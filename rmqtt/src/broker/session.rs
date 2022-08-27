@@ -70,7 +70,7 @@ impl SessionState {
         let mut state = self.clone();
         ntex::rt::spawn(async move {
             log::debug!("{:?} there are {} offline messages ...", state.id, state.deliver_queue.len());
-            Runtime::instance().stats.sessions.inc();
+            // Runtime::instance().stats.sessions.inc();
             Runtime::instance().stats.connections.inc();
 
             let (burst, replenish_n_per) = state.fitter.mqueue_rate_limit();
@@ -268,7 +268,7 @@ impl SessionState {
                 }
             }
 
-            Runtime::instance().stats.sessions.dec();
+            // Runtime::instance().stats.sessions.dec();
         });
         (self, msg_tx)
     }
@@ -316,7 +316,7 @@ impl SessionState {
                                 }
                             },
                             _ => {
-                                log::warn!("{:?} offline receive message is {:?}", id, msg);
+                                log::info!("{:?} offline receive message is {:?}", id, msg);
                             }
                         }
                     }else{
@@ -509,7 +509,7 @@ impl SessionState {
     #[inline]
     pub(crate) async fn subscribe(&self, mut sub: Subscribe) -> Result<SubscribeReturn> {
         if self.listen_cfg.max_subscriptions > 0
-            && (self.subscriptions_len() >= self.listen_cfg.max_subscriptions)
+            && (self.subscriptions.len() >= self.listen_cfg.max_subscriptions)
         {
             return Err(MqttError::TooManySubscriptions);
         }
@@ -679,24 +679,14 @@ impl SessionState {
                 .await;
         }
 
-        let id_not_same = if let Some(id) = Runtime::instance().extends.shared().await.id(&self.id.client_id)
-        {
-            if self.id != id && self.id.node_id == id.node_id {
-                log::info!("id not the same, id: {:?}, current id: {:?}, reason: {:?}", self.id, id, reason);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        //hook, session terminated
+        self.hook.session_terminated(reason).await;
 
-        if !id_not_same {
-            //hook, session terminated
-            self.hook.session_terminated(reason).await;
 
-            //clear session, and unsubscribe
-            if let Err(e) = Runtime::instance().extends.shared().await.entry(self.id.clone()).remove().await {
+        //clear session, and unsubscribe
+        let mut entry = Runtime::instance().extends.shared().await.entry(self.id.clone());
+        if let Some(true) = entry.id_same(){
+            if let Err(e) = entry.remove_with(&self.id).await {
                 log::warn!("{:?} failed to remove the session from the broker, {:?}", self.id, e);
             }
         }
@@ -709,21 +699,21 @@ impl SessionState {
         mut offline_info: SessionOfflineInfo,
     ) -> Result<()> {
         log::debug!(
-            "{:?} transfer session state, form: {:?}, subscriptions: {}, inflight_messages: {}, offline_messages: {}",
+            "{:?} transfer session state, form: {:?}, subscriptions: {}, inflight_messages: {}, offline_messages: {}, clear_subscriptions: {}",
             self.id,
             offline_info.id,
             offline_info.subscriptions.len(),
             offline_info.inflight_messages.len(),
-            offline_info.offline_messages.len()
+            offline_info.offline_messages.len(),
+            clear_subscriptions
         );
-        if self.id.node_id != offline_info.id.node_id
-            && !clear_subscriptions
-            && !offline_info.subscriptions.is_empty()
+        if !clear_subscriptions && !offline_info.subscriptions.is_empty()
         {
             for (tf, (qos, shared_group)) in offline_info.subscriptions.iter() {
                 let shared_group = shared_group.as_ref().cloned();
                 let qos = *qos;
                 let id = self.id.clone();
+                log::debug!("{:?} transfer_session_state, router.add ... topic_filter: {:?}, shared_group: {:?}, qos: {:?}", id, tf, shared_group, qos);
                 if let Err(e) =
                 Runtime::instance().extends.router().await.add(tf, id, qos, shared_group).await
                 {
@@ -734,8 +724,8 @@ impl SessionState {
         }
 
         //Subscription transfer from previous session
-        for (tf, (qos, shared_sub)) in offline_info.subscriptions.drain(..) {
-            self.subscriptions_add(tf, qos, shared_sub);
+        if !clear_subscriptions {
+            self.subscriptions.extend(offline_info.subscriptions);
         }
 
         //Send previous session unacked messages
@@ -822,13 +812,13 @@ impl Session {
         max_inflight: usize,
         created_at: TimestampMillis,
     ) -> Self {
-        //let max_inflight = listen_cfg.max_inflight;
         let message_retry_interval = listen_cfg.message_retry_interval.as_millis() as TimestampMillis;
         let message_expiry_interval = listen_cfg.message_expiry_interval.as_millis() as TimestampMillis;
+        Runtime::instance().stats.sessions.inc();
         Self(Arc::new(_SessionInner {
             id,
             listen_cfg,
-            _subscriptions: Arc::new(TopicFilterMap::default()), //Arc::new(RwLock::new(TopicFilterMap::default())),
+            subscriptions: SessionSubs::new(),
             deliver_queue: Arc::new(MessageQueue::new(max_mqueue_len)),
             inflight_win: Arc::new(RwLock::new(Inflight::new(
                 max_inflight,
@@ -842,7 +832,7 @@ impl Session {
     #[inline]
     pub async fn to_offline_info(&self) -> SessionOfflineInfo {
         let id = self.id.clone();
-        let subscriptions = self.drain_subscriptions();
+        let subscriptions = self.subscriptions.drain();
         let mut offline_messages = Vec::new();
         while let Some(item) = self.deliver_queue.pop() {
             //@TODO ..., check message expired
@@ -882,20 +872,27 @@ impl std::fmt::Debug for Session {
 pub struct _SessionInner {
     pub id: Id,
     pub listen_cfg: Listener,
-    _subscriptions: Arc<TopicFilterMap>,
     //Current subscription for this session
+    pub subscriptions: SessionSubs,
     pub deliver_queue: Arc<MessageQueue>,
     pub inflight_win: Arc<RwLock<Inflight>>,
     pub created_at: TimestampMillis,
 }
 
+impl Drop for _SessionInner {
+    fn drop(&mut self) {
+        Runtime::instance().stats.sessions.dec();
+        self.subscriptions.clear();
+    }
+}
+
 impl _SessionInner {
     #[inline]
     pub async fn to_json(&self) -> serde_json::Value {
-        let count = self.subscriptions_len();
+        let count = self.subscriptions.len();
 
         let subs = self
-            ._subscriptions
+            .subscriptions
             .iter()
             .enumerate()
             .filter_map(|(i, entry)| {
@@ -923,76 +920,6 @@ impl _SessionInner {
         });
         data
     }
-
-    #[inline]
-    pub fn subscriptions_add(&self, topic_filter: TopicFilter, qos: QoS, shared_group: Option<SharedGroup>) {
-        let is_shared = shared_group.is_some();
-        let prev = self._subscriptions.insert(topic_filter, (qos, shared_group));
-
-        let inc = |shared: bool| {
-            Runtime::instance().stats.subscriptions.inc();
-            if shared {
-                Runtime::instance().stats.subscriptions_shared.inc();
-            }
-        };
-
-        if let Some((_, prev_group)) = prev {
-            match (prev_group.is_some(), is_shared) {
-                (true, false) => {
-                    Runtime::instance().stats.subscriptions_shared.dec();
-                }
-                (false, true) => {
-                    inc(true);
-                }
-                (false, false) => {}
-                (true, true) => {}
-            }
-        } else {
-            inc(is_shared);
-        }
-    }
-
-    #[inline]
-    pub fn subscriptions_remove(
-        &self,
-        topic_filter: &str,
-    ) -> Option<(TopicFilter, (QoS, Option<SharedGroup>))> {
-        let removed = self._subscriptions.remove(topic_filter);
-        if let Some((_, (_, group))) = &removed {
-            Runtime::instance().stats.subscriptions.dec();
-            if group.is_some() {
-                Runtime::instance().stats.subscriptions_shared.dec();
-            }
-        }
-        removed
-    }
-
-    #[inline]
-    pub fn drain_subscriptions(&self) -> Subscriptions {
-        let topic_filters = self._subscriptions.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>();
-        let subs = topic_filters.iter().filter_map(|tf| self.subscriptions_remove(tf)).collect();
-        subs
-    }
-
-    #[inline]
-    pub fn subscriptions(&self) -> &TopicFilterMap {
-        self._subscriptions.as_ref()
-    }
-
-    #[inline]
-    pub fn subscriptions_len(&self) -> usize {
-        self._subscriptions.len()
-    }
-
-    #[inline]
-    pub fn clone_topic_filters(&self) -> TopicFilters {
-        self._subscriptions.iter().map(|entry| TopicFilter::from(entry.key().as_str())).collect()
-    }
-
-    // #[inline]
-    // pub fn is_shared_subscriptions(&self, topic_filter: &str) -> Option<bool> {
-    //     self._subscriptions.get(topic_filter).map(|entry| matches!(entry.value(), (_, Some(_))))
-    // }
 }
 
 #[derive(Clone)]

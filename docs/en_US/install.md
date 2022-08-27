@@ -1,6 +1,6 @@
 # RMQTT Broker
 
-English | [简体中文](./install-cn.md)
+English | [简体中文](../zh_CN/install.md)
 
 ## Install
 
@@ -17,13 +17,13 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 1. Download the ZIP package from [GitHub Release](https://github.com/rmqtt/rmqtt/releases).
 
 ```bash
-$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.3/rmqtt-0.2.3-x86_64-unknown-linux-musl.zip"
+$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.4/rmqtt-0.2.4-x86_64-unknown-linux-musl.zip"
 ```
 
 2. Decompress the zip package you downloaded from [GitHub Release](https://github.com/rmqtt/rmqtt/releases).
 
 ```bash
-$ unzip rmqtt-0.2.3-x86_64-unknown-linux-musl.zip -d /app/
+$ unzip rmqtt-0.2.4-x86_64-unknown-linux-musl.zip -d /app/
 ```
 
 3. Modify the permissions
@@ -228,25 +228,6 @@ $ cd /app/rmqtt
 ./bin/rmqttd "./etc/rmqtt.toml"
 ```
 
-##### Solve the problem of compilation failure
-
-If the tool chain of version 1.59 and later is used, the version of the dependent library may be too low, resulting in
-link failure.
-
-solve:
-
-- Use version 1.58 tool chain
-
-```bash
-#Install version 1.58 tool chain
-$ rustup install 1.58
-
-#Switch the current tool chain to 1.58
-$ rustup default 1.58
-
-#Rebuild
-$ cargo build --release
-```
 
 
 

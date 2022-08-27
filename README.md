@@ -1,6 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
+<a href="https://blog.rust-lang.org/2022/02/24/Rust-1.59.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.59%2B-blue" /></a>
 
 English | [简体中文](./README-CN.md)
 
@@ -19,7 +20,7 @@ and mobile applications that can handle millions of concurrent clients on a sing
 - Built-in ACL;
 - HTTP ACL;
 - WebHook;
-- HTTP API;
+- [HTTP APIs](./docs/en_US/http-api.md);
 - Distributed cluster;
 - Hooks;
 - TLS support;
@@ -47,9 +48,9 @@ x86_64 architecture servers and ARM devices like Raspberry Pi.
 
 Get the binary package of the corresponding OS from [RMQTT Download](https://github.com/rmqtt/rmqtt/releases) page.
 
-- [Single Node Install](./docs/install.md)
+- [Single Node Install](./docs/en_US/install.md)
 
-- [Multi Node Install](./docs/install.md)
+- [Multi Node Install](./docs/en_US/install.md)
 
 ## Experience
 

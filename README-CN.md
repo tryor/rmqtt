@@ -1,6 +1,8 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
+<a href="https://blog.rust-lang.org/2022/02/24/Rust-1.59.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.59%2B-blue" /></a>
+
 
 [English](./README.md)  | 简体中文
 
@@ -18,7 +20,7 @@
 - 内置 ACL;
 - HTTP ACL;
 - WebHook;
-- [HTTP API](./docs/zh_CN/http-api.md);
+- [HTTP APIs](./docs/zh_CN/http-api.md);
 - 分布式集群;
 - 钩子(Hooks);
 - TLS支持;
@@ -42,9 +44,9 @@
 
 需从 [GitHub Release](https://github.com/rmqtt/rmqtt/releases) 页面获取相应操作系统的ZIP压缩包。
 
-- [单节点安装配置文档](./docs/install-cn.md)
+- [单节点安装配置文档](./docs/zh_CN/install.md)
 
-- [集群安装配置文档](./docs/install-cn.md)
+- [集群安装配置文档](./docs/zh_CN/install.md)
 
 ## 体验
 

@@ -105,7 +105,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/brokers/1"
 
 | Name | Type | Required | Description                 |
 | ---- | --------- | ------------|-----------------------------|
-| node | Integer    | False       | 节点名字，如：1 <br/>不指定时返回所有节点的信息 |
+| node | Integer    | False       | 节点ID，如：1 <br/>不指定时返回所有节点的信息 |
 
 **Success Response Body (JSON):**
 
@@ -160,48 +160,50 @@ $ curl -i -X GET "http://localhost:6060/api/v1/nodes/1"
 | ------ | --------- | -------- | ------- |  ---- |
 | _limit | Integer   | False | 10000   | 一次最多返回的数据条数，未指定时由 `rmqtt-http-api.toml` 插件的配置项 `max_row_limit` 决定 |
 
-| Name            | Type   | Required | Description                     |
-| --------------- | ------ | -------- |---------------------------------|
-| clientid        | String | False    | 客户端标识符                          |
-| username        | String | False    | 客户端用户名                          |
-| ip_address      | String | False    | 客户端 IP 地址                       |
-| connected       | Bool   | False    | 客户端当前连接状态                       |
-| clean_start     | Bool   | False    | 客户端是否使用了全新的会话                   |
-| proto_ver       | Integer| False    | 客户端协议版本, 3,4,5                  |
-| _like_clientid  | String | False    | 客户端标识符，子串方式模糊查找                 |
-| _like_username  | String | False    | 客户端用户名，子串方式模糊查找                 |
-| _gte_created_at | Integer| False    | 客户端会话创建时间，大于等于查找                |
-| _lte_created_at | Integer| False    | 客户端会话创建时间，小于等于查找                |
-| _gte_connected_at | Integer| False    | 客户端连接创建时间，大于等于查找                |
-| _lte_connected_at | Integer| False    | 客户端连接创建时间，小于等于查找                |
-| _gte_mqueue_len | Integer| False    | 客户端消息队列当前长度， 大于等于查找              |
-| _lte_mqueue_len | Integer| False    | 客户端消息队列当前长度， 大于等于查找              |
+| Name            | Type   | Required | Description         |
+| --------------- | ------ | -------- |---------------------|
+| clientid        | String | False    | 客户端标识符              |
+| username        | String | False    | 客户端用户名              |
+| ip_address      | String | False    | 客户端 IP 地址           |
+| connected       | Bool   | False    | 客户端当前连接状态           |
+| clean_start     | Bool   | False    | 客户端是否使用了全新的会话       |
+| session_present | Bool   | False    | 客户端是否连接到已经存在的会话    |
+| proto_ver       | Integer| False    | 客户端协议版本, 3,4,5      |
+| _like_clientid  | String | False    | 客户端标识符，子串方式模糊查找     |
+| _like_username  | String | False    | 客户端用户名，子串方式模糊查找     |
+| _gte_created_at | Integer| False    | 客户端会话创建时间，大于等于查找    |
+| _lte_created_at | Integer| False    | 客户端会话创建时间，小于等于查找    |
+| _gte_connected_at | Integer| False    | 客户端连接创建时间，大于等于查找    |
+| _lte_connected_at | Integer| False    | 客户端连接创建时间，小于等于查找    |
+| _gte_mqueue_len | Integer| False    | 客户端消息队列当前长度， 大于等于查找 |
+| _lte_mqueue_len | Integer| False    | 客户端消息队列当前长度， 大于等于查找 |
 
 
 **Success Response Body (JSON):**
 
-| Name                  | Type | Description                                                                |
-|-----------------------| --------- |----------------------------------------------------------------------------|
-| []                    | Array of Objects | 所有客户端的信息                                                                   |
-| [0].node_id           | Integer    | 客户端所连接的节点ID                                                                |
-| [0].clientid          | String    | 客户端标识符                                                                     |
-| [0].username          | String    | 客户端连接时使用的用户名                                                               |                                                                  |
-| [0].proto_ver         | Integer   | 客户端使用的协议版本                                                                 |
-| [0].ip_address        | String    | 客户端的 IP 地址                                                                 |
-| [0].port              | Integer   | 客户端的端口                                                                     |                                                          |
-| [0].connected_at      | String    | 客户端连接时间，格式为 "YYYY-MM-DD HH:mm:ss"                                          |
-| [0].disconnected_at   | String    | 客户端离线时间，格式为 "YYYY-MM-DD HH:mm:ss"，<br/>此字段仅在 `connected` 为 `false` 时有效并被返回 |
-| [0].connected         | Boolean   | 客户端是否处于连接状态                                                                |
-| [0].keepalive         | Integer   | 保持连接时间，单位：秒                                                                |
-| [0].clean_start       | Boolean   | 指示客户端是否使用了全新的会话                                                            |
-| [0].expiry_interval   | Integer   | 会话过期间隔，单位：秒                                                                |
-| [0].created_at        | String    | 会话创建时间，格式为 "YYYY-MM-DD HH:mm:ss"                                           |
-| [0].subscriptions_cnt | Integer   | 此客户端已建立的订阅数量                                                               |
-| [0].max_subscriptions | Integer   | 此客户端允许建立的最大订阅数量                                                            |
-| [0].inflight          | Integer   | 飞行队列当前长度                                                                   |
-| [0].max_inflight      | Integer   | 飞行队列最大长度                                                                   |
-| [0].mqueue_len        | Integer   | 消息队列当前长度                                                                   |
-| [0].max_mqueue        | Integer   | 消息队列最大长度                                                                   |
+| Name                    | Type             | Description                                                                |
+|-------------------------|------------------|----------------------------------------------------------------------------|
+| []                      | Array of Objects | 所有客户端的信息                                                                   |
+| [0].node_id             | Integer          | 客户端所连接的节点ID                                                                |
+| [0].clientid            | String           | 客户端标识符                                                                     |
+| [0].username            | String           | 客户端连接时使用的用户名                                                               | 
+| [0].proto_ver           | Integer          | 客户端使用的协议版本                                                                 |
+| [0].ip_address          | String           | 客户端的 IP 地址                                                                 |
+| [0].port                | Integer          | 客户端的端口                                                                     | 
+| [0].connected_at        | String           | 客户端连接时间，格式为 "YYYY-MM-DD HH:mm:ss"                                          |
+| [0].disconnected_at     | String           | 客户端离线时间，格式为 "YYYY-MM-DD HH:mm:ss"，<br/>此字段仅在 `connected` 为 `false` 时有效并被返回 |
+| [0].disconnected_reason | String           | 客户端离线原因                                                                    |
+| [0].connected           | Boolean          | 客户端是否处于连接状态                                                                |
+| [0].keepalive           | Integer          | 保持连接时间，单位：秒                                                                |
+| [0].clean_start         | Boolean          | 指示客户端是否使用了全新的会话                                                            |
+| [0].expiry_interval     | Integer          | 会话过期间隔，单位：秒                                                                |
+| [0].created_at          | String           | 会话创建时间，格式为 "YYYY-MM-DD HH:mm:ss"                                           |
+| [0].subscriptions_cnt   | Integer          | 此客户端已建立的订阅数量                                                               |
+| [0].max_subscriptions   | Integer          | 此客户端允许建立的最大订阅数量                                                            |
+| [0].inflight            | Integer          | 飞行队列当前长度                                                                   |
+| [0].max_inflight        | Integer          | 飞行队列最大长度                                                                   |
+| [0].mqueue_len          | Integer          | 消息队列当前长度                                                                   |
+| [0].max_mqueue          | Integer          | 消息队列最大长度                                                                   |
 
 
 **Examples:**
@@ -314,14 +316,15 @@ false
 
 **Success Response Body (JSON):**
 
-| Name             | Type | Description |
-|------------------| --------- |-------------|
-| []               | Array of Objects | 所有订阅信息      |
-| [0].node_id     | Integer    | 节点ID        |
-| [0].clientid | String    | 客户端标识符      |
-| [0].topic    | String    | 订阅主题        |
-| [0].qos      | Integer   | QoS 等级      |
-| [0].share      | String   | 共享订阅的组名称      |
+| Name            | Type             | Description |
+|-----------------|------------------|-------------|
+| []              | Array of Objects | 所有订阅信息      |
+| [0].node_id     | Integer          | 节点ID        |
+| [0].clientid    | String           | 客户端标识符      |
+| [0].client_addr | String           | 客户端IP地址和端口  |
+| [0].topic       | String           | 订阅主题        |
+| [0].qos         | Integer          | QoS 等级      |
+| [0].share       | String           | 共享订阅的组名称    |
 
 
 **Examples:**
@@ -345,14 +348,15 @@ $ curl -i -X GET "http://localhost:6060/api/v1/subscriptions?_limit=10"
 
 **Success Response Body (JSON):**
 
-| Name             | Type | Description |
-|------------------| --------- |-------------|
-| []               | Array of Objects | 所有订阅信息      |
-| [0].node_id     | Integer    | 节点ID        |
-| [0].clientid | String    | 客户端标识符      |
-| [0].topic    | String    | 订阅主题        |
-| [0].qos      | Integer   | QoS 等级      |
-| [0].share      | String   | 共享订阅的组名称      |
+| Name            | Type             | Description |
+|-----------------|------------------|-------------|
+| []              | Array of Objects | 所有订阅信息      |
+| [0].node_id     | Integer          | 节点ID        |
+| [0].clientid    | String           | 客户端标识符      |
+| [0].client_addr | String           | 客户端IP地址和端口  |
+| [0].topic       | String           | 订阅主题        |
+| [0].qos         | Integer          | QoS 等级      |
+| [0].share       | String           | 共享订阅的组名称      |
 
 **Examples:**
 
@@ -535,7 +539,7 @@ true
 | [0].plugins.descr     | String           | 插件描述                             |
 | [0].plugins.active    | Boolean          | 插件是否启动                           |
 | [0].plugins.inited    | Boolean          | 插件是否已经初始化                        |
-| [0].plugins.immutable | Boolean          | 插件是否不可变，不可变插件将不能被停止，不有修改配置，不能重启等 |
+| [0].plugins.immutable | Boolean          | 插件是否不可变，不可变插件将不能被停止，不能修改配置，不能重启等 |
 | [0].plugins.attrs     | Json             | 插件其它附加属性                         |
 
 
@@ -553,9 +557,9 @@ $ curl -i -X GET "http://localhost:6060/api/v1/plugins"
 
 **Path Parameters:** 
 
-| Name | Type | Required | Description                |
-| ---- | --------- |----------|----------------------------|
-| node | Integer    | True     | 节点名字，如：1 |
+| Name | Type | Required | Description |
+| ---- | --------- |----------|-------------|
+| node | Integer    | True     | 节点ID，如：1    |
 
 
 **Success Response Body (JSON):**
@@ -589,7 +593,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/plugins/1"
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 | plugin | String    | True       | 插件名称        |
 
 **Success Response Body (JSON):**
@@ -623,7 +627,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/plugins/1/rmqtt-web-hook"
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 | plugin | String    | True       | 插件名称        |
 
 **Success Response Body (JSON):**
@@ -652,7 +656,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/plugins/1/rmqtt-http-api/config"
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 | plugin | String    | True       | 插件名称        |
 
 **Success Response Body (String):**
@@ -680,7 +684,7 @@ ok
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 | plugin | String    | True       | 插件名称        |
 
 **Success Response Body (String):**
@@ -708,7 +712,7 @@ ok
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 | plugin | String    | True       | 插件名称        |
 
 **Success Response Body (JSON):**
@@ -789,7 +793,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/stats"
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 
 **Success Response Body (JSON):**
 
@@ -899,7 +903,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/stats/sum"
 | client.subscribe                | Integer   | 客户端订阅次数 |
 | client.unsubscribe              | Integer   | 客户端取消订阅次数 |
 | messages.publish                | Integer   | 接收到PUBLISH消息数量 |
-| messages.delivered              | Integer   | 内部转发到订阅端消息数量 |
+| messages.delivered              | Integer   | 除系统消息外已发布的消息数 |
 | messages.acked                  | Integer   | 接收的 PUBACK 和 PUBREC 报文数量 |
 | messages.dropped                | Integer   | 丢弃的消息总数 |
 | session.created                 | Integer   | 创建的会话数量 |
@@ -926,14 +930,14 @@ $ curl -i -X GET "http://localhost:6060/api/v1/metrics"
 
 | Name | Type | Required | Description |
 | ---- | --------- | ------------|-------------|
-| node | Integer    | True       | 节点名字，如：1    |
+| node | Integer    | True       | 节点ID，如：1    |
 
 **Success Response Body (JSON):**
 
-| Name          | Type                 | Description        |
-|---------------|----------------------|--------------------|
-| {}            | Object               | 各节点上的统计指标列表        |
-| {}.node  | Json Object          | 节点信息               |
+| Name          | Type                 | Description            |
+|---------------|----------------------|------------------------|
+| {}            | Object               | 统计指标信息                   |
+| {}.node  | Json Object          | 节点信息                   |
 | {}.metrics | Json Object          | 监控指标数据，详见下面的 *metrics* |
 
 **node:**
@@ -960,7 +964,7 @@ $ curl -i -X GET "http://localhost:6060/api/v1/metrics/1"
 
 ### GET /api/v1/metrics/sum
 
-汇总集群下指定节点的统计指标数据。
+汇总集群下所有节点的统计指标数据。
 
 **Path Parameters:** 无
 

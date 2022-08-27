@@ -1,4 +1,4 @@
-use rmqtt::{broker::Entry, ClientInfo, Runtime, Session, TimestampMillis};
+use rmqtt::{broker::Entry, ClientId, ClientInfo, Id, Runtime, Session, TimestampMillis};
 use rmqtt::{chrono, futures};
 
 use super::types::{ClientSearchParams as SearchParams, ClientSearchResult as SearchResult};
@@ -8,7 +8,8 @@ pub(crate) async fn get(clientid: &str) -> Option<SearchResult> {
     if !shared.exist(clientid) {
         return None;
     }
-    let id = shared.id(clientid)?;
+
+    let id = Id::from(Runtime::instance().node.id(), ClientId::from(clientid));
     let peer = shared.entry(id);
     let (s, c) = if let (Some(s), Some(c)) = (peer.session(), peer.client()) {
         (s, c)
@@ -55,6 +56,7 @@ async fn build_result(s: Option<Session>, c: Option<ClientInfo>) -> SearchResult
     let connected = c.is_connected();
     let connected_at = c.connected_at / 1000;
     let disconnected_at = c.disconnected_at() / 1000;
+    let disconnected_reason = c.get_disconnected_reason().await.unwrap_or_default();
     let expiry_interval = if connected {
         s.listen_cfg.session_expiry_interval.as_secs() as i64
     } else {
@@ -72,11 +74,13 @@ async fn build_result(s: Option<Session>, c: Option<ClientInfo>) -> SearchResult
         connected,
         connected_at,
         disconnected_at,
+        disconnected_reason,
         keepalive: c.connect_info.keep_alive(),
-        clean_start: !c.session_present,
+        clean_start: c.connect_info.clean_start(),
+        session_present: c.session_present,
         expiry_interval,
         created_at: s.created_at / 1000,
-        subscriptions_cnt: s.subscriptions().len(),
+        subscriptions_cnt: s.subscriptions.len(),
         max_subscriptions: s.listen_cfg.max_subscriptions,
 
         inflight,
@@ -128,9 +132,14 @@ fn filtering(q: &SearchParams, entry: &dyn Entry) -> bool {
         }
     }
 
+    if let Some(session_present) = &q.session_present {
+        if *session_present != c.session_present {
+            return false;
+        }
+    }
+
     if let Some(clean_start) = &q.clean_start {
-        let is_clean_start = !c.session_present;
-        if *clean_start && !is_clean_start || !*clean_start && is_clean_start {
+        if *clean_start != c.connect_info.clean_start() {
             return false;
         }
     }

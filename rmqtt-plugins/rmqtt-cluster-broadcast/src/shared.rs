@@ -4,7 +4,6 @@ use once_cell::sync::OnceCell;
 
 use rmqtt::{ahash, async_trait::async_trait, futures, log, once_cell, tokio};
 use rmqtt::{
-    AsStr,
     broker::{
         default::DefaultShared,
         Entry,
@@ -47,6 +46,11 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
+    fn id_same(&self) -> Option<bool>{
+        self.inner.id_same()
+    }
+
+    #[inline]
     fn exist(&self) -> bool {
         self.inner.exist()
     }
@@ -59,6 +63,11 @@ impl Entry for ClusterLockEntry {
     #[inline]
     async fn remove(&mut self) -> Result<Option<(Session, Tx, ClientInfo)>> {
         self.inner.remove().await
+    }
+
+    #[inline]
+    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx, ClientInfo)>> {
+        self.inner.remove_with(id).await
     }
 
     #[inline]
@@ -207,11 +216,6 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    fn id(&self, client_id: &str) -> Option<Id> {
-        self.inner.id(client_id)
-    }
-
-    #[inline]
     fn exist(&self, client_id: &str) -> bool {
         self.inner.exist(client_id)
     }
@@ -278,7 +282,7 @@ impl Shared for &'static ClusterShared {
             let add_one_to_shared_sub_groups =
                 |shared_groups: &mut SharedSubGroups, shared_rel: SharedRelation| {
                     let (topic_filter, node_id, client_id, qos, (group, is_online)) = shared_rel;
-                    if let Some(groups) = shared_groups.get_mut(topic_filter.as_str()) {
+                    if let Some(groups) = shared_groups.get_mut(&topic_filter) {
                         groups.entry(group).or_default().push((node_id, client_id, qos, Some(is_online)));
                     } else {
                         let mut groups = HashMap::default();

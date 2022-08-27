@@ -1,6 +1,6 @@
 # RMQTT Broker
 
-[English](./install.md)  | 简体中文
+[English](../en_US/install.md)  | 简体中文
 
 ## 安装
 
@@ -17,13 +17,13 @@ RMQTT 目前支持的操作系统:
 1. 从[GitHub Release](https://github.com/rmqtt/rmqtt/releases) 下载zip包。
 
 ```bash
-$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.3/rmqtt-0.2.3-x86_64-unknown-linux-musl.zip"
+$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.4/rmqtt-0.2.4-x86_64-unknown-linux-musl.zip"
 ```
 
 2. 解压从[GitHub Release](https://github.com/rmqtt/rmqtt/releases) 下载的zip包。
 
 ```bash
-$ unzip rmqtt-0.2.3-x86_64-unknown-linux-musl.zip -d /app/
+$ unzip rmqtt-0.2.4-x86_64-unknown-linux-musl.zip -d /app/
 ```
 
 3. 修改权限
@@ -252,23 +252,6 @@ listener.tls.external.key = "/app/rmqtt/etc/rmqtt.key"
 ```bash
 $ cd /app/rmqtt
 ./bin/rmqttd "./etc/rmqtt.toml"
-```
-
-##### 解决编译失败问题
-
-如果使用1.59版及之后工具链，可能会存在依赖库版本太低导致链接失败问题，解决办法：
-
-- 使用1.58版工具链
-
-```bash
-#安装1.58版本工具链
-$ rustup install 1.58
-
-#将当前工具链切换到1.58
-$ rustup default 1.58
-
-#重新编译
-$ cargo build --release
 ```
 
 

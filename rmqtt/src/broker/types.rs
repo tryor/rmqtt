@@ -29,7 +29,7 @@ use serde::ser::{Serialize, Serializer, SerializeStruct};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::{MqttError, Result};
+use crate::{MqttError, Result, Runtime};
 
 pub type NodeId = u64;
 pub type RemoteSocketAddr = SocketAddr;
@@ -61,9 +61,9 @@ pub type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 pub type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 pub type QoS = ntex_mqtt::types::QoS;
 pub type PublishReceiveTime = TimestampMillis;
-pub type TopicFilterMap = DashMap<TopicFilter, (QoS, Option<SharedGroup>)>;
-pub type Subscriptions = Vec<(TopicFilter, (QoS, Option<SharedGroup>))>;
+pub type Subscriptions = Vec<(TopicFilter, SubscriptionValue)>;
 pub type TopicFilters = Vec<TopicFilter>;
+pub type SubscriptionValue = (QoS, Option<SharedGroup>);
 
 pub type HookSubscribeResult = Vec<Option<TopicFilter>>;
 pub type HookUnsubscribeResult = Vec<Option<TopicFilter>>;
@@ -858,7 +858,7 @@ impl Id {
                 local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
                 remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
                 client_id,
-                username.as_ref().map(|un| un.as_str()).unwrap_or_default(),
+                username.as_ref().map(|un| <ByteString as AsRef<str>>::as_ref(un)).unwrap_or_default(),
             )),
             node_id,
             local_addr,
@@ -990,40 +990,6 @@ pub enum Message {
     Unsubscribe(Unsubscribe, oneshot::Sender<Result<()>>),
 }
 
-pub trait AsStr {
-    fn as_str(&self) -> &str;
-}
-
-impl AsStr for bytestring::ByteString {
-    fn as_str(&self) -> &str {
-        #[inline(always)]
-        fn slice_as_str(slice: &[u8]) -> &str {
-            union Slices<'a> {
-                str: &'a str,
-                slice: &'a [u8],
-            }
-            unsafe { Slices { slice }.str }
-        }
-
-        slice_as_str(self.as_ref())
-    }
-}
-
-impl AsStr for bytes::Bytes {
-    fn as_str(&self) -> &str {
-        #[inline(always)]
-        fn slice_as_str(slice: &[u8]) -> &str {
-            union Slices<'a> {
-                str: &'a str,
-                slice: &'a [u8],
-            }
-            unsafe { Slices { slice }.str }
-        }
-
-        slice_as_str(self.as_ref())
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionStatus {
     pub id: Id,
@@ -1047,6 +1013,7 @@ pub struct SubsSearchParams {
 pub struct SubsSearchResult {
     pub node_id: NodeId,
     pub clientid: ClientId,
+    pub client_addr: Option<SocketAddr>,
     pub topic: TopicFilter,
     pub qos: u8,
     pub share: Option<SharedGroup>,
@@ -1056,4 +1023,116 @@ pub struct SubsSearchResult {
 pub struct Route {
     pub node_id: NodeId,
     pub topic: TopicFilter,
+}
+
+
+pub struct SessionSubs(Arc<_SessionSubs>);
+
+impl SessionSubs{
+    #[inline]
+    pub(crate) fn new() -> Self{
+        Self(Arc::new(_SessionSubs::new()))
+    }
+}
+
+impl Deref for SessionSubs {
+    type Target = _SessionSubs;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+pub struct _SessionSubs{
+    subs: DashMap<TopicFilter, SubscriptionValue>,
+}
+
+impl _SessionSubs{
+    #[inline]
+    pub(crate) fn new() -> Self{
+        Self{
+            subs: DashMap::default(),
+        }
+    }
+
+
+    #[inline]
+    pub fn add(&self, topic_filter: TopicFilter, qos: QoS, shared_group: Option<SharedGroup>) {
+        let is_shared = shared_group.is_some();
+        let prev = self.subs.insert(topic_filter, (qos, shared_group));
+
+        if let Some((_, prev_group)) = prev {
+            match (prev_group.is_some(), is_shared) {
+                (true, false) => {
+                    Runtime::instance().stats.subscriptions_shared.dec();
+                }
+                (false, true) => {
+                    Runtime::instance().stats.subscriptions_shared.inc();
+                }
+                (false, false) => {}
+                (true, true) => {}
+            }
+        } else {
+            Runtime::instance().stats.subscriptions.inc();
+            if is_shared {
+                Runtime::instance().stats.subscriptions_shared.inc();
+            }
+        }
+    }
+
+    #[inline]
+    pub fn remove(
+        &self,
+        topic_filter: &str,
+    ) -> Option<(TopicFilter, SubscriptionValue)> {
+        let removed = self.subs.remove(topic_filter);
+        if let Some((_, (_, group))) = &removed {
+            Runtime::instance().stats.subscriptions.dec();
+            if group.is_some() {
+                Runtime::instance().stats.subscriptions_shared.dec();
+            }
+        }
+        removed
+    }
+
+    #[inline]
+    pub fn drain(&self) -> Subscriptions {
+        let topic_filters = self.subs.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>();
+        let subs = topic_filters.iter().filter_map(|tf| self.remove(tf)).collect();
+        subs
+    }
+
+    #[inline]
+    pub fn extend(&self, subs: Subscriptions) {
+        for (topic_filter, (qos, group)) in subs{
+            self.add(topic_filter, qos, group);
+        }
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        for entry in self.subs.iter() {
+            Runtime::instance().stats.subscriptions.dec();
+            let (_, group) = entry.value();
+            if group.is_some() {
+                Runtime::instance().stats.subscriptions_shared.dec();
+            }
+        }
+        self.subs.clear();
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.subs.len()
+    }
+
+    #[inline]
+    pub fn clone(&self) -> TopicFilters {
+        self.subs.iter().map(|entry| TopicFilter::from(entry.key().as_ref())).collect()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> dashmap::iter::Iter<TopicFilter, SubscriptionValue, ahash::RandomState, DashMap<TopicFilter, SubscriptionValue>> {
+        self.subs.iter()
+    }
 }

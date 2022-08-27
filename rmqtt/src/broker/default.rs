@@ -60,18 +60,39 @@ impl LockEntry {
     #[inline]
     async fn _unsubscribe(&self, id: Id, topic_filter: &str) -> Result<()> {
         Runtime::instance().extends.router().await.remove(topic_filter, id).await?;
+        if let Some(s) = self.session() {
+            s.subscriptions.remove(topic_filter);
+        }
         Ok(())
     }
 
     #[inline]
-    pub async fn _remove(&mut self, clear_subscriptions: bool) -> Option<(Session, Tx, ClientInfo)> {
-        if !self.shared.peers.contains_key(&self.id.client_id) {
-            return None;
+    pub async fn _remove_with(&mut self, clear_subscriptions: bool, with_id: &Id) -> Option<(Session, Tx, ClientInfo)> {
+        if let Some((_, peer)) = { self.shared.peers.remove_if(&self.id.client_id, |_, entry| &entry.c.id == with_id) } {
+            if clear_subscriptions {
+                for topic_filter in peer.s.subscriptions.clone() {
+                    if let Err(e) = self._unsubscribe(peer.c.id.clone(), &topic_filter).await {
+                        log::warn!(
+                            "{:?} remove._unsubscribe, topic_filter: {}, {:?}",
+                            self.id,
+                            topic_filter,
+                            e
+                        );
+                    }
+                }
+            }
+            log::debug!("{:?} remove ...", self.id);
+            Some((peer.s, peer.tx, peer.c))
+        } else {
+            None
         }
+    }
 
+    #[inline]
+    pub async fn _remove(&mut self, clear_subscriptions: bool) -> Option<(Session, Tx, ClientInfo)> {
         if let Some((_, peer)) = { self.shared.peers.remove(&self.id.client_id) } {
             if clear_subscriptions {
-                for topic_filter in peer.s.clone_topic_filters() {
+                for topic_filter in peer.s.subscriptions.clone() {
                     if let Err(e) = self._unsubscribe(peer.c.id.clone(), &topic_filter).await {
                         log::warn!(
                             "{:?} remove._unsubscribe, topic_filter: {}, {:?}",
@@ -111,6 +132,11 @@ impl super::Entry for LockEntry {
     }
 
     #[inline]
+    fn id_same(&self) -> Option<bool>{
+        self.shared.peers.get(&self.id.client_id).map(|peer| peer.c.id == self.id)
+    }
+
+    #[inline]
     async fn set(&mut self, s: Session, tx: Tx, c: ClientInfo) -> Result<()> {
         self.shared.peers.insert(self.id.client_id.clone(), EntryItem { s, tx, c });
         Ok(())
@@ -119,6 +145,11 @@ impl super::Entry for LockEntry {
     #[inline]
     async fn remove(&mut self) -> Result<Option<(Session, Tx, ClientInfo)>> {
         Ok(self._remove(true).await)
+    }
+
+    #[inline]
+    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx, ClientInfo)>> {
+        Ok(self._remove_with(true, id).await)
     }
 
     #[inline]
@@ -226,7 +257,7 @@ impl super::Entry for LockEntry {
             .await
             .add(&sub.topic_filter, self.id(), sub.qos, sub.shared_group.clone())
             .await?;
-        peer.s.subscriptions_add(sub.topic_filter.clone(), sub.qos, sub.shared_group.clone());
+        peer.s.subscriptions.add(sub.topic_filter.clone(), sub.qos, sub.shared_group.clone());
         Ok(SubscribeReturn::new_success(sub.qos))
     }
 
@@ -244,7 +275,7 @@ impl super::Entry for LockEntry {
         {
             log::warn!("{:?} unsubscribe, error:{:?}", self.id, e);
         }
-        let remove_ok = peer.s.subscriptions_remove(&unsubscribe.topic_filter).is_some();
+        let remove_ok = peer.s.subscriptions.remove(&unsubscribe.topic_filter).is_some();
         Ok(remove_ok)
     }
 
@@ -269,14 +300,15 @@ impl super::Entry for LockEntry {
     async fn subscriptions(&self) -> Option<Vec<SubsSearchResult>> {
         if let Some(s) = self.session() {
             let subs = s
-                .subscriptions()
+                .subscriptions
                 .iter()
                 .map(|entry| {
                     let (topic_filter, (qos, group)) = entry.pair();
                     SubsSearchResult {
                         node_id: self.id.node_id,
                         clientid: self.id.client_id.clone(),
-                        topic: TopicFilter::from(topic_filter.as_str()),
+                        client_addr: self.id.remote_addr,
+                        topic: TopicFilter::from(topic_filter.as_ref()),
                         qos: qos.value(),
                         share: group.as_ref().cloned(),
                     }
@@ -324,15 +356,6 @@ impl Shared for &'static DefaultShared {
     #[inline]
     fn entry(&self, id: Id) -> Box<dyn Entry> {
         Box::new(LockEntry::new(id, self, None))
-    }
-
-    #[inline]
-    fn id(&self, client_id: &str) -> Option<Id> {
-        if let Some(e) = self.peers.get(client_id) {
-            Some(e.c.id.clone())
-        } else {
-            None
-        }
     }
 
     #[inline]
@@ -646,7 +669,7 @@ impl DefaultRouter {
                 e.value()
                     .iter()
                     .filter(|(client_id, (_id, qos, group))| {
-                        Self::_query_subscriptions_filter(q, client_id.as_str(), qos, group)
+                        Self::_query_subscriptions_filter(q, client_id.as_ref(), qos, group)
                     })
                     .filter_map(|(client_id, (id, qos, group))| {
                         if curr < limit {
@@ -654,6 +677,7 @@ impl DefaultRouter {
                             Some(SubsSearchResult {
                                 node_id: id.node_id,
                                 clientid: client_id.clone(),
+                                client_addr: id.remote_addr,
                                 topic: topic_filter.clone(),
                                 qos: qos.value(),
                                 share: group.as_ref().cloned(),
@@ -694,7 +718,7 @@ impl DefaultRouter {
                     entry
                         .iter()
                         .filter(|(client_id, (_id, qos, group))| {
-                            Self::_query_subscriptions_filter(q, client_id.as_str(), qos, group)
+                            Self::_query_subscriptions_filter(q, client_id.as_ref(), qos, group)
                         })
                         .filter_map(|(client_id, (id, qos, group))| {
                             if curr < limit {
@@ -702,6 +726,7 @@ impl DefaultRouter {
                                 Some(SubsSearchResult {
                                     node_id: id.node_id,
                                     clientid: client_id.clone(),
+                                    client_addr: id.remote_addr,
                                     topic: topic_filter.clone(),
                                     qos: qos.value(),
                                     share: group.as_ref().cloned(),
@@ -729,7 +754,7 @@ impl DefaultRouter {
                 e.value()
                     .iter()
                     .filter(|(client_id, (_id, qos, group))| {
-                        Self::_query_subscriptions_filter(q, client_id.as_str(), qos, group)
+                        Self::_query_subscriptions_filter(q, client_id.as_ref(), qos, group)
                     })
                     .filter_map(|(client_id, (id, qos, group))| {
                         if curr < limit {
@@ -737,6 +762,7 @@ impl DefaultRouter {
                             Some(SubsSearchResult {
                                 node_id: id.node_id,
                                 clientid: client_id.clone(),
+                                client_addr: id.remote_addr,
                                 topic: topic_filter.clone(),
                                 qos: qos.value(),
                                 share: group.as_ref().cloned(),
@@ -777,7 +803,7 @@ impl Router for &'static DefaultRouter {
         qos: QoS,
         shared_group: Option<SharedGroup>,
     ) -> Result<()> {
-        log::debug!("add, topic_filter: {:?}", topic_filter);
+        log::debug!("{:?} add, topic_filter: {:?}", id, topic_filter);
         let topic = Topic::from_str(topic_filter)?;
         //add to topic tree
         self.topics.write().await.insert(&topic, ());
@@ -801,7 +827,7 @@ impl Router for &'static DefaultRouter {
 
     #[inline]
     async fn remove(&self, topic_filter: &str, id: Id) -> Result<bool> {
-        log::debug!("remove, topic_filter: {:?}", topic_filter.to_string());
+        log::debug!("{:?} remove, topic_filter: {:?}", id, topic_filter);
         //Remove subscription relationship from local
         let res = if let Some(mut rels) = self.relations.get_mut(topic_filter) {
             let remove_enable = rels.value().get(&id.client_id).map(|(s_id, _, _)| {
@@ -993,12 +1019,12 @@ impl DefaultRetainStorage {
     }
 
     #[inline]
-    pub async fn add(&self, topic: &Topic, retain: Retain) {
+    async fn add(&self, topic: &Topic, retain: Retain) {
         self.messages.write().await.insert(topic, retain);
     }
 
     #[inline]
-    pub async fn remove(&self, topic: &Topic) -> Option<Retain> {
+    async fn remove(&self, topic: &Topic) -> Option<Retain> {
         self.messages.write().await.remove(topic)
     }
 }

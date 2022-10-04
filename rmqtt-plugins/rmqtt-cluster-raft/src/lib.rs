@@ -11,7 +11,13 @@ use rmqtt_raft::{Mailbox, Raft};
 use config::PluginConfig;
 use handler::HookHandler;
 use retainer::ClusterRetainer;
-use rmqtt::{ahash, anyhow, async_trait::async_trait, futures, log, RwLock, serde_json::{self, json}, tokio};
+use rmqtt::{
+    ahash, anyhow,
+    async_trait::async_trait,
+    futures, log,
+    RwLock,
+    serde_json::{self, json}, tokio,
+};
 use rmqtt::{
     broker::{
         error::MqttError,
@@ -73,18 +79,19 @@ impl ClusterPlugin {
     #[inline]
     async fn new<S: Into<String>>(runtime: &'static Runtime, name: S, descr: S) -> Result<Self> {
         let name = name.into();
-        let cfg = Arc::new(RwLock::new(
+        let cfg =
             runtime
                 .settings
                 .plugins
                 .load_config::<PluginConfig>(&name)
-                .map_err(|e| MqttError::from(e.to_string()))?,
-        ));
-        log::debug!("{} ClusterPlugin cfg: {:?}", name, cfg.read());
+                .map_err(|e| MqttError::from(e.to_string()))?;
+        log::debug!("{} ClusterPlugin cfg: {:?}", name, cfg);
+
+        init_executor(cfg.executor_workers, cfg.executor_queue_max);
 
         let register = runtime.extends.hook_mgr().await.register();
         let mut grpc_clients = HashMap::default();
-        let node_grpc_addrs = cfg.read().node_grpc_addrs.clone();
+        let node_grpc_addrs = cfg.node_grpc_addrs.clone();
         for node_addr in &node_grpc_addrs {
             if node_addr.id != runtime.node.id() {
                 grpc_clients.insert(
@@ -94,12 +101,11 @@ impl ClusterPlugin {
             }
         }
         let grpc_clients = Arc::new(grpc_clients);
-        let message_type = cfg.read().message_type;
-        let try_lock_timeout = cfg.read().try_lock_timeout;
-        let router = ClusterRouter::get_or_init(try_lock_timeout);
-        let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), message_type);
-        let retainer = ClusterRetainer::get_or_init(grpc_clients.clone(), message_type);
+        let router = ClusterRouter::get_or_init(cfg.try_lock_timeout);
+        let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), cfg.message_type);
+        let retainer = ClusterRetainer::get_or_init(grpc_clients.clone(), cfg.message_type);
         let raft_mailbox = None;
+        let cfg = Arc::new(RwLock::new(cfg));
         Ok(Self {
             runtime,
             name,
@@ -166,7 +172,7 @@ impl ClusterPlugin {
                         tokio::spawn(raft.lead(id))
                     }
                 };
-                let _ = raft_handle.await.unwrap().unwrap();
+                raft_handle.await.unwrap().unwrap();
             };
 
             rt.block_on(runner);
@@ -242,7 +248,6 @@ impl Plugin for ClusterPlugin {
         *self.runtime.extends.router_mut().await = Box::new(self.router);
         *self.runtime.extends.shared_mut().await = Box::new(self.shared);
         *self.runtime.extends.retain_mut().await = Box::new(self.retainer);
-        // *self.runtime.extends.shared_subscriber_mut().await = Box::new(self.shared_subscriber);
         self.register.start().await;
 
         for i in 0..10 {
@@ -288,7 +293,6 @@ impl Plugin for ClusterPlugin {
 
         let mut nodes = HashMap::default();
         for (node_id, (_, c)) in self.grpc_clients.iter() {
-            //let (node_id, c) = entry.pair();
             let stats = json!({
                 "channel_tasks": c.channel_tasks(),
                 "active_tasks": c.active_tasks(),
@@ -296,10 +300,17 @@ impl Plugin for ClusterPlugin {
             nodes.insert(*node_id, stats);
         }
 
+        let exec = executor();
         json!({
             "grpc_clients": nodes,
             "raft_status": raft_status,
             "raft_pears": pears,
+            "client_states": self.router.states_count(),
+            "executor": {
+                "waiting_count": exec.waiting_count(),
+                "active_count": exec.active_count(),
+                "completed_count": exec.completed_count(),
+            }
         })
     }
 }
@@ -313,6 +324,8 @@ pub(crate) struct MessageSender {
 }
 
 impl MessageSender {
+
+    #[inline]
     async fn send(&mut self) -> Result<MessageReply> {
         let mut current_retry = 0usize;
         loop {
@@ -367,9 +380,37 @@ impl MessageBroadcaster {
     }
 }
 
+#[inline]
 pub(crate) async fn hook_message_dropped(droppeds: Vec<(To, From, Publish, Reason)>) {
     for (to, from, publish, reason) in droppeds {
         //hook, message_dropped
         Runtime::instance().extends.hook_mgr().await.message_dropped(Some(to), from, publish, reason).await;
     }
+}
+
+use rmqtt::{
+        once_cell::sync::OnceCell,
+        rust_box::task_executor::{Builder, Executor}
+    };
+
+
+static EXECUTOR: OnceCell<Executor> = OnceCell::new();
+
+#[inline]
+fn init_executor(workers: usize, queue_max: usize) {
+    let (exec, task_runner) = Builder::default()
+        .workers(workers)
+        .queue_max(queue_max)
+        .build();
+
+    tokio::spawn(async move{
+        task_runner.await;
+    });
+
+    EXECUTOR.set(exec).ok().expect("Failed to initialize executor")
+}
+
+#[inline]
+pub(crate) fn executor() -> &'static Executor {
+    EXECUTOR.get().expect("Executor not initialized")
 }

@@ -71,7 +71,7 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
-    fn id_same(&self) -> Option<bool>{
+    fn id_same(&self) -> Option<bool> {
         self.inner.id_same()
     }
 
@@ -409,6 +409,16 @@ impl Shared for &'static ClusterShared {
             id: s.id,
             online: s.online,
         })
+    }
+
+    #[inline]
+    async fn clinet_states_count(&self) -> usize {
+        self.router.states_count()
+    }
+
+    #[inline]
+    fn sessions_count(&self) -> usize {
+        self.inner.sessions_count()
     }
 
     #[inline]

@@ -14,10 +14,11 @@ use config::PluginConfig;
 use rmqtt::{ahash, async_trait, dashmap, lazy_static, log, reqwest, serde_json, tokio};
 use rmqtt::{
     broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
-    broker::session::ClientInfo,
-    broker::types::{AuthResult, Password, PublishAclResult, SubscribeAckReason, SubscribeAclResult},
-    ClientId,
-    MqttError, plugin::{DynPlugin, DynPluginResult, Plugin}, Result, Runtime, TopicName,
+    broker::types::{
+        AuthResult, ConnectInfo, Id, Password, PublishAclResult, SubscribeAckReason, SubscribeAclResult,
+    },
+    MqttError,
+    plugin::{DynPlugin, DynPluginResult, Plugin}, Result, Runtime, TopicName,
 };
 use rmqtt::ntex::util::ByteString;
 
@@ -28,10 +29,23 @@ type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 type HashSet<K> = std::collections::HashSet<K, ahash::RandomState>;
 
 const IGNORE: &str = "ignore";
-const SUB: &str = "1";
-const PUB: &str = "2";
 
-type CacheMap = Arc<DashMap<ClientId, CacheValue>>;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
+enum ACLType {
+    Sub = 1,
+    Pub = 2,
+}
+
+impl ACLType {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Sub => "1",
+            Self::Pub => "2",
+        }
+    }
+}
+
+type CacheMap = Arc<DashMap<Id, CacheValue>>;
 
 #[inline]
 pub async fn register(
@@ -139,6 +153,13 @@ impl Plugin for AuthHttpPlugin {
     fn descr(&self) -> &str {
         &self.descr
     }
+
+    #[inline]
+    async fn attrs(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cache_count": self.cache_map.len()
+        })
+    }
 }
 
 struct AuthHandler {
@@ -231,25 +252,23 @@ impl AuthHandler {
 
     fn replaces<'a>(
         params: &'a mut HashMap<String, String>,
-        client: &ClientInfo,
+        connect_info: &ConnectInfo,
         password: Option<&Password>,
-        sub_or_pub: Option<(&str, &TopicName)>,
+        sub_or_pub: Option<(ACLType, &TopicName)>,
     ) -> Result<()> {
-        let password = if let Some(p) = password{
-            ByteString::try_from(p.clone())?
-        }else{
-            ByteString::default()
-        };
-        let username = client.connect_info.username().map(|n| n.as_ref()).unwrap_or("");
-        let remote_addr = client.id.remote_addr.map(|addr| addr.ip().to_string()).unwrap_or_default();
+        let password =
+            if let Some(p) = password { ByteString::try_from(p.clone())? } else { ByteString::default() };
+        let client_id = connect_info.client_id();
+        let username = connect_info.username().map(|n| n.as_ref()).unwrap_or("");
+        let remote_addr = connect_info.id().remote_addr.map(|addr| addr.ip().to_string()).unwrap_or_default();
         for v in params.values_mut() {
             *v = v.replace("%u", username);
-            *v = v.replace("%c", &client.id.client_id);
+            *v = v.replace("%c", client_id);
             *v = v.replace("%a", &remote_addr);
             *v = v.replace("%r", "mqtt");
             *v = v.replace("%P", &password);
-            if let Some((flag, topic)) = sub_or_pub {
-                *v = v.replace("%A", flag);
+            if let Some((ref acl_type, topic)) = sub_or_pub {
+                *v = v.replace("%A", acl_type.as_str());
                 *v = v.replace("%t", topic);
             } else {
                 *v = v.replace("%A", "");
@@ -261,30 +280,24 @@ impl AuthHandler {
 
     async fn request(
         &self,
-        client: &ClientInfo,
+        connect_info: &ConnectInfo,
         mut req_cfg: config::Req,
         password: Option<&Password>,
-        sub_or_pub: Option<(&str, &TopicName)>,
+        sub_or_pub: Option<(ACLType, &TopicName)>,
         check_super: bool,
     ) -> Result<bool> {
-        log::debug!("req_cfg.url.path(): {:?}", req_cfg.url.path());
-        let catch_key_fn = || {
-            CacheKey(
-                req_cfg.url.path().to_owned(),
-                client.id.remote_addr.map(|addr| addr.ip()),
-                password.cloned(),
-                sub_or_pub.map(|(f, t)| (f.to_owned(), t.to_string())),
-            )
-        };
+        log::debug!("{:?} req_cfg.url.path(): {:?}", connect_info.id(), req_cfg.url.path());
+        let catch_key_fn =
+            || CacheItem(req_cfg.url.path().to_owned(), sub_or_pub.map(|(f, t)| (f, t.clone())));
         let catch_key = {
-            if let Some(c_map) = self.cache_map.get(&client.id.client_id) {
-                log::debug!("{:?} catch value: {:?}", client.id, c_map.value());
-                if c_map.is_super {
+            if let Some(cached) = self.cache_map.get(connect_info.id()) {
+                log::debug!("{:?} catch value: {:?}", connect_info.id(), cached.value());
+                if cached.is_super {
                     return Ok(true);
                 }
 
                 let catch_key = catch_key_fn();
-                if c_map.ignores.contains(&catch_key) {
+                if cached.ignores.contains(&catch_key) {
                     return Ok(true);
                 }
                 catch_key
@@ -312,40 +325,40 @@ impl AuthHandler {
 
         let (allow, ignore) = if req_cfg.is_get() {
             let body = &mut req_cfg.params;
-            Self::replaces(body, client, password, sub_or_pub)?;
+            Self::replaces(body, connect_info, password, sub_or_pub)?;
             Self::http_get_request(req_cfg.url, body, headers, timeout).await?
         } else if req_cfg.json_body() {
             let body = &mut req_cfg.params;
-            Self::replaces(body, client, password, sub_or_pub)?;
+            Self::replaces(body, connect_info, password, sub_or_pub)?;
             Self::http_json_request(req_cfg.url, req_cfg.method, body, headers, timeout).await?
         } else {
             //form body
             let body = &mut req_cfg.params;
-            Self::replaces(body, client, password, sub_or_pub)?;
+            Self::replaces(body, connect_info, password, sub_or_pub)?;
             Self::http_form_request(req_cfg.url, req_cfg.method, body, headers, timeout).await?
         };
 
-        log::debug!("allow: {:?}", allow);
+        log::debug!("check_super: {}, allow: {:?}, ignore: {}", check_super, allow, ignore);
 
         //IGNORE
         if allow && ignore == IGNORE {
-            let mut c_map = self.cache_map.entry(client.id.client_id.clone()).or_default();
+            let mut cached = self.cache_map.entry(connect_info.id().clone()).or_default();
             if check_super {
-                c_map.is_super = true;
-            } else {
-                c_map.ignores.insert(catch_key);
+                cached.is_super = true;
+            } else if sub_or_pub.is_some() {
+                cached.ignores.insert(catch_key);
             }
         }
 
         Ok(allow)
     }
 
-    async fn auth(&self, client: &ClientInfo, password: Option<&Password>) -> bool {
+    async fn auth(&self, connect_info: &ConnectInfo, password: Option<&Password>) -> bool {
         if let Some(req) = { self.cfg.read().await.http_auth_req.clone() } {
-            match self.request(client, req.clone(), password, None, false).await {
+            match self.request(connect_info, req.clone(), password, None, false).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    log::warn!("{:?} auth error, {:?}", client.id, e);
+                    log::warn!("{:?} auth error, {:?}", connect_info.id(), e);
                     false
                 }
             }
@@ -354,12 +367,12 @@ impl AuthHandler {
         }
     }
 
-    async fn is_super(&self, client: &ClientInfo) -> bool {
+    async fn is_super(&self, connect_info: &ConnectInfo) -> bool {
         if let Some(req) = { self.cfg.read().await.http_super_req.clone() } {
-            match self.request(client, req.clone(), None, None, true).await {
+            match self.request(connect_info, req.clone(), None, None, true).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    log::warn!("{:?} check super error, {:?}", client.id, e);
+                    log::warn!("{:?} check super error, {:?}", connect_info.id(), e);
                     false
                 }
             }
@@ -368,15 +381,15 @@ impl AuthHandler {
         }
     }
 
-    async fn acl(&self, client: &ClientInfo, sub_or_pub: Option<(&str, &TopicName)>) -> bool {
+    async fn acl(&self, connect_info: &ConnectInfo, sub_or_pub: Option<(ACLType, &TopicName)>) -> bool {
         if let Some(req) = { self.cfg.read().await.http_acl_req.clone() } {
-            match self.request(client, req.clone(), None, sub_or_pub, false).await {
+            match self.request(connect_info, req.clone(), None, sub_or_pub, false).await {
                 Ok(allow) => {
                     log::debug!("acl.allow: {:?}", allow);
                     allow
                 }
                 Err(e) => {
-                    log::warn!("{:?} acl error, {:?}", client.id, e);
+                    log::warn!("{:?} acl error, {:?}", connect_info.id(), e);
                     false
                 }
             }
@@ -390,7 +403,7 @@ impl AuthHandler {
 impl Handler for AuthHandler {
     async fn hook(&self, param: &Parameter, acc: Option<HookResult>) -> ReturnType {
         match param {
-            Parameter::ClientAuthenticate(_session, client_info, password) => {
+            Parameter::ClientAuthenticate(connect_info) => {
                 log::debug!("ClientAuthenticate auth-http");
                 if matches!(
                     acc,
@@ -402,12 +415,12 @@ impl Handler for AuthHandler {
 
                 let stop = !self.cfg.read().await.break_if_allow;
 
-                if self.is_super(*client_info).await {
+                if self.is_super(*connect_info).await {
                     return (stop, Some(HookResult::AuthResult(AuthResult::Allow)));
                 }
 
-                return if !self.auth(*client_info, password.as_ref()).await {
-                    (false, Some(HookResult::AuthResult(AuthResult::NotAuthorized)))
+                return if !self.auth(*connect_info, connect_info.password()).await {
+                    (false, Some(HookResult::AuthResult(AuthResult::BadUsernameOrPassword)))
                 } else {
                     (stop, Some(HookResult::AuthResult(AuthResult::Allow)))
                 };
@@ -420,7 +433,10 @@ impl Handler for AuthHandler {
                     }
                 }
 
-                return if self.acl(*client_info, Some((SUB, &subscribe.topic_filter))).await {
+                return if self
+                    .acl(&client_info.connect_info, Some((ACLType::Sub, &subscribe.topic_filter)))
+                    .await
+                {
                     (
                         !self.cfg.read().await.break_if_allow,
                         Some(HookResult::SubscribeAclResult(SubscribeAclResult::new_success(subscribe.qos))),
@@ -441,7 +457,7 @@ impl Handler for AuthHandler {
                     return (false, acc);
                 }
 
-                return if self.acl(*client_info, Some((PUB, publish.topic()))).await {
+                return if self.acl(&client_info.connect_info, Some((ACLType::Pub, publish.topic()))).await {
                     (
                         !self.cfg.read().await.break_if_allow,
                         Some(HookResult::PublishAclResult(PublishAclResult::Allow)),
@@ -453,7 +469,7 @@ impl Handler for AuthHandler {
             }
             Parameter::ClientDisconnected(_session, client_info, _reason) => {
                 log::debug!("ClientDisconnected");
-                self.cache_map.remove(&client_info.id.client_id);
+                self.cache_map.remove(&client_info.id);
             }
             _ => {
                 log::error!("unimplemented, {:?}", param)
@@ -475,30 +491,11 @@ lazy_static::lazy_static! {
 
 type Path = String;
 
-#[derive(Clone, Debug)]
-struct CacheKey(Path, Option<std::net::IpAddr>, Option<Password>, Option<(String, String)>);
-
-impl PartialEq<CacheKey> for CacheKey {
-    #[inline]
-    fn eq(&self, other: &CacheKey) -> bool {
-        self.0 == other.0 && self.1 == other.1 && self.2 == other.2 && self.3 == other.3
-    }
-}
-
-impl Eq for CacheKey {}
-
-impl std::hash::Hash for CacheKey {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-        self.1.hash(state);
-        self.2.hash(state);
-        self.3.hash(state);
-    }
-}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheItem(Path, Option<(ACLType, TopicName)>);
 
 #[derive(Debug, Default)]
 struct CacheValue {
     is_super: bool,
-    ignores: HashSet<CacheKey>,
+    ignores: HashSet<CacheItem>,
 }

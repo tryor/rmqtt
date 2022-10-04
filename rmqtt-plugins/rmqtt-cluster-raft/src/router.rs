@@ -5,7 +5,7 @@ use once_cell::sync::OnceCell;
 use rmqtt_raft::{Error, Mailbox, Result as RaftResult, Store};
 use tokio::sync::RwLock;
 
-use rmqtt::{ahash, anyhow, async_trait::async_trait, bincode, chrono, dashmap, log, once_cell, serde_json, tokio};
+use rmqtt::{ahash, anyhow, async_trait::async_trait, bincode, chrono, dashmap, log, MqttError, once_cell, serde_json, tokio};
 use rmqtt::{
     broker::{
         default::DefaultRouter,
@@ -17,7 +17,9 @@ use rmqtt::{
     },
     Result,
 };
+use rmqtt::rust_box::task_executor::SpawnExt;
 use rmqtt::stats::Counter;
+use crate::executor;
 
 use super::config::{BACKOFF_STRATEGY, retry};
 use super::message::{Message, MessageReply};
@@ -48,7 +50,7 @@ impl ClientStatus {
 pub(crate) struct ClusterRouter {
     inner: &'static DefaultRouter,
     raft_mailbox: Arc<RwLock<Option<Mailbox>>>,
-    client_statuses: DashMap<ClientId, ClientStatus>,
+    client_states: DashMap<ClientId, ClientStatus>,
     pub try_lock_timeout: Duration,
 }
 
@@ -59,7 +61,7 @@ impl ClusterRouter {
         INSTANCE.get_or_init(|| Self {
             inner: DefaultRouter::instance(),
             raft_mailbox: Arc::new(RwLock::new(None)),
-            client_statuses: DashMap::default(),
+            client_states: DashMap::default(),
             try_lock_timeout,
         })
     }
@@ -81,27 +83,32 @@ impl ClusterRouter {
 
     #[inline]
     pub(crate) fn _client_node_id(&self, client_id: &str) -> Option<NodeId> {
-        self.client_statuses.get(client_id).map(|entry| entry.id.node_id)
+        self.client_states.get(client_id).map(|entry| entry.id.node_id)
     }
 
     #[inline]
     pub(crate) fn id(&self, client_id: &str) -> Option<Id> {
-        self.client_statuses.get(client_id).map(|entry| entry.id.clone())
+        self.client_states.get(client_id).map(|entry| entry.id.clone())
+    }
+
+    #[inline]
+    pub(crate) fn states_count(&self) -> usize {
+        self.client_states.len()
     }
 
     #[inline]
     pub(crate) fn status(&self, client_id: &str) -> Option<ClientStatus> {
-        self.client_statuses.get(client_id).map(|entry| entry.value().clone())
+        self.client_states.get(client_id).map(|entry| entry.value().clone())
     }
 
     #[inline]
     pub(crate) fn remove_client_status(&self, client_id: &str) {
-        self.client_statuses.remove(client_id);
+        self.client_states.remove(client_id);
     }
 
     #[inline]
     pub(crate) fn _handshakings(&self) -> usize {
-        self.client_statuses
+        self.client_states
             .iter()
             .filter_map(|entry| if entry.handshaking { Some(()) } else { None })
             .count()
@@ -127,8 +134,11 @@ impl Router for &'static ClusterRouter {
         );
 
         let msg = Message::Add { topic_filter, id, qos, shared_group }.encode()?;
-        let _ = self.raft_mailbox().await.send(msg).await.map_err(anyhow::Error::new)?;
-
+        let mailbox = self.raft_mailbox().await;
+        let _ = async move {
+            mailbox.send(msg).await.map_err(anyhow::Error::new)
+        }.spawn(executor()).result().await
+            .map_err(|_| MqttError::from("Router::add(..), task execution failure"))??;
         Ok(())
     }
 
@@ -139,7 +149,16 @@ impl Router for &'static ClusterRouter {
         let raft_mailbox = self.raft_mailbox().await;
         tokio::spawn(async move {
             if let Err(e) =
-            retry(BACKOFF_STRATEGY.clone(), || async { Ok(raft_mailbox.send(msg.clone()).await?) }).await
+            retry(BACKOFF_STRATEGY.clone(), || async {
+                let msg = msg.clone();
+                let mailbox = raft_mailbox.clone();
+                let res = async move { mailbox.send(msg).await }
+                    .spawn(executor()).result().await
+                    .map_err(|_| MqttError::from("Router::remove(..), task execution failure"))?
+                    .map_err(|e| MqttError::from(e.to_string()))?;
+                Ok(res)
+
+            }).await
             {
                 log::warn!("[Router.remove] Failed to send Message::Remove, id: {:?}, {:?}", id, e);
             }
@@ -155,7 +174,7 @@ impl Router for &'static ClusterRouter {
     ///Check online or offline
     async fn is_online(&self, node_id: NodeId, client_id: &str) -> bool {
         log::debug!("[Router.is_online] node_id: {:?}, client_id: {:?}", node_id, client_id);
-        self.client_statuses.get(client_id).map(|entry| entry.online).unwrap_or(false)
+        self.client_states.get(client_id).map(|entry| entry.online).unwrap_or(false)
     }
 
     #[inline]
@@ -166,6 +185,11 @@ impl Router for &'static ClusterRouter {
     #[inline]
     async fn get(&self, topic: &str) -> Result<Vec<Route>> {
         self.inner.get(topic).await
+    }
+
+    #[inline]
+    async fn topics_tree(&self) -> usize {
+        self.inner.topics_tree().await
     }
 
     #[inline]
@@ -209,7 +233,7 @@ impl Store for &'static ClusterRouter {
                 log::debug!("[Router.HandshakeTryLock] id: {:?}", id);
                 let mut try_lock_ok = false;
                 let mut prev_id = None;
-                self.client_statuses
+                self.client_states
                     .entry(id.client_id.clone())
                     .and_modify(|status| {
                         prev_id = Some(status.id.clone());
@@ -231,7 +255,7 @@ impl Store for &'static ClusterRouter {
                 return if try_lock_ok {
                     Ok(MessageReply::HandshakeTryLock(prev_id).encode().map_err(|_e| Error::Unknown)?)
                 } else {
-                    Ok(MessageReply::Error("handshake try lock error".into())
+                    Ok(MessageReply::Error("Handshake try lock failed".into())
                         .encode()
                         .map_err(|_e| Error::Unknown)?)
                 };
@@ -239,7 +263,7 @@ impl Store for &'static ClusterRouter {
             Message::Connected { id } => {
                 log::debug!("[Router.Connected] id: {:?}", id);
                 let mut reply = None;
-                self.client_statuses.entry(id.client_id.clone()).and_modify(|status| {
+                self.client_states.entry(id.client_id.clone()).and_modify(|status| {
                     if status.id != id && id.create_time < status.id.create_time {
                         log::info!("[Router.Connected] id not the same, input id: {:?}, current status: {:?}", id, status);
                         reply = Some(MessageReply::Error("id not the same".into()));
@@ -261,7 +285,7 @@ impl Store for &'static ClusterRouter {
             }
             Message::Disconnected { id } => {
                 log::debug!("[Router.Disconnected] id: {:?}", id,);
-                if let Some(mut entry) = self.client_statuses.get_mut(&id.client_id) {
+                if let Some(mut entry) = self.client_states.get_mut(&id.client_id) {
                     let mut status = entry.value_mut();
                     if status.id != id {
                         log::info!(
@@ -278,7 +302,7 @@ impl Store for &'static ClusterRouter {
             }
             Message::SessionTerminated { id } => {
                 log::debug!("[Router.SessionTerminated] id: {:?}", id,);
-                self.client_statuses.remove_if(&id.client_id, |_, status| {
+                self.client_states.remove_if(&id.client_id, |_, status| {
                     if status.id != id {
                         log::info!("[Router.SessionTerminated] id not the same, input id: {:?}, current status: {:?}", id, status);
                         false
@@ -338,8 +362,8 @@ impl Store for &'static ClusterRouter {
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
-        let client_statuses = &self
-            .client_statuses
+        let client_states = &self
+            .client_states
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
@@ -350,19 +374,19 @@ impl Store for &'static ClusterRouter {
         let snapshot = bincode::serialize(&(
             self.inner.topics.read().await.as_ref(),
             relations,
-            client_statuses,
+            client_states,
             topics_count,
             relations_count,
         ))
             .map_err(|e| Error::Other(e))?;
-        log::debug!("snapshot len: {}", snapshot.len());
+        log::info!("create snapshot, len: {}", snapshot.len());
         Ok(snapshot)
     }
 
     async fn restore(&mut self, snapshot: &[u8]) -> RaftResult<()> {
         log::info!("restore, snapshot.len: {}", snapshot.len());
 
-        let (topics, relations, client_statuses, topics_count, relations_count): (
+        let (topics, relations, client_states, topics_count, relations_count): (
             TopicTree<()>,
             Vec<(TopicFilter, HashMap<ClientId, (Id, QoS, Option<SharedGroup>)>)>,
             Vec<(ClientId, ClientStatus)>,
@@ -379,9 +403,9 @@ impl Store for &'static ClusterRouter {
         }
         self.inner.relations_count.set(&relations_count);
 
-        self.client_statuses.clear();
-        for (client_id, content) in client_statuses {
-            self.client_statuses.insert(client_id, content);
+        self.client_states.clear();
+        for (client_id, content) in client_states {
+            self.client_states.insert(client_id, content);
         }
 
         Ok(())

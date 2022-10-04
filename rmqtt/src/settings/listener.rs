@@ -93,10 +93,8 @@ pub struct ListenerInner {
     pub workers: usize,
     #[serde(default = "ListenerInner::max_connections_default")]
     pub max_connections: usize,
-    #[serde(default = "ListenerInner::max_handshake_rate_default")]
-    pub max_handshake_rate: usize,
-    #[serde(default = "ListenerInner::max_handshake_limit_default")]
-    pub max_handshake_limit: usize,
+    #[serde(default = "ListenerInner::max_handshaking_limit_default")]
+    pub max_handshaking_limit: usize,
     #[serde(default = "ListenerInner::max_packet_size_default")]
     pub max_packet_size: Bytesize,
     #[serde(default = "ListenerInner::backlog_default")]
@@ -185,12 +183,8 @@ impl ListenerInner {
         1024000
     }
     #[inline]
-    fn max_handshake_limit_default() -> usize {
-        1000
-    }
-    #[inline]
-    fn max_handshake_rate_default() -> usize {
-        2000
+    fn max_handshaking_limit_default() -> usize {
+        500
     }
     #[inline]
     fn max_packet_size_default() -> Bytesize {
@@ -276,6 +270,16 @@ impl ListenerInner {
     #[inline]
     fn shared_subscription_default() -> bool {
         true
+    }
+
+    #[inline]
+    pub fn handshake_timeout(&self) -> u16 {
+        let millis = self.handshake_timeout.as_millis();
+        if millis > 0xffff{
+            0xffff
+        }else{
+            millis as u16
+        }
     }
 
     #[inline]

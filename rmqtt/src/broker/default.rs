@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use itertools::Itertools;
-use leaky_bucket::RateLimiter;
 use ntex_mqtt::types::{MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
 use once_cell::sync::OnceCell;
 use tokio::sync::{self, Mutex, OwnedMutexGuard};
@@ -27,7 +26,7 @@ use crate::settings::listener::Listener;
 use crate::stats::Counter;
 
 use super::{
-    Entry, IsOnline, Limiter, LimiterManager, retain::RetainTree, RetainStorage, Router, Shared,
+    Entry, IsOnline, retain::RetainTree, RetainStorage, Router, Shared,
     SharedSubscription, SubRelations, SubRelationsMap, topic::TopicTree,
 };
 
@@ -67,10 +66,16 @@ impl LockEntry {
     }
 
     #[inline]
-    pub async fn _remove_with(&mut self, clear_subscriptions: bool, with_id: &Id) -> Option<(Session, Tx, ClientInfo)> {
-        if let Some((_, peer)) = { self.shared.peers.remove_if(&self.id.client_id, |_, entry| &entry.c.id == with_id) } {
+    pub async fn _remove_with(
+        &mut self,
+        clear_subscriptions: bool,
+        with_id: &Id,
+    ) -> Option<(Session, Tx, ClientInfo)> {
+        if let Some((_, peer)) =
+        { self.shared.peers.remove_if(&self.id.client_id, |_, entry| &entry.c.id == with_id) }
+        {
             if clear_subscriptions {
-                for topic_filter in peer.s.subscriptions.clone() {
+                for topic_filter in peer.s.subscriptions.to_topic_filters() {
                     if let Err(e) = self._unsubscribe(peer.c.id.clone(), &topic_filter).await {
                         log::warn!(
                             "{:?} remove._unsubscribe, topic_filter: {}, {:?}",
@@ -92,7 +97,7 @@ impl LockEntry {
     pub async fn _remove(&mut self, clear_subscriptions: bool) -> Option<(Session, Tx, ClientInfo)> {
         if let Some((_, peer)) = { self.shared.peers.remove(&self.id.client_id) } {
             if clear_subscriptions {
-                for topic_filter in peer.s.subscriptions.clone() {
+                for topic_filter in peer.s.subscriptions.to_topic_filters() {
                     if let Err(e) = self._unsubscribe(peer.c.id.clone(), &topic_filter).await {
                         log::warn!(
                             "{:?} remove._unsubscribe, topic_filter: {}, {:?}",
@@ -132,7 +137,7 @@ impl super::Entry for LockEntry {
     }
 
     #[inline]
-    fn id_same(&self) -> Option<bool>{
+    fn id_same(&self) -> Option<bool> {
         self.shared.peers.get(&self.id.client_id).map(|peer| peer.c.id == self.id)
     }
 
@@ -500,6 +505,16 @@ impl Shared for &'static DefaultShared {
             online: entry.c.is_connected(),
             handshaking: false,
         })
+    }
+
+    #[inline]
+    async fn clinet_states_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    #[inline]
+    fn sessions_count(&self) -> usize{
+        self.peers.len()
     }
 
     #[inline]
@@ -925,14 +940,17 @@ impl Router for &'static DefaultRouter {
     }
 
     #[inline]
+    async fn topics_tree(&self) -> usize {
+        self.topics.read().await.values_size()
+    }
+
+    #[inline]
     fn topics(&self) -> Counter {
-        //self.relations.len()
         self.topics_count.clone()
     }
 
     #[inline]
     fn routes(&self) -> Counter {
-        //self.relations.iter().map(|rels| rels.len()).sum::<usize>()
         self.relations_count.clone()
     }
 
@@ -1266,6 +1284,62 @@ impl HookManager for &'static DefaultHookManager {
         }
     }
 
+    #[inline]
+    async fn client_authenticate(
+        &self,
+        connect_info: &ConnectInfo,
+        allow_anonymous: bool,
+    ) -> ConnectAckReason {
+        let proto_ver = connect_info.proto_ver();
+        let ok = || match proto_ver {
+            MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
+            MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
+            MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::Success),
+            _ => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
+        };
+
+        log::debug!("{:?} username: {:?}", connect_info.id(), connect_info.username());
+        if connect_info.username().is_none() && allow_anonymous {
+            return ok();
+        }
+
+        let result = self.exec(Type::ClientAuthenticate, Parameter::ClientAuthenticate(connect_info)).await;
+        log::debug!("{:?} result: {:?}", connect_info.id(), result);
+        let (bad_user_or_pass, not_auth) = match result {
+            Some(HookResult::AuthResult(AuthResult::BadUsernameOrPassword)) => (true, false),
+            Some(HookResult::AuthResult(AuthResult::NotAuthorized)) => (false, true),
+            Some(HookResult::AuthResult(AuthResult::Allow)) => return ok(),
+            _ => {
+                //or AuthResult::NotFound
+                if allow_anonymous {
+                    return ok();
+                } else {
+                    (false, true)
+                }
+            }
+        };
+
+        if bad_user_or_pass {
+            return match proto_ver {
+                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword),
+                _ => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+            };
+        }
+
+        if not_auth {
+            return match proto_ver {
+                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::NotAuthorized),
+                _ => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+            };
+        }
+
+        ok()
+    }
+
     ///When sending mqtt:: connectack message
     async fn client_connack(
         &self,
@@ -1372,60 +1446,6 @@ impl Hook for DefaultHook {
     #[inline]
     async fn session_created(&self) {
         self.manager.exec(Type::SessionCreated, Parameter::SessionCreated(&self.s, &self.c)).await;
-    }
-
-    #[inline]
-    async fn client_authenticate(&self, password: Option<Password>) -> ConnectAckReason {
-        let ok = || match self.c.protocol() {
-            MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
-            MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
-            MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::Success),
-            _ => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
-        };
-
-        log::debug!("{:?} username: {:?}", self.s.id, self.c.connect_info.username());
-        if self.c.connect_info.username().is_none() && self.s.listen_cfg.allow_anonymous {
-            return ok();
-        }
-
-        let result = self
-            .manager
-            .exec(Type::ClientAuthenticate, Parameter::ClientAuthenticate(&self.s, &self.c, password))
-            .await;
-        log::debug!("{:?} result: {:?}", self.s.id, result);
-        let (bad_user_or_pass, not_auth) = match result {
-            Some(HookResult::AuthResult(AuthResult::BadUsernameOrPassword)) => (true, false),
-            Some(HookResult::AuthResult(AuthResult::NotAuthorized)) => (false, true),
-            Some(HookResult::AuthResult(AuthResult::Allow)) => return ok(),
-            _ => {
-                //or AuthResult::NotFound
-                if self.s.listen_cfg.allow_anonymous {
-                    return ok();
-                } else {
-                    (false, true)
-                }
-            }
-        };
-
-        if bad_user_or_pass {
-            return match self.c.protocol() {
-                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword),
-                _ => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-            };
-        }
-
-        if not_auth {
-            return match self.c.protocol() {
-                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::NotAuthorized),
-                _ => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-            };
-        }
-
-        ok()
     }
 
     #[inline]
@@ -1575,83 +1595,5 @@ impl Hook for DefaultHook {
             return false;
         }
         true
-    }
-}
-
-pub struct DefaultLimiterManager {
-    limiters: DashMap<String, DefaultLimiter>,
-}
-
-impl DefaultLimiterManager {
-    #[inline]
-    pub fn instance() -> &'static DefaultLimiterManager {
-        static INSTANCE: OnceCell<DefaultLimiterManager> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self { limiters: DashMap::default() })
-    }
-}
-
-impl LimiterManager for &'static DefaultLimiterManager {
-    #[inline]
-    fn get(&self, name: String, listen_cfg: Listener) -> Result<Box<dyn Limiter>> {
-        let l = self
-            .limiters
-            .entry(name)
-            .or_insert_with(|| {
-                DefaultLimiter::new(
-                    listen_cfg.max_handshake_rate,
-                    listen_cfg.max_handshake_limit,
-                    listen_cfg.handshake_timeout,
-                )
-            })
-            .value()
-            .clone();
-        Ok(Box::new(l))
-    }
-}
-
-#[derive(Clone)]
-pub struct DefaultLimiter {
-    max_handshake_limit: isize,
-    limiter: Arc<RateLimiter>,
-    handshake_timeout: Duration,
-}
-
-impl DefaultLimiter {
-    #[inline]
-    pub fn new(max_handshake_rate: usize, max_handshake_limit: usize, handshake_timeout: Duration) -> Self {
-        Self {
-            max_handshake_limit: max_handshake_limit as isize,
-            limiter: Arc::new(
-                RateLimiter::builder()
-                    .initial(max_handshake_rate)
-                    .refill(max_handshake_rate)
-                    .max(max_handshake_rate)
-                    .interval(Duration::from_millis(1000))
-                    // .fair(false)
-                    .build(),
-            ),
-            handshake_timeout,
-        }
-    }
-}
-
-#[async_trait]
-impl Limiter for DefaultLimiter {
-    #[inline]
-    async fn acquire(&self, handshakings: isize) -> Result<()> {
-        if self.max_handshake_limit > 0 && handshakings > self.max_handshake_limit {
-            return Err(MqttError::from(format!(
-                "too many concurrent handshake connections, handshakings: {}",
-                handshakings
-            )));
-        }
-
-        let now = std::time::Instant::now();
-        self.limiter.acquire_one().await;
-        if now.elapsed() > self.handshake_timeout {
-            Err(MqttError::from(format!("handshake timeout, acquire cost time: {:?}", now.elapsed())))
-        } else {
-            Ok(())
-        }
     }
 }

@@ -14,6 +14,7 @@ type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 pub mod default;
 pub mod error;
 pub mod fitter;
+pub mod executor;
 pub mod hook;
 pub mod inflight;
 pub mod metrics;
@@ -87,6 +88,12 @@ pub trait Shared: Sync + Send {
     async fn session_status(&self, client_id: &str) -> Option<SessionStatus>;
 
     ///
+    async fn clinet_states_count(&self) -> usize;
+
+    ///
+    fn sessions_count(&self) -> usize;
+
+    ///
     async fn query_subscriptions(&self, q: SubsSearchParams) -> Vec<SubsSearchResult>;
 
     ///This node is not included
@@ -142,6 +149,9 @@ pub trait Router: Sync + Send {
 
     ///
     async fn get(&self, topic: &str) -> Result<Vec<Route>>;
+
+    ///
+    async fn topics_tree(&self) -> usize;
 
     ///Return number of subscribed topics
     fn topics(&self) -> Counter;
@@ -225,14 +235,4 @@ pub trait RetainStorage: Sync + Send {
 
     ///
     fn max(&self) -> isize;
-}
-
-#[async_trait]
-pub trait LimiterManager: Sync + Send {
-    fn get(&self, name: String, listen_cfg: Listener) -> Result<Box<dyn Limiter>>;
-}
-
-#[async_trait]
-pub trait Limiter: Sync + Send {
-    async fn acquire(&self, handshakings: isize) -> Result<()>;
 }

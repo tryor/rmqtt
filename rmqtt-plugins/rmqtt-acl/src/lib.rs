@@ -6,12 +6,16 @@ use std::sync::Arc;
 
 use config::{Access, Control, PH_C, PH_U, PluginConfig};
 use rmqtt::{
+    async_trait::async_trait,
+    log, serde_json,
+    tokio::{self, sync::RwLock},
+};
+use rmqtt::{
     broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
     broker::types::{AuthResult, PublishAclResult, SubscribeAckReason, SubscribeAclResult, Topic},
     plugin::{DynPlugin, DynPluginResult, Plugin},
     Result, Runtime,
 };
-use rmqtt::{async_trait::async_trait, log, serde_json, tokio::{self, sync::RwLock}};
 
 mod config;
 
@@ -115,7 +119,6 @@ impl Plugin for AclPlugin {
 
 struct AclHandler {
     cfg: Arc<RwLock<PluginConfig>>,
-    // cache_map: CacheMap,
 }
 
 impl AclHandler {
@@ -169,7 +172,7 @@ impl Handler for AclHandler {
                 tokio::spawn(build_placeholders);
             }
 
-            Parameter::ClientAuthenticate(_session, client_info, _password) => {
+            Parameter::ClientAuthenticate(connect_info) => {
                 log::debug!("ClientAuthenticate acl");
                 if matches!(
                     acc,
@@ -183,8 +186,8 @@ impl Handler for AclHandler {
                     if !matches!(rule.control, Control::Connect | Control::All) {
                         continue;
                     }
-                    if rule.user.hit(client_info) {
-                        log::debug!("{:?} ClientAuthenticate, rule: {:?}", client_info.id, rule);
+                    if rule.user.hit(connect_info) {
+                        log::debug!("{:?} ClientAuthenticate, rule: {:?}", connect_info.id(), rule);
                         return if matches!(rule.access, Access::Allow) {
                             (true, Some(HookResult::AuthResult(AuthResult::Allow)))
                         } else {
@@ -208,7 +211,7 @@ impl Handler for AclHandler {
                     if !matches!(rule.control, Control::Subscribe | Control::Pubsub | Control::All) {
                         continue;
                     }
-                    if !rule.user.hit(client_info) {
+                    if !rule.user.hit(&client_info.connect_info) {
                         continue;
                     }
                     if !rule.topics.is_match(&topic, topic_filter).await {
@@ -254,7 +257,7 @@ impl Handler for AclHandler {
                     if !matches!(rule.control, Control::Publish | Control::Pubsub | Control::All) {
                         continue;
                     }
-                    if !rule.user.hit(client_info) {
+                    if !rule.user.hit(&client_info.connect_info) {
                         continue;
                     }
                     if !rule.topics.is_match(&topic, topic_str).await {

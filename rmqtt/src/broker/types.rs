@@ -44,7 +44,6 @@ pub type TopicName = bytestring::ByteString;
 pub type Topic = ntex_mqtt::Topic;
 ///topic filter
 pub type TopicFilter = bytestring::ByteString;
-// pub type TopicFilterString = String;
 pub type SharedGroup = String;
 pub type IsDisconnect = bool;
 pub type MessageExpiry = bool;
@@ -52,6 +51,7 @@ pub type TimestampMillis = i64;
 pub type Timestamp = i64;
 pub type IsOnline = bool;
 pub type IsAdmin = bool;
+pub type LimiterName = u16;
 
 pub type Tx = mpsc::UnboundedSender<Message>;
 pub type Rx = mpsc::UnboundedReceiver<Message>;
@@ -80,6 +80,14 @@ impl ConnectInfo {
         match self {
             ConnectInfo::V3(id, _) => id,
             ConnectInfo::V5(id, _) => id,
+        }
+    }
+
+    #[inline]
+    pub fn client_id(&self) -> &ClientId {
+        match self {
+            ConnectInfo::V3(_, c) => &c.client_id,
+            ConnectInfo::V5(_, c) => &c.client_id,
         }
     }
 
@@ -149,6 +157,14 @@ impl ConnectInfo {
     }
 
     #[inline]
+    pub fn password(&self) -> Option<&Password> {
+        match self {
+            ConnectInfo::V3(_, conn_info) => conn_info.password.as_ref(),
+            ConnectInfo::V5(_, conn_info) => conn_info.password.as_ref(),
+        }
+    }
+
+    #[inline]
     pub fn clean_start(&self) -> bool {
         match self {
             ConnectInfo::V3(_, conn_info) => conn_info.clean_session,
@@ -160,7 +176,7 @@ impl ConnectInfo {
     pub fn proto_ver(&self) -> u8 {
         match self {
             ConnectInfo::V3(_, conn_info) => conn_info.protocol.level(),
-            ConnectInfo::V5(_, _) => 5,
+            ConnectInfo::V5(_, _) => MQTT_LEVEL_5,
         }
     }
 }
@@ -858,7 +874,7 @@ impl Id {
                 local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
                 remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
                 client_id,
-                username.as_ref().map(|un| <ByteString as AsRef<str>>::as_ref(un)).unwrap_or_default(),
+                username.as_ref().map(<UserName as AsRef<str>>::as_ref).unwrap_or_default()
             )),
             node_id,
             local_addr,
@@ -1025,12 +1041,11 @@ pub struct Route {
     pub topic: TopicFilter,
 }
 
-
 pub struct SessionSubs(Arc<_SessionSubs>);
 
-impl SessionSubs{
+impl SessionSubs {
     #[inline]
-    pub(crate) fn new() -> Self{
+    pub(crate) fn new() -> Self {
         Self(Arc::new(_SessionSubs::new()))
     }
 }
@@ -1043,18 +1058,15 @@ impl Deref for SessionSubs {
     }
 }
 
-pub struct _SessionSubs{
+pub struct _SessionSubs {
     subs: DashMap<TopicFilter, SubscriptionValue>,
 }
 
-impl _SessionSubs{
+impl _SessionSubs {
     #[inline]
-    pub(crate) fn new() -> Self{
-        Self{
-            subs: DashMap::default(),
-        }
+    pub(crate) fn new() -> Self {
+        Self { subs: DashMap::default() }
     }
-
 
     #[inline]
     pub fn add(&self, topic_filter: TopicFilter, qos: QoS, shared_group: Option<SharedGroup>) {
@@ -1081,10 +1093,7 @@ impl _SessionSubs{
     }
 
     #[inline]
-    pub fn remove(
-        &self,
-        topic_filter: &str,
-    ) -> Option<(TopicFilter, SubscriptionValue)> {
+    pub fn remove(&self, topic_filter: &str) -> Option<(TopicFilter, SubscriptionValue)> {
         let removed = self.subs.remove(topic_filter);
         if let Some((_, (_, group))) = &removed {
             Runtime::instance().stats.subscriptions.dec();
@@ -1104,7 +1113,7 @@ impl _SessionSubs{
 
     #[inline]
     pub fn extend(&self, subs: Subscriptions) {
-        for (topic_filter, (qos, group)) in subs{
+        for (topic_filter, (qos, group)) in subs {
             self.add(topic_filter, qos, group);
         }
     }
@@ -1127,12 +1136,24 @@ impl _SessionSubs{
     }
 
     #[inline]
-    pub fn clone(&self) -> TopicFilters {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn to_topic_filters(&self) -> TopicFilters {
         self.subs.iter().map(|entry| TopicFilter::from(entry.key().as_ref())).collect()
     }
 
     #[inline]
-    pub fn iter(&self) -> dashmap::iter::Iter<TopicFilter, SubscriptionValue, ahash::RandomState, DashMap<TopicFilter, SubscriptionValue>> {
+    pub fn iter(
+        &self,
+    ) -> dashmap::iter::Iter<
+        TopicFilter,
+        SubscriptionValue,
+        ahash::RandomState,
+        DashMap<TopicFilter, SubscriptionValue>,
+    > {
         self.subs.iter()
     }
 }

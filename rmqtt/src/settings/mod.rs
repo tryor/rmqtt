@@ -3,21 +3,27 @@ use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
-
+use std::str::FromStr;
 use chrono::TimeZone;
 use config::{Config, ConfigError, File};
 use parking_lot::RwLock;
-use serde::de::{Deserialize, Deserializer};
+use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::Serializer;
 use serde::Serialize;
+use once_cell::sync::OnceCell;
 
-use crate::{NodeId, Result};
+use crate::{Addr, MqttError, NodeId, Result};
 
 use self::listener::Listeners;
 use self::log::Log;
+pub use self::options::Options;
+pub use self::listener::Listener;
 
 pub mod listener;
 pub mod log;
+pub mod options;
+
+static SETTINGS: OnceCell<Settings> = OnceCell::new();
 
 #[derive(Clone)]
 pub struct Settings(Arc<Inner>);
@@ -37,6 +43,8 @@ pub struct Inner {
     pub plugins: Plugins,
     #[serde(default)]
     pub mqtt: Mqtt,
+    #[serde(default, skip)]
+    pub opts: Options,
 }
 
 impl Deref for Settings {
@@ -47,15 +55,19 @@ impl Deref for Settings {
 }
 
 impl Settings {
-    pub fn new() -> Result<Self, ConfigError> {
+
+    fn new(opts: Options) -> Result<Self, ConfigError> {
         let mut s = Config::new();
 
-        if let Ok(cfg_filename) = std::env::var("RMQTT-CONFIG-FILENAME") {
-            s.merge(File::with_name(&cfg_filename).required(false))?;
-        }
+        // if let Ok(cfg_filename) = std::env::var("RMQTT-CONFIG-FILENAME") {
+        //     s.merge(File::with_name(&cfg_filename).required(false))?;
+        // }
         s.merge(File::with_name("/etc/rmqtt/rmqtt").required(false))?;
         s.merge(File::with_name("/etc/rmqtt").required(false))?;
         s.merge(File::with_name("rmqtt").required(false))?;
+        if let Some(cfg) = opts.cfg_name.as_ref() {
+            s.merge(File::with_name(cfg).required(false))?;
+        }
 
         let mut inner: Inner = match s.try_into() {
             Ok(c) => c,
@@ -66,12 +78,46 @@ impl Settings {
 
         inner.listeners.init();
         if inner.listeners.tcps.is_empty() && inner.listeners.tlss.is_empty() {
-            return Err(ConfigError::Message(
-                "Settings::new() error, listener.tcp or listener.tls is not exist".into(),
-            ));
+            //set default
+            inner.listeners.set_default();
         }
 
+        //Command line configuration overriding file configuration
+        if let Some(id) = opts.node_id {
+            if id > 0 {
+                inner.node.id = id;
+            }
+        }
+        if let Some(plugins_default_startups) = opts.plugins_default_startups.as_ref() {
+            inner.plugins.default_startups = plugins_default_startups.clone()
+        }
+
+        inner.opts = opts;
         Ok(Self(Arc::new(inner)))
+    }
+
+    #[inline]
+    pub fn instance() -> &'static Self {
+        SETTINGS.get().unwrap()
+    }
+
+    #[inline]
+    pub fn init(opts: Options) -> &'static Self {
+        SETTINGS.set(Settings::new(opts).unwrap()).unwrap();
+        SETTINGS.get().unwrap()
+    }
+
+    #[inline]
+    pub fn logs() {
+        let cfg = Self::instance();
+        crate::log::debug!("Config info is {:?}", cfg.0);
+        crate::log::info!("node_id is {}", cfg.node.id);
+        if cfg.opts.node_grpc_addrs.is_some() {
+            crate::log::info!("node_grpc_addrs is {:?}", cfg.opts.node_grpc_addrs);
+        }
+        if cfg.opts.raft_peer_addrs.is_some() {
+            crate::log::info!("raft_peer_addrs is {:?}", cfg.opts.raft_peer_addrs);
+        }
     }
 }
 
@@ -88,46 +134,43 @@ pub struct Node {
     pub id: NodeId,
     #[serde(default = "Node::cookie_default")]
     pub cookie: String,
-    #[serde(default = "Node::crash_dump_default")]
-    pub crash_dump: String,
+    // #[serde(default = "Node::crash_dump_default")]
+    // pub crash_dump: String,
 }
 
 impl Node {
     fn cookie_default() -> String {
         "rmqttsecretcookie".into()
     }
-    fn crash_dump_default() -> String {
-        "/var/log/rmqtt/crash.dump".into()
-    }
+    // fn crash_dump_default() -> String {
+    //     "/var/log/rmqtt/crash.dump".into()
+    // }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rpc {
-    #[serde(default = "Rpc::mode_default")]
-    pub mode: String, // = "async"
 
     #[serde(default = "Rpc::server_addr_default", deserialize_with = "deserialize_addr")]
-    pub server_addr: SocketAddr, // = "0.0.0.0:5363"
+    pub server_addr: SocketAddr,
 
     #[serde(default = "Rpc::server_workers_default")]
-    pub server_workers: usize, //4
+    pub server_workers: usize,
 
     #[serde(default = "Rpc::client_concurrency_limit_default")]
-    pub client_concurrency_limit: usize, // = 128
+    pub client_concurrency_limit: usize,
 
     #[serde(default = "Rpc::client_timeout_default", deserialize_with = "deserialize_duration")]
     pub client_timeout: Duration,
-    //= "5s"
+
     //#Maximum number of messages sent in batch
     #[serde(default = "Rpc::batch_size_default")]
-    pub batch_size: usize, // = 128
+    pub batch_size: usize,
 }
 
 impl Default for Rpc {
     #[inline]
     fn default() -> Self {
         Self {
-            mode: Self::mode_default(),
             batch_size: Self::batch_size_default(),
             server_addr: Self::server_addr_default(),
             server_workers: Self::server_workers_default(),
@@ -138,9 +181,6 @@ impl Default for Rpc {
 }
 
 impl Rpc {
-    fn mode_default() -> String {
-        "async".into()
-    }
     fn batch_size_default() -> usize {
         128
     }
@@ -285,6 +325,19 @@ pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Erro
 }
 
 #[inline]
+pub fn deserialize_duration_option<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+{
+    let v = String::deserialize(deserializer)?;
+    if v.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(to_duration(&v)))
+    }
+}
+
+#[inline]
 pub fn to_duration(text: &str) -> Duration {
     let text = text.to_lowercase().replace("ms", "Y");
     let ms: u64 = text
@@ -343,7 +396,7 @@ pub fn deserialize_addr_option<'de, D>(
 }
 
 #[inline]
-pub fn deserialize_duration_option<'de, D>(deserializer: D) -> std::result::Result<Option<Duration>, D::Error>
+pub fn deserialize_datetime_option<'de, D>(deserializer: D) -> std::result::Result<Option<Duration>, D::Error>
     where
         D: Deserializer<'de>,
 {
@@ -362,7 +415,7 @@ pub fn deserialize_duration_option<'de, D>(deserializer: D) -> std::result::Resu
 }
 
 #[inline]
-pub fn serialize_duration_option<S>(t: &Option<Duration>, s: S) -> std::result::Result<S::Ok, S::Error>
+pub fn serialize_datetime_option<S>(t: &Option<Duration>, s: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
 {
@@ -370,5 +423,44 @@ pub fn serialize_duration_option<S>(t: &Option<Duration>, s: S) -> std::result::
         t.as_secs().to_string().serialize(s)
     } else {
         "".serialize(s)
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct NodeAddr {
+    pub id: NodeId,
+    pub addr: Addr,
+}
+
+impl std::fmt::Debug for NodeAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{:?}", self.id, self.addr)
+    }
+}
+
+impl FromStr for NodeAddr {
+    type Err = MqttError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('@').collect();
+        if parts.len() < 2 {
+            return Err(MqttError::Msg(format!(
+                "NodeAddr format error, {}",
+                s
+            )));
+        }
+        let id = NodeId::from_str(parts[0]).map_err(|e|MqttError::ParseIntError(e))?;
+        //let addr = parts[1].parse().map_err(|e|MqttError::AddrParseError(e))?;
+        let addr = Addr::from(parts[1]);
+        Ok(NodeAddr { id, addr })
+    }
+}
+
+impl<'de> de::Deserialize<'de> for NodeAddr {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: de::Deserializer<'de>,
+    {
+        Ok(NodeAddr::from_str(&String::deserialize(deserializer)?)
+            .map_err(de::Error::custom)?)
     }
 }

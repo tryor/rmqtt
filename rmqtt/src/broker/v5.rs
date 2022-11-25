@@ -3,12 +3,12 @@ use std::net::SocketAddr;
 
 use ntex_mqtt::v5;
 use ntex_mqtt::v5::codec::{Auth, DisconnectReasonCode};
-use rust_box::task_executor::LocalSpawnExt;
+use rust_box::task_exec_queue::LocalSpawnExt;
 
 use crate::{ClientInfo, MqttError, Result, Runtime, Session, SessionState};
 use crate::broker::{inflight::MomentStatus, types::*};
+use crate::broker::executor::get_handshake_exec_queue;
 use crate::settings::listener::Listener;
-use crate::broker::executor::get_handshake_executor;
 
 #[inline]
 async fn refused_ack<Io>(
@@ -58,34 +58,26 @@ pub async fn handshake<Io: 'static>(
     let id1 = id.clone();
     Runtime::instance().stats.handshakings.max_max(handshake.handshakings());
 
-    let exec = get_handshake_executor(local_addr.port(), listen_cfg.clone());
+    let exec = get_handshake_exec_queue(local_addr.port(), listen_cfg.clone());
 
     let start = chrono::Local::now().timestamp_millis();
     let handshake_fut = async move {
         if (chrono::Local::now().timestamp_millis() - start) > listen_cfg.handshake_timeout() as i64 {
             Runtime::instance().metrics.client_handshaking_timeout_inc();
-            return Err(MqttError::from("execute handshake timeout"))
+            return Err(MqttError::from("execute handshake timeout"));
         }
         _handshake(id, listen_cfg, handshake).await
     };
 
-    match handshake_fut.spawn(&exec).result().await{
+    match handshake_fut.spawn(&exec).result().await {
         Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => {
-            log::warn!(
-                    "{:?} Connection Refused, handshake error, reason: {:?}",
-                    id1,
-                    e.to_string()
-                );
+            log::warn!("{:?} Connection Refused, handshake error, reason: {:?}", id1, e.to_string());
             Err(e)
-        },
+        }
         Err(e) => {
             Runtime::instance().metrics.client_handshaking_timeout_inc();
-            log::warn!(
-                "{:?} Connection Refused, handshake timeout, reason: {:?}",
-                id1,
-                e.to_string()
-            );
+            log::warn!("{:?} Connection Refused, handshake timeout, reason: {:?}", id1, e.to_string());
             Err(MqttError::from("Connection Refused, execute handshake timeout"))
         }
     }
@@ -97,7 +89,6 @@ pub async fn _handshake<Io: 'static>(
     listen_cfg: Listener,
     mut handshake: v5::Handshake<Io>,
 ) -> Result<v5::HandshakeAck<Io, SessionState>, MqttError> {
-
     let connect_info = ConnectInfo::V5(id.clone(), Box::new(handshake.packet().clone()));
 
     //hook, client connect

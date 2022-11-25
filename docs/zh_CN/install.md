@@ -17,13 +17,13 @@ RMQTT 目前支持的操作系统:
 1. 从[GitHub Release](https://github.com/rmqtt/rmqtt/releases) 下载zip包。
 
 ```bash
-$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.5/rmqtt-0.2.5-x86_64-unknown-linux-musl.zip"
+$ wget "https://github.com/rmqtt/rmqtt/releases/download/0.2.8/rmqtt-0.2.8-x86_64-unknown-linux-musl.zip"
 ```
 
 2. 解压从[GitHub Release](https://github.com/rmqtt/rmqtt/releases) 下载的zip包。
 
 ```bash
-$ unzip rmqtt-0.2.5-x86_64-unknown-linux-musl.zip -d /app/
+$ unzip rmqtt-0.2.8-x86_64-unknown-linux-musl.zip -d /app/
 ```
 
 3. 修改权限
@@ -182,6 +182,14 @@ $ apt install pkg-config -y
 $ apt-get install libssl-dev -y
 ```
 
+4. 安装protoc
+   
+   如果编译时报: protoc directory is not found，那么需要在以下位置下载并安装匹配安装包:
+
+```bash
+   https://github.com/protocolbuffers/protobuf/releases
+```
+
 ##### 编译
 
 1. 获取源码
@@ -251,7 +259,7 @@ listener.tls.external.key = "/app/rmqtt/etc/rmqtt.key"
 
 ```bash
 $ cd /app/rmqtt
-./bin/rmqttd "./etc/rmqtt.toml"
+./bin/rmqttd -f "./etc/rmqtt.toml"
 ```
 
 

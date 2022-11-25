@@ -29,6 +29,10 @@ use rmqtt::{
     Result,
     Runtime, tokio::time::sleep,
 };
+use rmqtt::{
+    once_cell::sync::OnceCell,
+    rust_box::task_exec_queue::{Builder, TaskExecQueue},
+};
 use router::ClusterRouter;
 use shared::ClusterShared;
 
@@ -79,24 +83,26 @@ impl ClusterPlugin {
     #[inline]
     async fn new<S: Into<String>>(runtime: &'static Runtime, name: S, descr: S) -> Result<Self> {
         let name = name.into();
-        let cfg =
-            runtime
-                .settings
-                .plugins
-                .load_config::<PluginConfig>(&name)
-                .map_err(|e| MqttError::from(e.to_string()))?;
-        log::debug!("{} ClusterPlugin cfg: {:?}", name, cfg);
+        let mut cfg = runtime
+            .settings
+            .plugins
+            .load_config::<PluginConfig>(&name)
+            .map_err(|e| MqttError::from(e.to_string()))?;
+        log::info!("{} ClusterPlugin cfg: {:?}", name, cfg);
+        cfg.merge(&runtime.settings.opts);
 
-        init_executor(cfg.executor_workers, cfg.executor_queue_max);
+        init_task_exec_queue(cfg.task_exec_queue_workers, cfg.task_exec_queue_max);
 
         let register = runtime.extends.hook_mgr().await.register();
         let mut grpc_clients = HashMap::default();
+
         let node_grpc_addrs = cfg.node_grpc_addrs.clone();
+        log::info!("node_grpc_addrs: {:?}", node_grpc_addrs);
         for node_addr in &node_grpc_addrs {
             if node_addr.id != runtime.node.id() {
                 grpc_clients.insert(
                     node_addr.id,
-                    (node_addr.addr, runtime.node.new_grpc_client(&node_addr.addr).await?),
+                    (node_addr.addr.clone(), runtime.node.new_grpc_client(&node_addr.addr).await?),
                 );
             }
         }
@@ -122,21 +128,21 @@ impl ClusterPlugin {
 
     //raft init ...
     async fn start_raft(cfg: Arc<RwLock<PluginConfig>>, router: &'static ClusterRouter) -> Mailbox {
+
+        let raft_peer_addrs = cfg.read().raft_peer_addrs.clone();
+
         let id = Runtime::instance().node.id();
-        let raft_addr = cfg
-            .read()
-            .raft_peer_addrs
+        let raft_laddr = raft_peer_addrs
             .iter()
             .find(|peer| peer.id == id)
             .map(|peer| peer.addr.to_string())
             .expect("raft listening address does not exist");
         let logger = Runtime::instance().logger.clone();
-        let raft = Raft::new(raft_addr, router, logger);
+        log::info!("raft_laddr: {:?}", raft_laddr);
+        let raft = Raft::new(raft_laddr, router, logger, cfg.read().raft.to_raft_config());
         let mailbox = raft.mailbox();
 
-        let peer_addrs = cfg
-            .read()
-            .raft_peer_addrs
+        let peer_addrs = raft_peer_addrs
             .iter()
             .filter_map(|peer| if peer.id != id { Some(peer.addr.to_string()) } else { None })
             .collect();
@@ -300,13 +306,13 @@ impl Plugin for ClusterPlugin {
             nodes.insert(*node_id, stats);
         }
 
-        let exec = executor();
+        let exec = task_exec_queue();
         json!({
             "grpc_clients": nodes,
             "raft_status": raft_status,
             "raft_pears": pears,
             "client_states": self.router.states_count(),
-            "executor": {
+            "task_exec_queue": {
                 "waiting_count": exec.waiting_count(),
                 "active_count": exec.active_count(),
                 "completed_count": exec.completed_count(),
@@ -324,7 +330,6 @@ pub(crate) struct MessageSender {
 }
 
 impl MessageSender {
-
     #[inline]
     async fn send(&mut self) -> Result<MessageReply> {
         let mut current_retry = 0usize;
@@ -388,29 +393,20 @@ pub(crate) async fn hook_message_dropped(droppeds: Vec<(To, From, Publish, Reaso
     }
 }
 
-use rmqtt::{
-        once_cell::sync::OnceCell,
-        rust_box::task_executor::{Builder, Executor}
-    };
-
-
-static EXECUTOR: OnceCell<Executor> = OnceCell::new();
+static TASK_EXEC_QUEUE: OnceCell<TaskExecQueue> = OnceCell::new();
 
 #[inline]
-fn init_executor(workers: usize, queue_max: usize) {
-    let (exec, task_runner) = Builder::default()
-        .workers(workers)
-        .queue_max(queue_max)
-        .build();
+fn init_task_exec_queue(workers: usize, queue_max: usize) {
+    let (exec, task_runner) = Builder::default().workers(workers).queue_max(queue_max).build();
 
-    tokio::spawn(async move{
+    tokio::spawn(async move {
         task_runner.await;
     });
 
-    EXECUTOR.set(exec).ok().expect("Failed to initialize executor")
+    TASK_EXEC_QUEUE.set(exec).ok().expect("Failed to initialize task execution queue")
 }
 
 #[inline]
-pub(crate) fn executor() -> &'static Executor {
-    EXECUTOR.get().expect("Executor not initialized")
+pub(crate) fn task_exec_queue() -> &'static TaskExecQueue {
+    TASK_EXEC_QUEUE.get().expect("TaskExecQueue not initialized")
 }

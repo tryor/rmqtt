@@ -17,13 +17,13 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 1. Download the ZIP package from [GitHub Release](https://github.com/rmqtt/rmqtt/releases).
 
 ```bash
-$ wget "https://github.com/rmqtt/rmqtt/releases/download/v0.2.5/rmqtt-0.2.5-x86_64-unknown-linux-musl.zip"
+$ wget "https://github.com/rmqtt/rmqtt/releases/download/0.2.8/rmqtt-0.2.8-x86_64-unknown-linux-musl.zip"
 ```
 
 2. Decompress the zip package you downloaded from [GitHub Release](https://github.com/rmqtt/rmqtt/releases).
 
 ```bash
-$ unzip rmqtt-0.2.5-x86_64-unknown-linux-musl.zip -d /app/
+$ unzip rmqtt-0.2.8-x86_64-unknown-linux-musl.zip -d /app/
 ```
 
 3. Modify the permissions
@@ -155,6 +155,16 @@ $ apt install pkg-config -y
 $ apt-get install libssl-dev -y
 ```
 
+4. Install protoc
+
+   If the compiler reports: protoc directory is not found,
+   then you need to download and install the matching installation package in the following location:
+
+```bash
+   https://github.com/protocolbuffers/protobuf/releases
+```
+
+
 ##### Compile
 
 1. Get source code
@@ -225,7 +235,7 @@ listener.tls.external.key = "/app/rmqtt/etc/rmqtt.key"
 
 ```bash
 $ cd /app/rmqtt
-./bin/rmqttd "./etc/rmqtt.toml"
+./bin/rmqttd -f "./etc/rmqtt.toml"
 ```
 
 

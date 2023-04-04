@@ -1,6 +1,8 @@
-use rmqtt::{anyhow, bincode};
+use rmqtt_raft::Status;
+
 use rmqtt::broker::types::{Id, NodeId, QoS, SharedGroup};
 use rmqtt::Result;
+use rmqtt::{anyhow, bincode};
 
 use super::Mailbox;
 
@@ -52,5 +54,37 @@ pub(crate) async fn get_client_node_id(raft_mailbox: Mailbox, client_id: &str) -
         Ok(bincode::deserialize(&reply).map_err(anyhow::Error::new)?)
     } else {
         Ok(None)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum RaftGrpcMessage {
+    GetRaftStatus,
+}
+
+impl RaftGrpcMessage {
+    #[inline]
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+    }
+    #[inline]
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize::<Self>(data).map_err(anyhow::Error::new)?)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum RaftGrpcMessageReply {
+    GetRaftStatus(Status),
+}
+
+impl RaftGrpcMessageReply {
+    #[inline]
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+    }
+    #[inline]
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize::<Self>(data).map_err(anyhow::Error::new)?)
     }
 }

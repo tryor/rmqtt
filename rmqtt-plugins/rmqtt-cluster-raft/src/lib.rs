@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 #[macro_use]
 extern crate serde;
 
@@ -5,7 +6,6 @@ use std::convert::From as _f;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
 use rmqtt_raft::{Mailbox, Raft};
 
 use config::PluginConfig;
@@ -14,9 +14,9 @@ use retainer::ClusterRetainer;
 use rmqtt::{
     ahash, anyhow,
     async_trait::async_trait,
-    futures, log,
-    RwLock,
-    serde_json::{self, json}, tokio,
+    log,
+    serde_json::{self, json},
+    tokio, RwLock,
 };
 use rmqtt::{
     broker::{
@@ -26,8 +26,8 @@ use rmqtt::{
     },
     grpc::{client::NodeGrpcClient, GrpcClients, Message, MessageReply, MessageType},
     plugin::{DynPlugin, DynPluginResult, Plugin},
-    Result,
-    Runtime, tokio::time::sleep,
+    tokio::time::sleep,
+    Result, Runtime,
 };
 use rmqtt::{
     once_cell::sync::OnceCell,
@@ -95,6 +95,7 @@ impl ClusterPlugin {
 
         let register = runtime.extends.hook_mgr().await.register();
         let mut grpc_clients = HashMap::default();
+        let mut node_names = HashMap::default();
 
         let node_grpc_addrs = cfg.node_grpc_addrs.clone();
         log::info!("node_grpc_addrs: {:?}", node_grpc_addrs);
@@ -105,10 +106,11 @@ impl ClusterPlugin {
                     (node_addr.addr.clone(), runtime.node.new_grpc_client(&node_addr.addr).await?),
                 );
             }
+            node_names.insert(node_addr.id, format!("{}@{}", node_addr.id, node_addr.addr));
         }
         let grpc_clients = Arc::new(grpc_clients);
         let router = ClusterRouter::get_or_init(cfg.try_lock_timeout);
-        let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), cfg.message_type);
+        let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), node_names, cfg.message_type);
         let retainer = ClusterRetainer::get_or_init(grpc_clients.clone(), cfg.message_type);
         let raft_mailbox = None;
         let cfg = Arc::new(RwLock::new(cfg));
@@ -128,7 +130,6 @@ impl ClusterPlugin {
 
     //raft init ...
     async fn start_raft(cfg: Arc<RwLock<PluginConfig>>, router: &'static ClusterRouter) -> Mailbox {
-
         let raft_peer_addrs = cfg.read().raft_peer_addrs.clone();
 
         let id = Runtime::instance().node.id();
@@ -352,38 +353,38 @@ impl MessageSender {
     }
 }
 
-pub struct MessageBroadcaster {
-    grpc_clients: GrpcClients,
-    msg_type: MessageType,
-    msg: Option<Message>,
-}
-
-impl MessageBroadcaster {
-    pub fn new(grpc_clients: GrpcClients, msg_type: MessageType, msg: Message) -> Self {
-        Self { grpc_clients, msg_type, msg: Some(msg) }
-    }
-
-    #[inline]
-    pub async fn join_all(&mut self) -> Vec<Result<MessageReply>> {
-        let msg_type = self.msg_type;
-        let msg = self.msg.take().unwrap();
-        let mut senders = Vec::new();
-        let max_idx = self.grpc_clients.len() - 1;
-        for (i, (_, (_, grpc_client))) in self.grpc_clients.iter().enumerate() {
-            let grpc_client = grpc_client.clone();
-            if i == max_idx {
-                let fut = async move { grpc_client.send_message(msg_type, msg).await };
-                senders.push(fut.boxed());
-                break;
-            } else {
-                let msg = msg.clone();
-                let fut = async move { grpc_client.send_message(msg_type, msg).await };
-                senders.push(fut.boxed());
-            }
-        }
-        futures::future::join_all(senders).await
-    }
-}
+//pub struct MessageBroadcaster {
+//    grpc_clients: GrpcClients,
+//    msg_type: MessageType,
+//    msg: Option<Message>,
+//}
+//
+//impl MessageBroadcaster {
+//    pub fn new(grpc_clients: GrpcClients, msg_type: MessageType, msg: Message) -> Self {
+//        Self { grpc_clients, msg_type, msg: Some(msg) }
+//    }
+//
+//    #[inline]
+//    pub async fn join_all(&mut self) -> Vec<Result<MessageReply>> {
+//        let msg_type = self.msg_type;
+//        let msg = self.msg.take().unwrap();
+//        let mut senders = Vec::new();
+//        let max_idx = self.grpc_clients.len() - 1;
+//        for (i, (_, (_, grpc_client))) in self.grpc_clients.iter().enumerate() {
+//            let grpc_client = grpc_client.clone();
+//            if i == max_idx {
+//                let fut = async move { grpc_client.send_message(msg_type, msg).await };
+//                senders.push(fut.boxed());
+//                break;
+//            } else {
+//                let msg = msg.clone();
+//                let fut = async move { grpc_client.send_message(msg_type, msg).await };
+//                senders.push(fut.boxed());
+//            }
+//        }
+//        futures::future::join_all(senders).await
+//    }
+//}
 
 #[inline]
 pub(crate) async fn hook_message_dropped(droppeds: Vec<(To, From, Publish, Reason)>) {

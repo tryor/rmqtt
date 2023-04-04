@@ -1,13 +1,14 @@
 use std::convert::From as _f;
 use std::fmt;
+use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::net::SocketAddr;
+
 use bytestring::ByteString;
 use ntex::util::Bytes;
 use ntex_mqtt::error::SendPacketError;
-pub use ntex_mqtt::types::{MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5, Protocol};
+pub use ntex_mqtt::types::{Protocol, MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
 pub use ntex_mqtt::v3::{
     self, codec::Connect as ConnectV3, codec::ConnectAckReason as ConnectAckReasonV3,
     codec::LastWill as LastWillV3, codec::Packet as PacketV3,
@@ -24,13 +25,14 @@ pub use ntex_mqtt::v5::{
     codec::UserProperty, HandshakeAck as HandshakeAckV5, MqttSink as MqttSinkV5,
 };
 use serde::de::{Deserialize, Deserializer};
-use serde::ser::{Serialize, Serializer, SerializeStruct};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::{MqttError, Result, Runtime};
 
 pub type NodeId = u64;
+pub type NodeName = String;
 pub type RemoteSocketAddr = SocketAddr;
 pub type LocalSocketAddr = SocketAddr;
 pub type Addr = bytestring::ByteString;
@@ -68,7 +70,7 @@ pub type SubscriptionValue = (QoS, Option<SharedGroup>);
 pub type HookSubscribeResult = Vec<Option<TopicFilter>>;
 pub type HookUnsubscribeResult = Vec<Option<TopicFilter>>;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConnectInfo {
     V3(Id, ConnectV3),
     V5(Id, Box<ConnectV5>),
@@ -93,7 +95,7 @@ impl ConnectInfo {
 
     #[inline]
     pub fn to_json(&self) -> serde_json::Value {
-        let json = match self {
+        match self {
             ConnectInfo::V3(id, conn_info) => {
                 json!({
                     "node": id.node(),
@@ -128,8 +130,7 @@ impl ConnectInfo {
                     "max_packet_size": conn_info.max_packet_size,
                 })
             }
-        };
-        json
+        }
     }
 
     #[inline]
@@ -181,7 +182,7 @@ impl ConnectInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disconnect {
     V3,
     V5(DisconnectV5),
@@ -232,13 +233,13 @@ impl QoSEx for QoS {
 
 pub type SubscribeAclResult = SubscribeReturn;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishAclResult {
     Allow,
     Rejected(IsDisconnect),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthResult {
     Allow,
     ///User is not found
@@ -256,7 +257,7 @@ pub fn parse_topic_filter(
     //$share/abc/
     let topic = if shared_subscription_supported {
         let mut levels = topic_filter.splitn(3, '/').collect::<Vec<_>>();
-        let is_share = levels.get(0).map(|f| *f == "$share").unwrap_or(false);
+        let is_share = levels.first().map(|f| *f == "$share").unwrap_or(false);
         if is_share {
             if levels.len() < 3 {
                 return Err(err);
@@ -348,7 +349,7 @@ impl SubscribeReturn {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SubscribedV5 {
     /// Packet Identifier
     pub packet_id: NonZeroU16,
@@ -359,7 +360,7 @@ pub struct SubscribedV5 {
     pub topic_filter: (ByteString, SubscriptionOptions),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectAckReason {
     V3(ConnectAckReasonV3),
     V5(ConnectAckReasonV5),
@@ -390,16 +391,12 @@ impl ConnectAckReason {
     pub fn success_or_auth_error(&self) -> (bool, bool) {
         match *self {
             ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted)
-            | ConnectAckReason::V5(ConnectAckReasonV5::Success) => {
-                (true, false)
-            },
+            | ConnectAckReason::V5(ConnectAckReasonV5::Success) => (true, false),
             ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized)
             | ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword)
             | ConnectAckReason::V5(ConnectAckReasonV5::NotAuthorized)
-            | ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword) => {
-                (false, true)
-            },
-            _ => (false, false)
+            | ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword) => (false, true),
+            _ => (false, false),
         }
     }
 
@@ -532,8 +529,8 @@ impl<'a> LastWill<'a> {
 impl<'a> Serialize for LastWill<'a> {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where
-            S: Serializer,
+    where
+        S: Serializer,
     {
         match self {
             LastWill::V3(lw) => {
@@ -620,7 +617,7 @@ pub enum Packet {
     V5(PacketV5),
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Default)]
 pub struct PublishProperties {
     pub topic_alias: Option<NonZeroU16>,
     pub correlation_data: Option<Bytes>,
@@ -989,8 +986,8 @@ impl Deref for Id {
 impl Serialize for Id {
     #[inline]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where
-            S: Serializer,
+    where
+        S: Serializer,
     {
         _Id::serialize(self.0.as_ref(), serializer)
     }
@@ -999,8 +996,8 @@ impl Serialize for Id {
 impl<'de> Deserialize<'de> for Id {
     #[inline]
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         Ok(Id(Arc::new(_Id::deserialize(deserializer)?)))
     }

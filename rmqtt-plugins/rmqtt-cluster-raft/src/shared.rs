@@ -1,26 +1,33 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use futures::future::FutureExt;
 use once_cell::sync::OnceCell;
 
-use rmqtt::{anyhow, async_trait::async_trait, futures, log, once_cell, tokio};
+use rmqtt::anyhow::Error;
+use rmqtt::broker::Router;
+use rmqtt::grpc::MessageBroadcaster;
+use rmqtt::serde_json::json;
+use rmqtt::{anyhow, async_trait::async_trait, futures, log, once_cell, serde_json, tokio};
 use rmqtt::{
     broker::{
         default::DefaultShared,
-        Entry,
         session::{ClientInfo, Session, SessionOfflineInfo},
-        Shared, SubRelations, SubRelationsMap, types::{
-            From, Id, IsAdmin, NodeId, Publish, Reason, SessionStatus, Subscribe, SubscribeReturn,
-            SubsSearchParams, SubsSearchResult, To, Tx, Unsubscribe,
+        types::{
+            From, Id, IsAdmin, NodeId, NodeName, Publish, Reason, SessionStatus, SubsSearchParams,
+            SubsSearchResult, Subscribe, SubscribeReturn, To, Tx, Unsubscribe,
         },
+        Entry, Shared, SubRelations, SubRelationsMap,
     },
     grpc::{Message, MessageReply, MessageType},
     MqttError, Result, Runtime,
 };
-use rmqtt::broker::Router;
 
-use super::{ClusterRouter, GrpcClients, MessageSender, NodeGrpcClient};
-use super::message::{get_client_node_id, Message as RaftMessage, MessageReply as RaftMessageReply};
+use super::message::{
+    get_client_node_id, Message as RaftMessage, MessageReply as RaftMessageReply, RaftGrpcMessage,
+    RaftGrpcMessageReply,
+};
+use super::{ClusterRouter, GrpcClients, HashMap, MessageSender, NodeGrpcClient};
 
 pub struct ClusterLockEntry {
     inner: Box<dyn Entry>,
@@ -234,8 +241,8 @@ impl Entry for ClusterLockEntry {
                     max_retries: 0,
                     retry_interval: Duration::from_millis(500),
                 }
-                    .send()
-                    .await;
+                .send()
+                .await;
                 match reply {
                     Ok(MessageReply::SubscriptionsGet(subs)) => subs,
                     Err(e) => {
@@ -256,6 +263,7 @@ pub struct ClusterShared {
     inner: &'static DefaultShared,
     router: &'static ClusterRouter,
     grpc_clients: GrpcClients,
+    node_names: HashMap<NodeId, NodeName>,
     pub message_type: MessageType,
 }
 
@@ -264,10 +272,17 @@ impl ClusterShared {
     pub(crate) fn get_or_init(
         router: &'static ClusterRouter,
         grpc_clients: GrpcClients,
+        node_names: HashMap<NodeId, NodeName>,
         message_type: MessageType,
     ) -> &'static ClusterShared {
         static INSTANCE: OnceCell<ClusterShared> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self { inner: DefaultShared::instance(), router, grpc_clients, message_type })
+        INSTANCE.get_or_init(|| Self {
+            inner: DefaultShared::instance(),
+            router,
+            grpc_clients,
+            node_names,
+            message_type,
+        })
     }
 
     #[inline]
@@ -392,7 +407,7 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    fn iter(&self) -> Box<dyn Iterator<Item=Box<dyn Entry>> + Sync + Send> {
+    fn iter(&self) -> Box<dyn Iterator<Item = Box<dyn Entry>> + Sync + Send> {
         self.inner.iter()
     }
 
@@ -429,5 +444,67 @@ impl Shared for &'static ClusterShared {
     #[inline]
     fn get_grpc_clients(&self) -> GrpcClients {
         self.grpc_clients.clone()
+    }
+
+    #[inline]
+    fn node_name(&self, id: NodeId) -> String {
+        self.node_names.get(&id).cloned().unwrap_or_default()
+    }
+
+    #[inline]
+    async fn check_health(&self) -> Result<Option<serde_json::Value>> {
+        let mut node_statuses = Vec::new();
+        let mailbox = self.router.raft_mailbox().await;
+        let status = mailbox.status().await.map_err(Error::new)?;
+        let mut leader_ids = HashSet::new();
+        node_statuses.push(json!({
+            "node_id": status.id,
+            "leader_id": status.leader_id,
+        }));
+        leader_ids.insert(status.leader_id);
+
+        let data = RaftGrpcMessage::GetRaftStatus.encode()?;
+        let replys =
+            MessageBroadcaster::new(self.grpc_clients.clone(), self.message_type, Message::Data(data))
+                .join_all()
+                .await;
+
+        for (node_id, reply) in replys {
+            match reply {
+                Ok(reply) => {
+                    if let MessageReply::Data(data) = reply {
+                        let RaftGrpcMessageReply::GetRaftStatus(o_status) =
+                            RaftGrpcMessageReply::decode(&data)?;
+                        node_statuses.push(json!({
+                            "node_id": o_status.id,
+                            "leader_id": o_status.leader_id,
+                        }));
+                        leader_ids.insert(o_status.leader_id);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                Err(e) => {
+                    log::error!("Get RaftGrpcMessage::GetRaftStatus from other node, error: {:?}", e);
+                    node_statuses.push(json!({
+                        "node_id": node_id,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        let status = if leader_ids.len() != 1 {
+            "Leader ID exception"
+        } else if leader_ids.into_iter().next() == Some(0) {
+            "Leader does not exist"
+        } else {
+            "Ok"
+        };
+
+        Ok(Some(json!({
+            "status": status,
+            "nodes": node_statuses,
+        })))
     }
 }

@@ -1,12 +1,13 @@
 use std::time::Duration;
 
-use rmqtt::{anyhow, bincode, chrono, HashMap, MqttError, QoS, Reason, serde_json};
-use rmqtt::{metrics::Metrics, stats::Stats};
-use rmqtt::{ClientId, NodeId, Timestamp, TopicFilter, TopicName, UserName};
+use rmqtt::chrono::LocalResult;
 use rmqtt::node::{BrokerInfo, NodeInfo, NodeStatus};
 use rmqtt::plugin::PluginInfo;
-use rmqtt::Result;
 use rmqtt::settings::{deserialize_datetime_option, serialize_datetime_option};
+use rmqtt::Result;
+use rmqtt::{anyhow, bincode, chrono, serde_json, HashMap, MqttError, QoS, Reason};
+use rmqtt::{metrics::Metrics, stats::Stats};
+use rmqtt::{ClientId, NodeId, Timestamp, TopicFilter, TopicName, UserName};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message<'a> {
@@ -82,30 +83,30 @@ pub struct ClientSearchParams {
     pub _like_username: Option<String>,
     //Substring fuzzy search
     #[serde(
-    default,
-    deserialize_with = "deserialize_datetime_option",
-    serialize_with = "serialize_datetime_option"
+        default,
+        deserialize_with = "deserialize_datetime_option",
+        serialize_with = "serialize_datetime_option"
     )]
     pub _gte_created_at: Option<Duration>,
     //Greater than or equal search
     #[serde(
-    default,
-    deserialize_with = "deserialize_datetime_option",
-    serialize_with = "serialize_datetime_option"
+        default,
+        deserialize_with = "deserialize_datetime_option",
+        serialize_with = "serialize_datetime_option"
     )]
     pub _lte_created_at: Option<Duration>,
     //Less than or equal search
     #[serde(
-    default,
-    deserialize_with = "deserialize_datetime_option",
-    serialize_with = "serialize_datetime_option"
+        default,
+        deserialize_with = "deserialize_datetime_option",
+        serialize_with = "serialize_datetime_option"
     )]
     pub _gte_connected_at: Option<Duration>,
     //Greater than or equal search
     #[serde(
-    default,
-    deserialize_with = "deserialize_datetime_option",
-    serialize_with = "serialize_datetime_option"
+        default,
+        deserialize_with = "deserialize_datetime_option",
+        serialize_with = "serialize_datetime_option"
     )]
     pub _lte_connected_at: Option<Duration>,
     //Less than or equal search
@@ -287,6 +288,10 @@ fn format_timestamp(t: i64) -> String {
         "".into()
     } else {
         use chrono::TimeZone;
-        chrono::Local.timestamp(t, 0).format("%Y-%m-%d %H:%M:%S").to_string()
+        if let LocalResult::Single(t) = chrono::Local.timestamp_opt(t, 0) {
+            t.format("%Y-%m-%d %H:%M:%S").to_string()
+        } else {
+            "".into()
+        }
     }
 }

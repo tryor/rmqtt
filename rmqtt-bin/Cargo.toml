@@ -1,8 +1,15 @@
 [package]
 name = "rmqttd"
-version = "0.2.9"
-authors = ["rmqtt <rmqttd@126.com>"]
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+categories.workspace = true
+keywords.workspace = true
+exclude.workspace = true
+rust-version.workspace = true
 build = "build.rs"
 
 [[bin]]
@@ -17,7 +24,7 @@ lto = true
 opt-level = 's'
 codegen-units = 1
 
-[target.'cfg(linux)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.5"
 
 [dependencies]
@@ -47,5 +54,5 @@ rmqtt-cluster-raft = { immutable = true }
 
 [build-dependencies]
 toml = "0.5"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = [] }
 

@@ -1,31 +1,31 @@
 use std::net::SocketAddr;
 
-use salvo::extra::affix;
-use salvo::http::header::{CONTENT_TYPE, HeaderValue};
+use salvo::affix;
+use salvo::http::header::{HeaderValue, CONTENT_TYPE};
 use salvo::prelude::*;
 
 use rmqtt::{
-    anyhow, base64, bytes, chrono, futures, HashMap,
-    log,
+    anyhow, base64, bytes, chrono, futures, log,
     serde_json::{self, json},
     tokio::sync::oneshot,
+    HashMap,
 };
 use rmqtt::{
     broker::types::NodeId,
-    ClientId,
     grpc::{
         client::NodeGrpcClient, Message as GrpcMessage, MessageBroadcaster, MessageReply as GrpcMessageReply,
         MessageSender, MessageType,
     },
-    Id, MqttError, node::NodeStatus, Publish, PublishProperties, QoS, Result, Retain, Runtime, SubsSearchParams,
+    node::NodeStatus,
+    ClientId, Id, MqttError, Publish, PublishProperties, QoS, Result, Retain, Runtime, SubsSearchParams,
     TopicFilter, TopicName, UserName,
 };
 
-use super::{clients, plugin, subs};
-use super::PluginConfigType;
 use super::types::{
     ClientSearchParams, Message, MessageReply, PublishParams, SubscribeParams, UnsubscribeParams,
 };
+use super::PluginConfigType;
+use super::{clients, plugin, subs};
 
 fn route(cfg: PluginConfigType) -> Router {
     Router::with_path("api/v1")
@@ -33,6 +33,7 @@ fn route(cfg: PluginConfigType) -> Router {
         .get(list_apis)
         .push(Router::with_path("brokers").get(get_brokers).push(Router::with_path("<id>").get(get_brokers)))
         .push(Router::with_path("nodes").get(get_nodes).push(Router::with_path("<id>").get(get_nodes)))
+        .push(Router::with_path("health/check").get(check_health))
         .push(
             Router::with_path("clients").get(search_clients).push(
                 Router::with_path("<clientid>")
@@ -107,7 +108,12 @@ async fn list_apis(res: &mut Response) {
             "path": "/nodes/{node}",
             "descr": "Returns the status of the node"
         },
-
+        {
+            "name": "check_health",
+            "method": "GET",
+            "path": "/health/check",
+            "descr": "Node health check"
+        },
         {
             "name": "search_clients",
             "method": "GET",
@@ -402,6 +408,15 @@ async fn _get_nodes(message_type: MessageType) -> Result<Vec<serde_json::Value>>
 }
 
 #[handler]
+async fn check_health(_req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+    match Runtime::instance().extends.shared().await.check_health().await {
+        Ok(Some(health_info)) => res.render(Json(health_info)),
+        Ok(None) => res.set_status_code(StatusCode::NOT_FOUND),
+        Err(e) => res.set_status_error(StatusError::service_unavailable().with_detail(e.to_string())),
+    }
+}
+
+#[handler]
 async fn get_client(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let cfg = depot.obtain::<PluginConfigType>().cloned().unwrap();
     let message_type = cfg.read().message_type;
@@ -452,7 +467,7 @@ async fn search_clients(req: &mut Request, depot: &mut Depot, res: &mut Response
     let cfg = depot.obtain::<PluginConfigType>().cloned().unwrap();
     let message_type = cfg.read().message_type;
     let max_row_limit = cfg.read().max_row_limit;
-    let mut q = match req.extract_queries::<ClientSearchParams>() {
+    let mut q = match req.parse_queries::<ClientSearchParams>() {
         Ok(q) => q,
         Err(e) => return res.set_status_error(StatusError::bad_request().with_detail(e.to_string())),
     };
@@ -540,7 +555,7 @@ async fn check_online(req: &mut Request, res: &mut Response) {
 async fn query_subscriptions(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let cfg = depot.obtain::<PluginConfigType>().cloned().unwrap();
     let max_row_limit = cfg.read().max_row_limit;
-    let mut q = match req.extract_queries::<SubsSearchParams>() {
+    let mut q = match req.parse_queries::<SubsSearchParams>() {
         Ok(q) => q,
         Err(e) => return res.set_status_error(StatusError::bad_request().with_detail(e.to_string())),
     };
@@ -613,7 +628,8 @@ async fn publish(req: &mut Request, depot: &mut Depot, res: &mut Response) {
             addr.as_ipv6().map(|ipv6| SocketAddr::V6(*ipv6))
         }
     });
-    let params = match req.extract_json::<PublishParams>().await {
+
+    let params = match req.parse_json::<PublishParams>().await {
         Ok(p) => p,
         Err(e) => return res.set_status_error(StatusError::bad_request().with_detail(e.to_string())),
     };
@@ -706,13 +722,13 @@ async fn _publish(
 
 #[handler]
 async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let params = match req.extract_json::<SubscribeParams>().await {
+    let params = match req.parse_json::<SubscribeParams>().await {
         Ok(p) => p,
         Err(e) => return res.set_status_error(StatusError::bad_request().with_detail(e.to_string())),
     };
 
     let node_id = if let Some(status) =
-    Runtime::instance().extends.shared().await.session_status(&params.clientid).await
+        Runtime::instance().extends.shared().await.session_status(&params.clientid).await
     {
         if status.online {
             status.id.node_id
@@ -788,13 +804,13 @@ async fn _subscribe_on_other_node(
 
 #[handler]
 async fn unsubscribe(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let params = match req.extract_json::<UnsubscribeParams>().await {
+    let params = match req.parse_json::<UnsubscribeParams>().await {
         Ok(p) => p,
         Err(e) => return res.set_status_error(StatusError::bad_request().with_detail(e.to_string())),
     };
 
     let node_id = if let Some(status) =
-    Runtime::instance().extends.shared().await.session_status(&params.clientid).await
+        Runtime::instance().extends.shared().await.session_status(&params.clientid).await
     {
         if status.online {
             status.id.node_id
@@ -1160,7 +1176,7 @@ async fn _get_stats_sum(message_type: MessageType) -> Result<serde_json::Value> 
     if !grpc_clients.is_empty() {
         let msg = Message::StatsInfo.encode()?;
         for reply in
-        MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
+            MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
         {
             match reply {
                 (id, Ok(GrpcMessageReply::Data(msg))) => match MessageReply::decode(&msg)? {
@@ -1255,7 +1271,7 @@ async fn _get_stats_all(message_type: MessageType) -> Result<Vec<serde_json::Val
     if !grpc_clients.is_empty() {
         let msg = Message::StatsInfo.encode()?;
         for reply in
-        MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
+            MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
         {
             let data = match reply {
                 (id, Ok(GrpcMessageReply::Data(msg))) => match MessageReply::decode(&msg)? {
@@ -1384,7 +1400,7 @@ async fn _get_metrics_sum(message_type: MessageType) -> Result<serde_json::Value
     if !grpc_clients.is_empty() {
         let msg = Message::MetricsInfo.encode()?;
         for reply in
-        MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
+            MessageBroadcaster::new(grpc_clients, message_type, GrpcMessage::Data(msg)).join_all().await
         {
             match reply {
                 (_id, Ok(GrpcMessageReply::Data(msg))) => match MessageReply::decode(&msg)? {

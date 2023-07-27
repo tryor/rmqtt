@@ -2,7 +2,8 @@ use crate::broker::types::*;
 use crate::{grpc, ClientInfo, Result, Session};
 
 pub type Priority = u32;
-pub type ReturnType = (bool, Option<HookResult>);
+pub type Proceed = bool;
+pub type ReturnType = (Proceed, Option<HookResult>);
 
 #[async_trait]
 pub trait HookManager: Sync + Send {
@@ -21,7 +22,7 @@ pub trait HookManager: Sync + Send {
         &self,
         connect_info: &ConnectInfo,
         allow_anonymous: bool,
-    ) -> ConnectAckReason;
+    ) -> (ConnectAckReason, Superuser);
 
     ///When sending mqtt:: connectack message
     async fn client_connack(

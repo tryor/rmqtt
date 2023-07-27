@@ -21,8 +21,8 @@ debug = []
 
 [dependencies]
 rmqtt-macros = "0.1"
-ntex = { git = "https://github.com/rmqtt/ntex.git", branch = "0.3.17", features = ["rustls"] }
-ntex-mqtt = { git = "https://github.com/rmqtt/ntex-mqtt", branch = "0.6.14" }
+ntex = { git = "https://github.com/rmqtt/ntex.git", branch = "0.3.18", features = ["rustls"] }
+ntex-mqtt = { git = "https://github.com/rmqtt/ntex-mqtt", branch = "0.6.15" }
 #ntex = { path = "../../ntex/ntex", features = ["rustls"]}
 #ntex-mqtt = { path = "../../ntex-mqtt" }
 futures = "0.3"
@@ -63,6 +63,10 @@ rust-box = { version = "0.6.1", features = ["task-exec-queue", "task-exec-queue-
 structopt = "0.3"
 tokio-tungstenite = "0.18"
 pin-project-lite = "0.2.5"
+tokio-cron-scheduler = "0.9.4"
+update_rate = "2.0"
+bitflags = "2.3.3"
+time = "=0.3.20"
 
 [build-dependencies]
 tonic-build = "0.8"

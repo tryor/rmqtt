@@ -5,13 +5,14 @@ use std::sync::Arc;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::{self, Serialize};
 
+use rmqtt::broker::hook::Priority;
 use rmqtt::broker::topic::TopicTree;
 use rmqtt::{
-    ahash, dashmap,
+    ahash, dashmap, log,
     serde_json::{self, Value},
     tokio::sync::RwLock,
 };
-use rmqtt::{ClientId, ConnectInfo, MqttError, Result, Topic, UserName};
+use rmqtt::{ClientId, ConnectInfo, MqttError, Password, Result, Superuser, Topic, UserName};
 
 type DashSet<V> = dashmap::DashSet<V, ahash::RandomState>;
 
@@ -20,6 +21,14 @@ pub const PH_U: &str = "%u";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
+    ///Disconnect if publishing is rejected
+    #[serde(default = "PluginConfig::disconnect_if_pub_rejected_default")]
+    pub disconnect_if_pub_rejected: bool,
+
+    ///Hook priority
+    #[serde(default = "PluginConfig::priority_default")]
+    pub priority: Priority,
+
     #[serde(
         default,
         serialize_with = "PluginConfig::serialize_rules",
@@ -29,6 +38,14 @@ pub struct PluginConfig {
 }
 
 impl PluginConfig {
+    fn disconnect_if_pub_rejected_default() -> bool {
+        true
+    }
+
+    fn priority_default() -> Priority {
+        10
+    }
+
     #[inline]
     pub fn rules(&self) -> &Vec<Rule> {
         let (_rules, _) = &self.rules;
@@ -103,20 +120,22 @@ impl std::convert::TryFrom<&serde_json::Value> for Rule {
             let user_cfg = cfg_items.get(1).ok_or_else(|| MqttError::from(err_msg))?;
             let control_cfg = cfg_items.get(2);
             let topics_cfg = cfg_items.get(3);
-            let r = Rule {
-                access: Access::try_from(access_cfg)?,
-                user: User::try_from(user_cfg)?,
-                control: Control::try_from(control_cfg)?,
-                topics: Topics::try_from(topics_cfg)?,
-            };
-            Ok(r)
+
+            let access = Access::try_from(access_cfg)?;
+            let user = User::try_from((user_cfg, access))?;
+            let control = Control::try_from(control_cfg)?;
+            let topics = Topics::try_from(topics_cfg)?;
+            if topics_cfg.is_some() && matches!(control, Control::Connect) {
+                log::warn!("ACL Rule config, the third column of a quadruple is Connect, but the fourth column is not empty! topics config is {:?}", topics_cfg);
+            }
+            Ok(Rule { access, user, control, topics })
         } else {
             Err(MqttError::from(err_msg))
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Access {
     Allow,
     Deny,
@@ -124,7 +143,7 @@ pub enum Access {
 
 #[derive(Debug, Clone)]
 pub enum User {
-    Username(UserName),
+    Username(UserName, Option<Password>, Superuser),
     Clientid(ClientId),
     Ipaddr(String),
     All,
@@ -132,29 +151,34 @@ pub enum User {
 
 impl User {
     #[inline]
-    pub fn hit(&self, connect_info: &ConnectInfo) -> bool {
+    pub fn hit(&self, connect_info: &ConnectInfo, allow: bool) -> (bool, Superuser) {
         match self {
-            User::All => true,
-            User::Username(name1) => {
-                if let Some(name2) = connect_info.username() {
-                    name1 == name2
-                } else {
-                    false
+            User::All => (true, false),
+            User::Username(name1, password1, superuser) => {
+                match (connect_info.username(), connect_info.password(), password1, allow) {
+                    (Some(name2), Some(password2), Some(password1), true) => {
+                        (name1 == name2 && password1 == password2, *superuser)
+                    }
+                    (Some(name2), Some(_), &Some(_), false) => (name1 == name2, false),
+                    (Some(name2), _, None, true) => (name1 == name2, *superuser),
+                    (Some(name2), _, None, false) => (name1 == name2, false),
+                    (Some(_), None, Some(_), _) => (false, false),
+                    (None, _, _, _) => (false, false),
                 }
             }
-            User::Clientid(clientid) => connect_info.client_id() == clientid,
+            User::Clientid(clientid) => (connect_info.client_id() == clientid, false),
             User::Ipaddr(ipaddr) => {
                 if let Some(remote_addr) = connect_info.id().remote_addr {
-                    ipaddr == remote_addr.ip().to_string().as_str()
+                    (ipaddr == remote_addr.ip().to_string().as_str(), false)
                 } else {
-                    false
+                    (false, false)
                 }
             }
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Control {
     ///ALL
     All,
@@ -170,7 +194,7 @@ pub enum Control {
 
 #[derive(Debug, Clone)]
 pub struct Topics {
-    pub allow_all: bool,
+    pub all: bool,
     pub eqs: Arc<DashSet<String>>,
     pub eq_placeholders: Vec<String>,
     //"sensor/%u/ctrl", "sensor/%c/ctrl"
@@ -180,7 +204,7 @@ pub struct Topics {
 
 impl Topics {
     pub async fn is_match(&self, topic_filter: &Topic, topic_filter_str: &str) -> bool {
-        if self.allow_all {
+        if self.all {
             return true;
         }
         if self.eqs.contains(topic_filter_str) {
@@ -203,10 +227,11 @@ impl std::convert::TryFrom<&serde_json::Value> for Access {
     }
 }
 
-impl std::convert::TryFrom<&serde_json::Value> for User {
+impl std::convert::TryFrom<(&serde_json::Value, Access)> for User {
     type Error = MqttError;
     #[inline]
-    fn try_from(user_cfg: &serde_json::Value) -> Result<Self, Self::Error> {
+    fn try_from(user_cfg_access: (&serde_json::Value, Access)) -> Result<Self, Self::Error> {
+        let (user_cfg, access) = user_cfg_access;
         let err_msg = format!("ACL Rule config error, user config is {:?}", user_cfg);
         let user = match user_cfg {
             Value::String(all) => {
@@ -216,14 +241,52 @@ impl std::convert::TryFrom<&serde_json::Value> for User {
                     Err(MqttError::from(err_msg))
                 }
             }
-            Value::Object(map) => match (map.get("user"), map.get("clientid"), map.get("ipaddr")) {
-                (Some(Value::String(name)), _, _) => Ok(User::Username(UserName::from(name.as_str()))),
-                (_, Some(Value::String(clientid)), _) => {
-                    Ok(User::Clientid(ClientId::from(clientid.as_str())))
+            Value::Object(map) => {
+                match (
+                    access,
+                    map.get("user"),
+                    map.get("password"),
+                    map.get("superuser"),
+                    map.get("clientid"),
+                    map.get("ipaddr"),
+                ) {
+                    (Access::Allow, Some(Value::String(name)), password, superuser, _, _) => {
+                        if name.is_empty() {
+                            Err(MqttError::from(err_msg))
+                        } else {
+                            let password = match password {
+                                Some(Value::String(p)) => Some(Password::from(p.to_owned())),
+                                None => None,
+                                _ => return Err(MqttError::from(err_msg)),
+                            };
+                            let superuser = superuser.and_then(|s| s.as_bool()).unwrap_or_default();
+                            Ok(User::Username(UserName::from(name.as_str()), password, superuser))
+                        }
+                    }
+                    (Access::Deny, Some(Value::String(name)), None, None, _, _) => {
+                        if name.is_empty() {
+                            Err(MqttError::from(err_msg))
+                        } else {
+                            Ok(User::Username(UserName::from(name.as_str()), None, false))
+                        }
+                    }
+                    (_, _, _, _, Some(Value::String(clientid)), _) => {
+                        if clientid.is_empty() {
+                            Err(MqttError::from(err_msg))
+                        } else {
+                            Ok(User::Clientid(ClientId::from(clientid.as_str())))
+                        }
+                    }
+                    (_, _, _, _, _, Some(Value::String(ipaddr))) => {
+                        if ipaddr.is_empty() {
+                            Err(MqttError::from(err_msg))
+                        } else {
+                            Ok(User::Ipaddr(ipaddr.clone()))
+                        }
+                    }
+                    _ => Err(MqttError::from(err_msg)),
                 }
-                (_, _, Some(Value::String(ipaddr))) => Ok(User::Ipaddr(ipaddr.clone())),
-                _ => Err(MqttError::from(err_msg)),
-            },
+            }
             _ => Err(MqttError::from(err_msg)),
         };
         user
@@ -256,13 +319,13 @@ impl std::convert::TryFrom<Option<&serde_json::Value>> for Topics {
     #[inline]
     fn try_from(topics_cfg: Option<&serde_json::Value>) -> Result<Self, Self::Error> {
         let err_msg = format!("ACL Rule config error, topics config is {:?}", topics_cfg);
-        let mut allow_all = false;
+        let mut all = false;
         let eqs = DashSet::default();
         let mut tree = TopicTree::default();
         let mut placeholders = Vec::new();
         let mut eq_placeholders = Vec::new();
         match topics_cfg {
-            None => allow_all = true,
+            None => all = true,
             Some(Value::Array(topics)) => {
                 for topic in topics.iter() {
                     match topic {
@@ -290,7 +353,7 @@ impl std::convert::TryFrom<Option<&serde_json::Value>> for Topics {
             _ => return Err(MqttError::from(err_msg)),
         }
         Ok(Topics {
-            allow_all,
+            all,
             eqs: Arc::new(eqs),
             eq_placeholders,
             tree: Arc::new(RwLock::new(tree)),

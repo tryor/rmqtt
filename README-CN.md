@@ -17,9 +17,9 @@
     - 离线消息支持;
     - Retained 消息支持;
     - Last Will 消息支持;
-- 内置 ACL;
-- HTTP ACL;
-- WebHook;
+- [内置 AUTH/ACL](./docs/zh_CN/acl.md);
+- [HTTP AUTH/ACL](./docs/zh_CN/auth-http.md);
+- [WebHook](./docs/zh_CN/web-hook.md);
 - [HTTP APIs](./docs/zh_CN/http-api.md);
 - 分布式集群;
 - 钩子(Hooks);
@@ -45,6 +45,7 @@
 * 单节点
 
 ```bash
+mkdir -p /app/log/rmqtt
 docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060 -v /app/log/rmqtt:/var/log/rmqtt  rmqtt/rmqtt:latest
 ```
 
@@ -62,7 +63,7 @@ docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060
 
 #### 通过 docker-compose 创建静态集群
 
-1. [下载配置模板](./examples/docker-compose.zip)
+1. [下载配置模板](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template.zip)
 
 2. 启动 docker-compose 集群
 
@@ -73,7 +74,7 @@ docker-compose up -d
 3. 查看集群
 
 ```bash
-curl "http://127.0.0.1:6066/api/v1/brokers"
+curl "http://127.0.0.1:6066/api/v1/health/check"
 ```
 
 #### ZIP 压缩包安装 (Linux、MacOS、Windows)
@@ -86,9 +87,9 @@ curl "http://127.0.0.1:6066/api/v1/brokers"
 
 ## 体验
 
-- MQTT Borker：121.4.74.58:1883
+- MQTT Broker：47.103.110.134:1883
 - Account: 无
-- HTTP APIs: http://121.4.74.58:6060/api/v1/
+- HTTP APIs: http://47.103.110.134:6080/api/v1/
 
 
 

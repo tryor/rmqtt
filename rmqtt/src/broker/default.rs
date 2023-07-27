@@ -172,7 +172,7 @@ impl super::Entry for LockEntry {
 
         if let Some(peer_tx) = self.tx().and_then(|tx| if tx.is_closed() { None } else { Some(tx) }) {
             let (tx, rx) = oneshot::channel();
-            if let Ok(()) = peer_tx.send(Message::Kick(tx, self.id.clone(), is_admin)) {
+            if let Ok(()) = peer_tx.unbounded_send(Message::Kick(tx, self.id.clone(), is_admin)) {
                 match tokio::time::timeout(Duration::from_secs(5), rx).await {
                     Ok(Ok(())) => {
                         log::debug!("{:?} kicked, from {:?}", self.id, self.client().map(|c| c.id.clone()));
@@ -291,9 +291,9 @@ impl super::Entry for LockEntry {
             log::warn!("{:?} forward, from:{:?}, error: Tx is None", self.id, from);
             return Err((from, p, Reason::from_static("Tx is None")));
         };
-        if let Err(e) = tx.send(Message::Forward(from, p)) {
+        if let Err(e) = tx.unbounded_send(Message::Forward(from, p)) {
             log::warn!("{:?} forward, error: {:?}", self.id, e);
-            if let Message::Forward(from, p) = e.0 {
+            if let Message::Forward(from, p) = e.into_inner() {
                 return Err((from, p, Reason::from_static("Tx is closed")));
             }
         }
@@ -457,7 +457,7 @@ impl Shared for &'static DefaultShared {
                 continue;
             };
 
-            if let Err(e) = tx.send(Message::Forward(from.clone(), p)) {
+            if let Err(e) = tx.unbounded_send(Message::Forward(from.clone(), p)) {
                 log::warn!(
                     "forwards,  from:{:?}, to:{:?}, topic_filter:{:?}, topic:{:?}, error:{:?}",
                     from,
@@ -466,7 +466,7 @@ impl Shared for &'static DefaultShared {
                     publish.topic,
                     e
                 );
-                if let Message::Forward(from, p) = e.0 {
+                if let Message::Forward(from, p) = e.into_inner() {
                     errs.push((to, from, p, Reason::from_static("Connection Tx is closed")));
                 }
             }
@@ -1025,7 +1025,7 @@ impl DefaultSharedSubscription {
 impl SharedSubscription for &'static DefaultSharedSubscription {}
 
 pub struct DefaultRetainStorage {
-    messages: RwLock<RetainTree<Retain>>,
+    messages: RwLock<RetainTree<TimedValue<Retain>>>,
 }
 
 impl DefaultRetainStorage {
@@ -1036,24 +1036,30 @@ impl DefaultRetainStorage {
     }
 
     #[inline]
-    async fn add(&self, topic: &Topic, retain: Retain) {
-        self.messages.write().await.insert(topic, retain);
+    pub async fn remove_expired_messages(&self) {
+        let mut messages = self.messages.write().await;
+        messages.retain(|tv| {
+            if tv.is_expired() {
+                Runtime::instance().stats.retaineds.dec();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     #[inline]
-    async fn remove(&self, topic: &Topic) -> Option<Retain> {
-        self.messages.write().await.remove(topic)
-    }
-}
-
-#[async_trait]
-impl RetainStorage for &'static DefaultRetainStorage {
-    #[inline]
-    async fn set(&self, topic: &TopicName, retain: Retain) -> Result<()> {
+    pub async fn set_with_timeout(
+        &self,
+        topic: &TopicName,
+        retain: Retain,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let topic = Topic::from_str(topic)?;
-        let old = self.remove(&topic).await;
+        let mut messages = self.messages.write().await;
+        let old = messages.remove(&topic);
         if !retain.publish.is_empty() {
-            self.add(&topic, retain).await;
+            messages.insert(&topic, TimedValue::new(retain, timeout));
             if old.is_none() {
                 Runtime::instance().stats.retaineds.inc();
             }
@@ -1062,18 +1068,33 @@ impl RetainStorage for &'static DefaultRetainStorage {
         }
         Ok(())
     }
+}
+
+#[async_trait]
+impl RetainStorage for &'static DefaultRetainStorage {
+    #[inline]
+    async fn set(&self, topic: &TopicName, retain: Retain) -> Result<()> {
+        self.set_with_timeout(topic, retain, None).await
+    }
 
     #[inline]
     async fn get(&self, topic_filter: &TopicFilter) -> Result<Vec<(TopicName, Retain)>> {
         let topic = Topic::from_str(topic_filter)?;
-        Ok(self
+        let retains = self
             .messages
-            .write()
+            .read()
             .await
             .matches(&topic)
             .drain(..)
-            .map(|(t, r)| (TopicName::from(t.to_string()), r))
-            .collect())
+            .filter_map(|(t, r)| {
+                if r.is_expired() {
+                    None
+                } else {
+                    Some((TopicName::from(t.to_string()), r.into_value()))
+                }
+            })
+            .collect::<Vec<(TopicName, Retain)>>();
+        Ok(retains)
     }
 
     #[inline]
@@ -1288,7 +1309,7 @@ impl HookManager for &'static DefaultHookManager {
         &self,
         connect_info: &ConnectInfo,
         allow_anonymous: bool,
-    ) -> ConnectAckReason {
+    ) -> (ConnectAckReason, Superuser) {
         let proto_ver = connect_info.proto_ver();
         let ok = || match proto_ver {
             MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::ConnectionAccepted),
@@ -1299,7 +1320,7 @@ impl HookManager for &'static DefaultHookManager {
 
         log::debug!("{:?} username: {:?}", connect_info.id(), connect_info.username());
         if connect_info.username().is_none() && allow_anonymous {
-            return ok();
+            return (ok(), false);
         }
 
         let result = self.exec(Type::ClientAuthenticate, Parameter::ClientAuthenticate(connect_info)).await;
@@ -1307,11 +1328,11 @@ impl HookManager for &'static DefaultHookManager {
         let (bad_user_or_pass, not_auth) = match result {
             Some(HookResult::AuthResult(AuthResult::BadUsernameOrPassword)) => (true, false),
             Some(HookResult::AuthResult(AuthResult::NotAuthorized)) => (false, true),
-            Some(HookResult::AuthResult(AuthResult::Allow)) => return ok(),
+            Some(HookResult::AuthResult(AuthResult::Allow(superuser))) => return (ok(), superuser),
             _ => {
                 //or AuthResult::NotFound
                 if allow_anonymous {
-                    return ok();
+                    return (ok(), false);
                 } else {
                     (false, true)
                 }
@@ -1319,24 +1340,30 @@ impl HookManager for &'static DefaultHookManager {
         };
 
         if bad_user_or_pass {
-            return match proto_ver {
-                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword),
-                _ => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
-            };
+            return (
+                match proto_ver {
+                    MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+                    MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+                    MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::BadUserNameOrPassword),
+                    _ => ConnectAckReason::V3(ConnectAckReasonV3::BadUserNameOrPassword),
+                },
+                false,
+            );
         }
 
         if not_auth {
-            return match proto_ver {
-                MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-                MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-                MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::NotAuthorized),
-                _ => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
-            };
+            return (
+                match proto_ver {
+                    MQTT_LEVEL_31 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+                    MQTT_LEVEL_311 => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+                    MQTT_LEVEL_5 => ConnectAckReason::V5(ConnectAckReasonV5::NotAuthorized),
+                    _ => ConnectAckReason::V3(ConnectAckReasonV3::NotAuthorized),
+                },
+                false,
+            );
         }
 
-        ok()
+        (ok(), false)
     }
 
     ///When sending mqtt:: connectack message
@@ -1470,6 +1497,9 @@ impl Hook for DefaultHook {
 
     #[inline]
     async fn client_subscribe_check_acl(&self, sub: &Subscribe) -> Option<SubscribeAclResult> {
+        if self.c.superuser {
+            return Some(SubscribeAclResult::new_success(sub.qos));
+        }
         let reply = self
             .manager
             .exec(Type::ClientSubscribeCheckAcl, Parameter::ClientSubscribeCheckAcl(&self.s, &self.c, sub))
@@ -1484,6 +1514,9 @@ impl Hook for DefaultHook {
 
     #[inline]
     async fn message_publish_check_acl(&self, publish: &Publish) -> PublishAclResult {
+        if self.c.superuser {
+            return PublishAclResult::Allow;
+        }
         let result = self
             .manager
             .exec(Type::MessagePublishCheckAcl, Parameter::MessagePublishCheckAcl(&self.s, &self.c, publish))

@@ -1,10 +1,13 @@
+use std::any::Any;
 use std::convert::From as _f;
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use bitflags::bitflags;
 use bytestring::ByteString;
 use ntex::util::Bytes;
 use ntex_mqtt::error::SendPacketError;
@@ -26,7 +29,6 @@ pub use ntex_mqtt::v5::{
 };
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::{MqttError, Result, Runtime};
@@ -38,6 +40,7 @@ pub type LocalSocketAddr = SocketAddr;
 pub type Addr = bytestring::ByteString;
 pub type ClientId = bytestring::ByteString;
 pub type UserName = bytestring::ByteString;
+pub type Superuser = bool;
 pub type Password = bytes::Bytes;
 pub type PacketId = u16;
 pub type Reason = bytestring::ByteString;
@@ -55,8 +58,8 @@ pub type IsOnline = bool;
 pub type IsAdmin = bool;
 pub type LimiterName = u16;
 
-pub type Tx = mpsc::UnboundedSender<Message>;
-pub type Rx = mpsc::UnboundedReceiver<Message>;
+pub type Tx = futures::channel::mpsc::UnboundedSender<Message>;
+pub type Rx = futures::channel::mpsc::UnboundedReceiver<Message>;
 
 pub type DashSet<V> = dashmap::DashSet<V, ahash::RandomState>;
 pub type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
@@ -69,6 +72,8 @@ pub type SubscriptionValue = (QoS, Option<SharedGroup>);
 
 pub type HookSubscribeResult = Vec<Option<TopicFilter>>;
 pub type HookUnsubscribeResult = Vec<Option<TopicFilter>>;
+
+pub(crate) const UNDEFINED: &str = "undefined";
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConnectInfo {
@@ -241,7 +246,7 @@ pub enum PublishAclResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthResult {
-    Allow,
+    Allow(Superuser),
     ///User is not found
     NotFound,
     BadUsernameOrPassword,
@@ -893,19 +898,11 @@ impl Id {
         username: Option<UserName>,
     ) -> Self {
         Self(Arc::new(_Id {
-            id: ByteString::from(format!(
-                "{}@{}/{}/{}/{}",
-                node_id,
-                local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
-                remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
-                client_id,
-                username.as_ref().map(<UserName as AsRef<str>>::as_ref).unwrap_or_default()
-            )),
             node_id,
             local_addr,
             remote_addr,
             client_id,
-            username: username.unwrap_or_else(|| "undefined".into()),
+            username,
             create_time: chrono::Local::now().timestamp_millis(),
         }))
     }
@@ -916,7 +913,7 @@ impl Id {
             "node": self.node(),
             "ipaddress": self.remote_addr,
             "clientid": self.client_id,
-            "username": self.username,
+            "username": self.username_ref(),
             "create_time": self.create_time,
         })
     }
@@ -927,42 +924,50 @@ impl Id {
     }
 
     #[inline]
-    pub fn as_str(&self) -> &str {
-        &self.id
-    }
-
-    #[inline]
     pub fn node(&self) -> NodeId {
-        //format!("{}/{}", self.node_id, self.local_addr.map(|addr| addr.to_string()).unwrap_or_default())
         self.node_id
     }
-}
 
-impl AsRef<str> for Id {
     #[inline]
-    fn as_ref(&self) -> &str {
-        &self.id
+    pub fn username(&self) -> UserName {
+        self.username.clone().unwrap_or_else(|| UserName::from_static(UNDEFINED))
+    }
+
+    #[inline]
+    pub fn username_ref(&self) -> &str {
+        self.username.as_ref().map(<UserName as AsRef<str>>::as_ref).unwrap_or_else(|| UNDEFINED)
     }
 }
 
 impl ToString for Id {
     #[inline]
     fn to_string(&self) -> String {
-        self.id.to_string()
+        format!(
+            "{}@{}/{}/{}/{}",
+            self.node_id,
+            self.local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
+            self.remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
+            self.client_id,
+            self.username_ref()
+        )
     }
 }
 
 impl std::fmt::Debug for Id {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.id, self.create_time)
+        write!(f, "{}-{}", self.to_string(), self.create_time)
     }
 }
 
 impl PartialEq<Id> for Id {
     #[inline]
-    fn eq(&self, other: &Id) -> bool {
-        self.id == other.id
+    fn eq(&self, o: &Id) -> bool {
+        self.node_id == o.node_id
+            && self.client_id == o.client_id
+            && self.local_addr == o.local_addr
+            && self.remote_addr == o.remote_addr
+            && self.username == o.username
     }
 }
 
@@ -971,7 +976,11 @@ impl Eq for Id {}
 impl std::hash::Hash for Id {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.node_id.hash(state);
+        self.local_addr.hash(state);
+        self.remote_addr.hash(state);
+        self.client_id.hash(state);
+        self.username.hash(state);
     }
 }
 
@@ -1005,12 +1014,11 @@ impl<'de> Deserialize<'de> for Id {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Deserialize, Serialize)]
 pub struct _Id {
-    id: ByteString,
     pub node_id: NodeId,
     pub local_addr: Option<SocketAddr>,
     pub remote_addr: Option<SocketAddr>,
     pub client_id: ClientId,
-    pub username: UserName,
+    pub username: Option<UserName>,
     pub create_time: TimestampMillis,
 }
 
@@ -1180,5 +1188,106 @@ impl _SessionSubs {
         DashMap<TopicFilter, SubscriptionValue>,
     > {
         self.subs.iter()
+    }
+}
+
+pub struct ExtraAttrs {
+    attrs: HashMap<String, Box<dyn Any + Sync + Send>>,
+}
+
+impl Default for ExtraAttrs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtraAttrs {
+    #[inline]
+    pub fn new() -> Self {
+        Self { attrs: HashMap::default() }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.attrs.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.attrs.is_empty()
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.attrs.clear()
+    }
+
+    #[inline]
+    pub fn insert<T: Any + Sync + Send>(&mut self, key: String, value: T) {
+        self.attrs.insert(key, Box::new(value));
+    }
+
+    #[inline]
+    pub fn get<T: Any + Sync + Send>(&self, key: &str) -> Option<&T> {
+        self.attrs.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+
+    #[inline]
+    pub fn get_mut<T: Any + Sync + Send>(&mut self, key: &str) -> Option<&mut T> {
+        self.attrs.get_mut(key).and_then(|v| v.downcast_mut::<T>())
+    }
+
+    #[inline]
+    pub fn get_default_mut<T: Any + Sync + Send, F: Fn() -> T>(
+        &mut self,
+        key: String,
+        def_fn: F,
+    ) -> Option<&mut T> {
+        self.attrs.entry(key).or_insert_with(|| Box::new(def_fn())).downcast_mut::<T>()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TimedValue<V>(V, Option<Instant>);
+
+impl<V> TimedValue<V> {
+    pub fn new(value: V, timeout_duration: Option<Duration>) -> Self {
+        TimedValue(value, timeout_duration.map(|t| Instant::now() + t))
+    }
+
+    pub fn value(&self) -> &V {
+        &self.0
+    }
+
+    pub fn value_mut(&mut self) -> &mut V {
+        &mut self.0
+    }
+
+    pub fn into_value(self) -> V {
+        self.0
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.1.map(|e| Instant::now() >= e).unwrap_or(false)
+    }
+}
+
+impl<V> PartialEq for TimedValue<V>
+where
+    V: PartialEq,
+{
+    fn eq(&self, other: &TimedValue<V>) -> bool {
+        self.value() == other.value()
+    }
+}
+
+//impl<V> Eq for TimedValue<V> where V: Eq {}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct StateFlags: u8 {
+        const Kicked = 0b00000001;
+        const ByAdminKick = 0b00000010;
+        const DisconnectReceived = 0b00000100;
     }
 }

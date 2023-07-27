@@ -3,9 +3,8 @@ use std::net::SocketAddr;
 
 use ntex_mqtt::v5;
 use ntex_mqtt::v5::codec::{Auth, DisconnectReasonCode};
-use rust_box::task_exec_queue::LocalSpawnExt;
 
-use crate::broker::executor::get_handshake_exec_queue;
+use crate::broker::executor::get_handshake_exec;
 use crate::broker::{inflight::MomentStatus, types::*};
 use crate::settings::listener::Listener;
 use crate::{ClientInfo, MqttError, Result, Runtime, Session, SessionState};
@@ -55,29 +54,18 @@ pub async fn handshake<Io: 'static>(
         handshake.packet().client_id.clone(),
         handshake.packet().username.clone(),
     );
-    let id1 = id.clone();
+
     Runtime::instance().stats.handshakings.max_max(handshake.handshakings());
 
-    let exec = get_handshake_exec_queue(local_addr.port(), listen_cfg.clone());
-
-    let start = chrono::Local::now().timestamp_millis();
-    let handshake_fut = async move {
-        if (chrono::Local::now().timestamp_millis() - start) > listen_cfg.handshake_timeout() as i64 {
-            Runtime::instance().metrics.client_handshaking_timeout_inc();
-            return Err(MqttError::from("execute handshake timeout"));
-        }
-        _handshake(id, listen_cfg, handshake).await
-    };
-
-    match handshake_fut.spawn(&exec).result().await {
+    let exec = get_handshake_exec(local_addr.port(), listen_cfg.clone());
+    match exec.spawn(_handshake(id.clone(), listen_cfg, handshake)).await {
         Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => {
-            log::warn!("{:?} Connection Refused, handshake error, reason: {:?}", id1, e.to_string());
+            log::warn!("{:?} Connection Refused, handshake error, reason: {:?}", id, e);
             Err(e)
         }
         Err(e) => {
-            Runtime::instance().metrics.client_handshaking_timeout_inc();
-            log::warn!("{:?} Connection Refused, handshake timeout, reason: {:?}", id1, e.to_string());
+            log::warn!("{:?} Connection Refused, handshake timeout, reason: {:?}", id, e);
             Err(MqttError::from("Connection Refused, execute handshake timeout"))
         }
     }
@@ -116,7 +104,7 @@ pub async fn _handshake<Io: 'static>(
     }
 
     //hook, client authenticate
-    let ack = Runtime::instance()
+    let (ack, superuser) = Runtime::instance()
         .extends
         .hook_mgr()
         .await
@@ -162,7 +150,7 @@ pub async fn _handshake<Io: 'static>(
     };
 
     let connected_at = chrono::Local::now().timestamp_millis();
-    let client = ClientInfo::new(connect_info, session_present, connected_at);
+    let client = ClientInfo::new(connect_info, session_present, superuser, connected_at);
 
     let fitter =
         Runtime::instance().extends.fitter_mgr().await.get(client.clone(), id.clone(), listen_cfg.clone());
@@ -208,12 +196,6 @@ pub async fn _handshake<Io: 'static>(
         .await);
     }
 
-    if let Some(o) = offline_info {
-        if let Err(e) = state.transfer_session_state(packet.clean_start, o).await {
-            log::warn!("{:?} Failed to transfer session state, {:?}", state.id, e);
-        }
-    }
-
     //hook, client connack
     let _ = Runtime::instance()
         .extends
@@ -224,6 +206,17 @@ pub async fn _handshake<Io: 'static>(
 
     //hook, client connected
     state.hook.client_connected().await;
+
+    //transfer session state
+    if let Some(o) = offline_info {
+        let state1 = state.clone();
+        let clean_start = packet.clean_start;
+        ntex::rt::spawn(async move {
+            if let Err(e) = state1.transfer_session_state(clean_start, o).await {
+                log::warn!("{:?} Failed to transfer session state, {:?}", state1.id, e);
+            }
+        });
+    }
 
     log::debug!("{:?} keep_alive: {}", state.id, keep_alive);
     let id = state.id.clone();

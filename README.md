@@ -18,9 +18,9 @@ and mobile applications that can handle millions of concurrent clients on a sing
     - Offline message support;
     - Retained message support;
     - Last Will message support;
-- Built-in ACL;
-- HTTP ACL;
-- WebHook;
+- [Built-in AUTH/ACL](./docs/en_US/acl.md);
+- [HTTP AUTH/ACL](./docs/en_US/auth-http.md);
+- [WebHook](./docs/en_US/web-hook.md);
 - [HTTP APIs](./docs/en_US/http-api.md);
 - Distributed cluster;
 - Hooks;
@@ -47,6 +47,7 @@ x86_64 architecture servers and ARM devices like Raspberry Pi.
 * Single node
 
 ```bash
+mkdir -p /app/log/rmqtt
 docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060 -v /app/log/rmqtt:/var/log/rmqtt  rmqtt/rmqtt:latest
 ```
 
@@ -64,7 +65,7 @@ Node IDs: 1, 2, 3; Node IP Addrs: 172.17.0.3, 172.17.0.4, 172.17.0.5
 
 #### Create a static cluster by docker-compose
 
-1. [Download docker-compose configuration template](./examples/docker-compose.zip)
+1. [Download docker-compose configuration template](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template.zip)
 
 2. Start docker-compose cluster
 
@@ -75,7 +76,7 @@ docker-compose up -d
 3. View cluster
 
 ```bash
-curl "http://127.0.0.1:6066/api/v1/brokers"
+curl "http://127.0.0.1:6066/api/v1/health/check"
 ```
 
 #### Installing via ZIP Binary Package (Linux、MacOS、Windows)
@@ -88,7 +89,7 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 
 ## Experience
 
-- MQTT Borker: 121.4.74.58:1883
+- MQTT Broker: 47.103.110.134:1883
 - Account:
-- HTTP APIs: http://121.4.74.58:6060/api/v1/
+- HTTP APIs: http://47.103.110.134:6080/api/v1/
 

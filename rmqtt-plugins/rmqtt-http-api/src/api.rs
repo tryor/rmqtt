@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use salvo::affix;
 use salvo::http::header::{HeaderValue, CONTENT_TYPE};
+use salvo::http::mime;
+use salvo::hyper::server::conn::AddrIncoming;
 use salvo::prelude::*;
 
 use rmqtt::{
@@ -17,8 +19,8 @@ use rmqtt::{
         MessageSender, MessageType,
     },
     node::NodeStatus,
-    ClientId, Id, MqttError, Publish, PublishProperties, QoS, Result, Retain, Runtime, SubsSearchParams,
-    TopicFilter, TopicName, UserName,
+    ClientId, From, Id, MqttError, Publish, PublishProperties, QoS, Result, Retain, Runtime,
+    SubsSearchParams, TopicFilter, TopicName, UserName,
 };
 
 use super::types::{
@@ -30,6 +32,7 @@ use super::{clients, plugin, subs};
 fn route(cfg: PluginConfigType) -> Router {
     Router::with_path("api/v1")
         .hoop(affix::inject(cfg))
+        .hoop(api_logger)
         .get(list_apis)
         .push(Router::with_path("brokers").get(get_brokers).push(Router::with_path("<id>").get(get_brokers)))
         .push(Router::with_path("nodes").get(get_nodes).push(Router::with_path("<id>").get(get_nodes)))
@@ -83,8 +86,17 @@ pub(crate) async fn listen_and_serve(
     cfg: PluginConfigType,
     rx: oneshot::Receiver<()>,
 ) -> Result<()> {
-    log::info!("HTTP API Listening on {}", laddr);
-    Server::new(TcpListener::bind(laddr))
+    let (reuseaddr, reuseport) = {
+        let cfg = cfg.read();
+        (cfg.http_reuseaddr, cfg.http_reuseport)
+    };
+    log::info!("HTTP API Listening on {}, reuseaddr: {}, reuseport: {}", laddr, reuseaddr, reuseport);
+
+    let listen = rmqtt::tokio::net::TcpListener::from_std(rmqtt::grpc::server::Server::bind(
+        laddr, 128, reuseaddr, reuseport,
+    )?)?;
+    let incoming = AddrIncoming::from_listener(listen).map_err(anyhow::Error::new)?;
+    Server::new(TcpListener::bind(incoming))
         .try_serve_with_graceful_shutdown(route(cfg), async {
             rx.await.ok();
         })
@@ -255,6 +267,41 @@ async fn list_apis(res: &mut Response) {
 
     ]);
     res.render(Json(data));
+}
+
+#[handler]
+async fn api_logger(req: &mut Request, depot: &mut Depot) {
+    if let Some(cfg) = depot.obtain::<PluginConfigType>() {
+        if !cfg.read().http_request_log {
+            return;
+        }
+    }
+
+    let log_data = format!(
+        "Request {}, {:?}, {}, {}",
+        req.remote_addr().map(|addr| addr.to_string()).unwrap_or_else(|| "[Unknown]".into()),
+        req.version(),
+        req.method(),
+        req.uri()
+    );
+    let txt_body = if let Some(m) = req.content_type() {
+        if let mime::PLAIN | mime::JSON | mime::TEXT = m.subtype() {
+            if let Ok(body) = req.payload().await {
+                Some(String::from_utf8_lossy(body))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(txt_body) = txt_body {
+        log::info!("{}, body: {}", log_data, txt_body);
+    } else {
+        log::info!("{}", log_data);
+    }
 }
 
 #[handler]
@@ -524,7 +571,7 @@ async fn kick_client(req: &mut Request, res: &mut Response) {
             .await
             .entry(Id::from(Runtime::instance().node.id(), ClientId::from(clientid)));
 
-        match entry.kick(true, true).await {
+        match entry.kick(true, true, true).await {
             Err(e) => res.set_status_error(StatusError::service_unavailable().with_detail(e.to_string())),
             Ok(None) => res.set_status_code(StatusCode::NOT_FOUND),
             Ok(Some(offline_info)) => res.render(Text::Plain(offline_info.id.to_string())),
@@ -665,13 +712,13 @@ async fn _publish(
         return Err(MqttError::Msg("encoding error, currently only plain and base64 are supported".into()));
     };
 
-    let from = rmqtt::From::new(
+    let from = From::from_admin(Id::new(
         Runtime::instance().node.id(),
         Some(http_laddr),
         remote_addr,
         params.clientid,
         Some(UserName::from("admin")),
-    );
+    ));
     let p = Publish {
         dup: false,
         retain: params.retain,
@@ -699,18 +746,32 @@ async fn _publish(
         }
 
         let fut = async {
-            Runtime::instance().metrics.messages_publish_inc();
+            //hook, message_publish
+            let p1 = Runtime::instance()
+                .extends
+                .hook_mgr()
+                .await
+                .message_publish(None, None, from.clone(), &p1)
+                .await
+                .unwrap_or(p1);
 
             let replys = Runtime::instance().extends.shared().await.forwards(from.clone(), p1).await;
-            if let Err(droppeds) = replys {
-                for (to, from, p, reason) in droppeds {
-                    //Message dropped
-                    Runtime::instance()
-                        .extends
-                        .hook_mgr()
-                        .await
-                        .message_dropped(Some(to), from, p, reason)
-                        .await;
+            match replys {
+                Ok(0) => {
+                    //hook, message_nonsubscribed
+                    Runtime::instance().extends.hook_mgr().await.message_nonsubscribed(from.clone()).await;
+                }
+                Ok(_) => {}
+                Err(droppeds) => {
+                    for (to, from, p, reason) in droppeds {
+                        //Message dropped
+                        Runtime::instance()
+                            .extends
+                            .hook_mgr()
+                            .await
+                            .message_dropped(Some(to), from, p, reason)
+                            .await;
+                    }
                 }
             }
         };

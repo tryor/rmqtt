@@ -7,7 +7,7 @@ use crate::broker::types::*;
 use crate::grpc::GrpcClients;
 use crate::settings::listener::Listener;
 use crate::stats::Counter;
-use crate::{ClientId, Id, NodeId, QoS, Result, Runtime, TopicFilter};
+use crate::{ClientId, Id, NodeId, Result, Runtime, TopicFilter};
 
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
@@ -37,6 +37,7 @@ pub trait Entry: Sync + Send {
     async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx, ClientInfo)>>;
     async fn kick(
         &mut self,
+        clean_start: bool,
         clear_subscriptions: bool,
         is_admin: IsAdmin,
     ) -> Result<Option<SessionOfflineInfo>>;
@@ -61,14 +62,18 @@ pub trait Shared: Sync + Send {
     fn exist(&self, client_id: &str) -> bool;
 
     ///Route and dispense publish message
-    async fn forwards(&self, from: From, publish: Publish) -> Result<(), Vec<(To, From, Publish, Reason)>>;
+    async fn forwards(
+        &self,
+        from: From,
+        publish: Publish,
+    ) -> Result<SubscriptionSize, Vec<(To, From, Publish, Reason)>>;
 
     ///Route and dispense publish message and return shared subscription relations
     async fn forwards_and_get_shareds(
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<SubRelationsMap, Vec<(To, From, Publish, Reason)>>;
+    ) -> Result<(SubRelationsMap, SubscriptionSize), Vec<(To, From, Publish, Reason)>>;
 
     ///dispense publish message
     async fn forwards_to(
@@ -88,7 +93,7 @@ pub trait Shared: Sync + Send {
     async fn session_status(&self, client_id: &str) -> Option<SessionStatus>;
 
     ///
-    async fn clinet_states_count(&self) -> usize;
+    async fn client_states_count(&self) -> usize;
 
     ///
     fn sessions_count(&self) -> usize;
@@ -113,31 +118,16 @@ pub trait Shared: Sync + Send {
     }
 }
 
-//key is TopicFilter
-pub type SharedSubRelations = HashMap<TopicFilter, Vec<(SharedGroup, NodeId, ClientId, QoS, IsOnline)>>;
-//In other nodes
-pub type OtherSubRelations = HashMap<NodeId, Vec<TopicFilter>>;
-
-pub type SubRelations = Vec<(TopicFilter, ClientId, QoS, Option<(SharedGroup, IsOnline)>)>;
-pub type SubRelationsMap = HashMap<NodeId, SubRelations>;
-pub type ClearSubscriptions = bool;
-
 #[async_trait]
 pub trait Router: Sync + Send {
     ///
-    async fn add(
-        &self,
-        topic_filter: &str,
-        id: Id,
-        qos: QoS,
-        shared_group: Option<SharedGroup>,
-    ) -> Result<()>;
+    async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()>;
 
     ///
     async fn remove(&self, topic_filter: &str, id: Id) -> Result<bool>;
 
     ///
-    async fn matches(&self, topic: &TopicName) -> Result<SubRelationsMap>;
+    async fn matches(&self, id: Id, topic: &TopicName) -> Result<SubRelationsMap>;
 
     ///Check online or offline
     #[inline]
@@ -188,7 +178,16 @@ pub trait SharedSubscription: Sync + Send {
 
     ///Shared subscription strategy, select a subscriber, default is "random"
     #[inline]
-    async fn choice(&self, ncs: &[(NodeId, ClientId, QoS, Option<IsOnline>)]) -> Option<(usize, IsOnline)> {
+    async fn choice(
+        &self,
+        ncs: &[(
+            NodeId,
+            ClientId,
+            SubscriptionOptions,
+            Option<Vec<SubscriptionIdentifier>>,
+            Option<IsOnline>,
+        )],
+    ) -> Option<(usize, IsOnline)> {
         if ncs.is_empty() {
             return None;
         }
@@ -196,7 +195,7 @@ pub trait SharedSubscription: Sync + Send {
         let mut tmp_ncs = ncs
             .iter()
             .enumerate()
-            .map(|(idx, (node_id, client_id, _, is_online))| (idx, node_id, client_id, is_online))
+            .map(|(idx, (node_id, client_id, _, _, is_online))| (idx, node_id, client_id, is_online))
             .collect::<Vec<_>>();
 
         while !tmp_ncs.is_empty() {

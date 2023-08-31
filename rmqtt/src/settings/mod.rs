@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeZone;
-use config::{Config, ConfigError, File};
+use config::{Config, File, Source};
 use once_cell::sync::OnceCell;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::Serializer;
@@ -55,7 +55,7 @@ impl Deref for Settings {
 }
 
 impl Settings {
-    fn new(opts: Options) -> Result<Self, ConfigError> {
+    fn new(opts: Options) -> Result<Self> {
         let mut s = Config::new();
 
         // if let Ok(cfg_filename) = std::env::var("RMQTT-CONFIG-FILENAME") {
@@ -68,12 +68,7 @@ impl Settings {
             s.merge(File::with_name(cfg).required(false))?;
         }
 
-        let mut inner: Inner = match s.try_into() {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        let mut inner: Inner = s.try_into()?;
 
         inner.listeners.init();
         if inner.listeners.tcps.is_empty() && inner.listeners.tlss.is_empty() {
@@ -151,6 +146,12 @@ pub struct Rpc {
     #[serde(default = "Rpc::server_addr_default", deserialize_with = "deserialize_addr")]
     pub server_addr: SocketAddr,
 
+    #[serde(default = "Rpc::reuseaddr_default")]
+    pub reuseaddr: bool,
+
+    #[serde(default = "Rpc::reuseport_default")]
+    pub reuseport: bool,
+
     #[serde(default = "Rpc::server_workers_default")]
     pub server_workers: usize,
 
@@ -169,6 +170,8 @@ impl Default for Rpc {
     #[inline]
     fn default() -> Self {
         Self {
+            reuseaddr: Self::reuseaddr_default(),
+            reuseport: Self::reuseport_default(),
             batch_size: Self::batch_size_default(),
             server_addr: Self::server_addr_default(),
             server_workers: Self::server_workers_default(),
@@ -179,6 +182,12 @@ impl Default for Rpc {
 }
 
 impl Rpc {
+    fn reuseaddr_default() -> bool {
+        true
+    }
+    fn reuseport_default() -> bool {
+        false
+    }
     fn batch_size_default() -> usize {
         128
     }
@@ -209,11 +218,32 @@ impl Plugins {
         "./plugins/".into()
     }
 
-    pub fn load_config<'de, T: serde::Deserialize<'de>>(&self, name: &str) -> Result<T, ConfigError> {
+    pub fn load_config<'de, T: serde::Deserialize<'de>>(&self, name: &str) -> Result<T> {
+        let (cfg, _) = self.load_config_with_required(name, true)?;
+        Ok(cfg)
+    }
+
+    pub fn load_config_default<'de, T: serde::Deserialize<'de>>(&self, name: &str) -> Result<T> {
+        let (cfg, def) = self.load_config_with_required(name, false)?;
+        if def {
+            crate::log::warn!(
+                "The configuration for plugin '{}' does not exist, default values will be used!",
+                name
+            );
+        }
+        Ok(cfg)
+    }
+
+    fn load_config_with_required<'de, T: serde::Deserialize<'de>>(
+        &self,
+        name: &str,
+        required: bool,
+    ) -> Result<(T, bool)> {
         let dir = self.dir.trim_end_matches(|c| c == '/' || c == '\\');
         let mut s = Config::new();
-        s.merge(File::with_name(&format!("{}/{}", dir, name)).required(true))?;
-        s.try_into::<T>()
+        s.merge(File::with_name(&format!("{}/{}", dir, name)).required(required))?;
+        let count = s.collect()?.len();
+        Ok((s.try_into::<T>()?, count == 0))
     }
 }
 

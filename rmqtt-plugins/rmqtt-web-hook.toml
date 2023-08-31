@@ -9,6 +9,8 @@
 #    None
 #
 
+# See more keys and their definitions at https://github.com/rmqtt/rmqtt/blob/master/docs/en_US/web-hook.md
+
 ## Hook general config
 worker_threads = 3
 queue_capacity = 300_000
@@ -37,7 +39,7 @@ rule.client_disconnected = [{action = "client_disconnected" } ]
 rule.client_subscribe = [{action = "client_subscribe" } ]
 rule.client_unsubscribe = [{action = "client_unsubscribe" } ]
 
-rule.message_publish = [{action = "message_publish", topics=["x/y/z", "foo/#", "testtopic/#"] }]
-rule.message_delivered = [{action = "message_delivered", topics=["x/y/z", "foo/#", "testtopic/#"] } ]
-rule.message_acked = [{action = "message_acked", topics=["x/y/z", "foo/#", "testtopic/#"] } ]
+rule.message_publish = [{action = "message_publish", topics=["#", "$SYS/#"] }]
+rule.message_delivered = [{action = "message_delivered", topics=["#", "$SYS/#"] } ]
+rule.message_acked = [{action = "message_acked", topics=["#", "$SYS/#"] } ]
 rule.message_dropped = [{action = "message_dropped" } ]

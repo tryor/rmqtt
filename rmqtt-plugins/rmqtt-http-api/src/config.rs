@@ -27,6 +27,15 @@ pub struct PluginConfig {
 
     #[serde(default = "PluginConfig::message_type_default")]
     pub message_type: MessageType,
+
+    #[serde(default = "PluginConfig::http_reuseaddr_default")]
+    pub http_reuseaddr: bool,
+
+    #[serde(default = "PluginConfig::http_reuseport_default")]
+    pub http_reuseport: bool,
+
+    #[serde(default = "PluginConfig::http_request_log_default")]
+    pub http_request_log: bool,
 }
 
 impl PluginConfig {
@@ -50,6 +59,18 @@ impl PluginConfig {
         99
     }
 
+    fn http_reuseaddr_default() -> bool {
+        true
+    }
+
+    fn http_reuseport_default() -> bool {
+        false
+    }
+
+    fn http_request_log_default() -> bool {
+        false
+    }
+
     #[inline]
     pub fn to_json(&self) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(self)?)
@@ -61,6 +82,7 @@ impl PluginConfig {
             || self.max_row_limit != other.max_row_limit
             || self.http_laddr != other.http_laddr
             || self.metrics_sample_interval != other.metrics_sample_interval
+            || self.http_request_log != other.http_request_log
     }
 
     #[inline]

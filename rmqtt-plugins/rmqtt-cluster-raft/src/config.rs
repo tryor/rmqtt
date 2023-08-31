@@ -73,6 +73,10 @@ impl PluginConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RaftConfig {
+    #[serde(default = "RaftConfig::grpc_reuseaddr_default")]
+    pub grpc_reuseaddr: bool,
+    #[serde(default = "RaftConfig::grpc_reuseport_default")]
+    pub grpc_reuseport: bool,
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     pub grpc_timeout: Option<Duration>,
     pub grpc_concurrency_limit: Option<usize>,
@@ -162,7 +166,8 @@ pub struct RaftConfig {
 impl RaftConfig {
     pub(crate) fn to_raft_config(&self) -> rmqtt_raft::Config {
         let mut cfg = rmqtt_raft::Config { ..Default::default() };
-
+        cfg.reuseaddr = self.grpc_reuseaddr;
+        cfg.reuseport = self.grpc_reuseport;
         if let Some(grpc_timeout) = self.grpc_timeout {
             cfg.grpc_timeout = grpc_timeout;
         }
@@ -234,6 +239,14 @@ impl RaftConfig {
 
     fn read_only_option_default() -> ReadOnlyOption {
         ReadOnlyOption::Safe
+    }
+
+    fn grpc_reuseaddr_default() -> bool {
+        true
+    }
+
+    fn grpc_reuseport_default() -> bool {
+        false
     }
 
     pub fn deserialize_read_only_option<'de, D>(deserializer: D) -> Result<ReadOnlyOption, D::Error>

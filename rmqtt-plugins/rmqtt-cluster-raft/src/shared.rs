@@ -14,10 +14,11 @@ use rmqtt::{
         default::DefaultShared,
         session::{ClientInfo, Session, SessionOfflineInfo},
         types::{
-            From, Id, IsAdmin, NodeId, NodeName, Publish, Reason, SessionStatus, SubsSearchParams,
-            SubsSearchResult, Subscribe, SubscribeReturn, To, Tx, Unsubscribe,
+            From, Id, IsAdmin, NodeId, NodeName, Publish, Reason, SessionStatus, SubRelations,
+            SubRelationsMap, SubsSearchParams, SubsSearchResult, Subscribe, SubscribeReturn,
+            SubscriptionSize, To, Tx, Unsubscribe,
         },
-        Entry, Shared, SubRelations, SubRelationsMap,
+        Entry, Shared,
     },
     grpc::{Message, MessageReply, MessageType},
     MqttError, Result, Runtime,
@@ -120,12 +121,14 @@ impl Entry for ClusterLockEntry {
     #[inline]
     async fn kick(
         &mut self,
+        clean_start: bool,
         clear_subscriptions: bool,
         is_admin: IsAdmin,
     ) -> Result<Option<SessionOfflineInfo>> {
         log::debug!(
-            "{:?} ClusterLockEntry kick ..., clear_subscriptions: {}, is_admin: {}",
+            "{:?} ClusterLockEntry kick ..., clean_start: {}, clear_subscriptions: {}, is_admin: {}",
             self.client().map(|c| c.id.clone()),
+            clean_start,
             clear_subscriptions,
             is_admin
         );
@@ -141,14 +144,14 @@ impl Entry for ClusterLockEntry {
         log::debug!("{:?} kick, prev_node_id: {:?}, is_admin: {}", id, self.prev_node_id, is_admin);
         if prev_node_id == id.node_id {
             //kicked from local
-            self.inner.kick(clear_subscriptions, is_admin).await
+            self.inner.kick(clean_start, clear_subscriptions, is_admin).await
         } else {
             //kicked from other node
             if let Some(client) = self.cluster_shared.grpc_client(prev_node_id) {
                 let mut msg_sender = MessageSender {
                     client,
                     msg_type: self.cluster_shared.message_type,
-                    msg: Message::Kick(id.clone(), true, is_admin), //clear_subscriptions
+                    msg: Message::Kick(id.clone(), clean_start, true, is_admin), //clear_subscriptions
                     max_retries: 0,
                     retry_interval: Duration::from_millis(500),
                 };
@@ -286,11 +289,6 @@ impl ClusterShared {
     }
 
     #[inline]
-    pub(crate) fn router(&self) -> &'static ClusterRouter {
-        self.router
-    }
-
-    #[inline]
     pub(crate) fn inner(&self) -> Box<dyn Shared> {
         Box::new(self.inner)
     }
@@ -314,18 +312,29 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    async fn forwards(&self, from: From, publish: Publish) -> Result<(), Vec<(To, From, Publish, Reason)>> {
+    async fn forwards(
+        &self,
+        from: From,
+        publish: Publish,
+    ) -> Result<SubscriptionSize, Vec<(To, From, Publish, Reason)>> {
         log::debug!("[forwards] from: {:?}, publish: {:?}", from, publish);
 
         let topic = publish.topic();
-        let mut relations_map =
-            match Runtime::instance().extends.router().await.matches(publish.topic()).await {
-                Ok(relations_map) => relations_map,
-                Err(e) => {
-                    log::warn!("forwards, from:{:?}, topic:{:?}, error: {:?}", from, topic, e);
-                    SubRelationsMap::default()
-                }
-            };
+        let mut relations_map = match Runtime::instance()
+            .extends
+            .router()
+            .await
+            .matches(from.id.clone(), publish.topic())
+            .await
+        {
+            Ok(relations_map) => relations_map,
+            Err(e) => {
+                log::warn!("forwards, from:{:?}, topic:{:?}, error: {:?}", from, topic, e);
+                SubRelationsMap::default()
+            }
+        };
+
+        let subs_size: SubscriptionSize = relations_map.iter().map(|(_, subs)| subs.len()).sum();
 
         let mut errs = Vec::new();
 
@@ -381,7 +390,7 @@ impl Shared for &'static ClusterShared {
         }
 
         if errs.is_empty() {
-            Ok(())
+            Ok(subs_size)
         } else {
             Err(errs)
         }
@@ -402,7 +411,7 @@ impl Shared for &'static ClusterShared {
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<SubRelationsMap, Vec<(To, From, Publish, Reason)>> {
+    ) -> Result<(SubRelationsMap, SubscriptionSize), Vec<(To, From, Publish, Reason)>> {
         self.inner.forwards_and_get_shareds(from, publish).await
     }
 
@@ -427,7 +436,7 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    async fn clinet_states_count(&self) -> usize {
+    async fn client_states_count(&self) -> usize {
         self.router.states_count()
     }
 

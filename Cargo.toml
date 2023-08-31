@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "rmqtt",
     "rmqtt-plugins/rmqtt-acl",
@@ -9,6 +10,7 @@ members = [
     "rmqtt-plugins/rmqtt-counter",
     "rmqtt-plugins/rmqtt-http-api",
     "rmqtt-plugins/rmqtt-retainer",
+    "rmqtt-plugins/rmqtt-sys-topic",
     "rmqtt-bin",
     "rmqtt-macros"
 ]
@@ -24,9 +26,10 @@ rmqtt-cluster-raft = { path = "rmqtt-plugins/rmqtt-cluster-raft" }
 rmqtt-counter = { path = "rmqtt-plugins/rmqtt-counter" }
 rmqtt-http-api = { path = "rmqtt-plugins/rmqtt-http-api" }
 rmqtt-retainer = { path = "rmqtt-plugins/rmqtt-retainer" }
+rmqtt-sys-topic = { path = "rmqtt-plugins/rmqtt-sys-topic" }
 
 [workspace.package]
-version = "0.2.13"
+version = "0.2.16"
 edition = "2021"
 authors = ["rmqtt <rmqttd@126.com>"]
 description = "MQTT Server for v3.1, v3.1.1 and v5.0 protocols"

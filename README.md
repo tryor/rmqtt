@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2022/09/22/Rust-1.64.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.64%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2023/02/09/Rust-1.67.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.67%2B-blue" /></a>
 
 English | [简体中文](./README-CN.md)
 
@@ -149,4 +149,32 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
     UnspecifiedError = 0x80, NotAuthorized = 0x87。
 
 
-### Stress Testing
+### Benchmark Testing
+
+#### environment
+| Item        | Content                                   |                                                          |
+|-------------|-------------------------------------------|----------------------------------------------------------|
+| System      | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                              |
+| CPU         | Intel(R) Xeon(R) CPU E5-2696 v3 @ 2.30GHz | 72(CPU(s)) = 18(Core(s)) * 2(Thread(s) per core) * 2(Socket(s)) |
+| Memory      | DDR3/2333                                 | 128G                                                     |
+| Disk        |                                           | 2T                                                       |
+| Container   | podman                                    | v4.4.1                                                   |
+| MQTT Bench  | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                   |
+| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.2.16                                                  |
+| Other       | MQTT Bench and MQTT Broker coexistence    |                                                          |
+
+#### Connection Concurrency Performance
+| Item                  | Single Node       | Raft Cluster Mode |
+|-----------------------|-------------------|--------------------|
+| Total Concurrent Clients | 1,000,000       | 1,000,000          |
+| Connection Handshake Rate | (5500-7000)/second | (5000-7000)/second |
+
+#### Message Throughput Performance
+| Item                    | Single Node         | Raft Cluster Mode |
+|-------------------------|---------------------|--------------------|
+| Subscription Client Count | 1,000,000          | 1,000,000          |
+| Publishing Client Count   | 40                | 40                 |
+| Message Throughput Rate  | 150,000/second      | 156,000/second     |
+
+[For detailed benchmark test results and information, see documentation.](./docs/en_US/benchmark-testing.md)
+

@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2022/09/22/Rust-1.64.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.64%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2023/02/09/Rust-1.67.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.67%2B-blue" /></a>
 
 [English](./README.md)  | 简体中文
 
@@ -147,7 +147,36 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 UnspecifiedError = 0x80, NotAuthorized = 0x87。
 
 
-### 压力测试
+### 基准测试
+
+#### 环境
+| 项目          | 内容                                        |                                                                 |
+|-------------|-------------------------------------------|-----------------------------------------------------------------|
+| 操作系统        | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                                     |
+| CPU         | Intel(R) Xeon(R) CPU E5-2696 v3 @ 2.30GHz | 72(CPU(s)) = 18(Core(s)) * 2(Thread(s) per core) * 2(Socket(s)) |
+| 内存          | DDR3/2333                                 | 128G                                                            |
+| 磁盘          |                                           | 2T                                                              |
+| 容器          | podman                                    | v4.4.1                                                          |
+| 测试客户端       | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                          |
+| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.2.16                                                         |
+| 其它          | 测试客户端和MQTT Broker同服         |                                                                 |
+
+#### 连接并发性能
+| 项目                | 单机              | Raft集群模式       |
+|-------------------|-----------------|----------------|
+| 并发客户端总数       | 100万            | 100万           |
+| 连接握手速率        | (5500-7000)/秒   | (5000-7000)/秒  |
+
+#### 消息吞吐性能
+| 项目               | 单机                | Raft集群模式             |
+|---------------------|------------------|----------------|
+| 订阅客户端数量             | 100万             |   100万       |
+| 发布客户端数量             | 40               |    40       |
+| 消息吞吐速率              | 15万/秒            |   15.6万/秒   |
+
+[基准测试详细内容，请参阅](./docs/zh_CN/benchmark-testing.md)
+
+
 
 
 

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use ntex_mqtt::handshakings;
+use ntex_mqtt::{handshakings, in_inflights};
 use once_cell::sync::OnceCell;
 
 use crate::broker::executor::{get_active_count, get_rate};
@@ -126,7 +126,9 @@ pub struct Stats {
     pub subscriptions_shared: Counter,
     pub retaineds: Counter,
     pub message_queues: Counter,
-    pub inflights: Counter,
+    pub out_inflights: Counter,
+    pub in_inflights: Counter,
+    pub forwards: Counter,
 
     topics_map: HashMap<NodeId, Counter>,
     routes_map: HashMap<NodeId, Counter>,
@@ -137,6 +139,12 @@ pub struct Stats {
     debug_topics_tree_map: HashMap<NodeId, usize>,
     #[cfg(feature = "debug")]
     debug_shared_peers: Counter,
+    #[cfg(feature = "debug")]
+    debug_subscriptions: usize,
+    #[cfg(feature = "debug")]
+    pub debug_session_channels: Counter,
+    #[cfg(feature = "debug")]
+    debug_runtime_exec_stats: Option<RuntimeExecStats>,
 }
 
 impl Stats {
@@ -153,7 +161,9 @@ impl Stats {
             subscriptions_shared: Counter::new(),
             retaineds: Counter::new(),
             message_queues: Counter::new(),
-            inflights: Counter::new(),
+            out_inflights: Counter::new(),
+            in_inflights: Counter::new(),
+            forwards: Counter::new(),
 
             topics_map: HashMap::default(),
             routes_map: HashMap::default(),
@@ -164,6 +174,12 @@ impl Stats {
             debug_topics_tree_map: HashMap::default(),
             #[cfg(feature = "debug")]
             debug_shared_peers: Counter::new(),
+            #[cfg(feature = "debug")]
+            debug_subscriptions: 0,
+            #[cfg(feature = "debug")]
+            debug_session_channels: Counter::new(),
+            #[cfg(feature = "debug")]
+            debug_runtime_exec_stats: None,
         })
     }
 
@@ -181,6 +197,10 @@ impl Stats {
         self.handshakings_active.current_set(get_active_count());
         self.handshakings_rate.sets((get_rate() * 100.0) as isize);
 
+        let (curr, max) = in_inflights();
+        self.in_inflights.current_set(curr);
+        self.in_inflights.max_max(max);
+
         #[cfg(feature = "debug")]
         let shared = Runtime::instance().extends.shared().await;
 
@@ -195,6 +215,10 @@ impl Stats {
         }
         #[cfg(feature = "debug")]
         self.debug_shared_peers.current_set(shared.sessions_count() as isize);
+        #[cfg(feature = "debug")]
+        let debug_subscriptions = shared.subscriptions_count().await;
+        #[cfg(feature = "debug")]
+        let debug_runtime_exec_stats = Some(RuntimeExecStats::new());
 
         Self {
             handshakings: self.handshakings.clone(),
@@ -206,7 +230,9 @@ impl Stats {
             subscriptions_shared: self.subscriptions_shared.clone(),
             retaineds: self.retaineds.clone(), //retained messages
             message_queues: self.message_queues.clone(),
-            inflights: self.inflights.clone(),
+            out_inflights: self.out_inflights.clone(),
+            in_inflights: self.in_inflights.clone(),
+            forwards: self.forwards.clone(),
 
             topics_map,
             routes_map,
@@ -217,6 +243,12 @@ impl Stats {
             debug_topics_tree_map,
             #[cfg(feature = "debug")]
             debug_shared_peers: self.debug_shared_peers.clone(),
+            #[cfg(feature = "debug")]
+            debug_subscriptions,
+            #[cfg(feature = "debug")]
+            debug_session_channels: self.debug_session_channels.clone(),
+            #[cfg(feature = "debug")]
+            debug_runtime_exec_stats,
         }
     }
 
@@ -231,7 +263,9 @@ impl Stats {
         self.subscriptions_shared.add(&other.subscriptions_shared);
         self.retaineds.add(&other.retaineds);
         self.message_queues.add(&other.message_queues);
-        self.inflights.add(&other.inflights);
+        self.out_inflights.add(&other.out_inflights);
+        self.in_inflights.add(&other.in_inflights);
+        self.forwards.add(&other.forwards);
 
         self.topics_map.extend(other.topics_map);
         self.routes_map.extend(other.routes_map);
@@ -240,7 +274,17 @@ impl Stats {
         {
             self.debug_client_states_map.extend(other.debug_client_states_map);
             self.debug_topics_tree_map.extend(other.debug_topics_tree_map);
-            self.debug_shared_peers.add(&other.debug_shared_peers)
+            self.debug_shared_peers.add(&other.debug_shared_peers);
+            self.debug_subscriptions += other.debug_subscriptions;
+            self.debug_session_channels.add(&other.debug_session_channels);
+
+            if let Some(other) = other.debug_runtime_exec_stats.as_ref() {
+                if let Some(stats) = self.debug_runtime_exec_stats.as_mut() {
+                    stats.add(other);
+                } else {
+                    self.debug_runtime_exec_stats.replace(other.clone());
+                }
+            }
         }
     }
 
@@ -270,8 +314,12 @@ impl Stats {
 
             "message_queues.count": self.message_queues.count(),
             "message_queues.max": self.message_queues.max(),
-            "inflights.count": self.inflights.count(),
-            "inflights.max": self.inflights.max(),
+            "out_inflights.count": self.out_inflights.count(),
+            "out_inflights.max": self.out_inflights.max(),
+            "in_inflights.count": self.in_inflights.count(),
+            "in_inflights.max": self.in_inflights.max(),
+            "forwards.count": self.forwards.count(),
+            "forwards.max": self.forwards.max(),
 
             "topics.count": topics.count(),
             "topics.max": topics.max(),
@@ -284,10 +332,47 @@ impl Stats {
             if let Some(obj) = json_val.as_object_mut() {
                 obj.insert("debug_client_states_map".into(), json!(self.debug_client_states_map));
                 obj.insert("debug_topics_tree_map".into(), json!(self.debug_topics_tree_map));
-                obj.insert("debug_shared_peers".into(), json!(self.debug_shared_peers.count()));
+                obj.insert("debug_shared_peers.count".into(), json!(self.debug_shared_peers.count()));
+                obj.insert("debug_subscriptions.count".into(), json!(self.debug_subscriptions));
+                obj.insert("debug_session_channels.count".into(), json!(self.debug_session_channels.count()));
+                obj.insert("debug_session_channels.max".into(), json!(self.debug_session_channels.max()));
+                obj.insert("debug_runtime_exec_stats".into(), json!(self.debug_runtime_exec_stats));
             }
         }
 
         json_val
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RuntimeExecStats {
+    active_count: isize,
+    completed_count: isize,
+    pending_wakers_count: usize,
+    waiting_count: isize,
+    rate: f64,
+}
+
+impl RuntimeExecStats {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        let exec = &Runtime::instance().exec;
+        Self {
+            active_count: exec.active_count(),
+            completed_count: exec.completed_count(),
+            pending_wakers_count: exec.pending_wakers_count(),
+            waiting_count: exec.waiting_count(),
+            rate: exec.rate(),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn add(&mut self, other: &Self) {
+        self.active_count += other.active_count;
+        self.completed_count += other.completed_count;
+        self.pending_wakers_count += other.pending_wakers_count;
+        self.waiting_count += other.waiting_count;
+        self.rate += other.rate;
     }
 }

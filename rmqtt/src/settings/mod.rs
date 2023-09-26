@@ -31,6 +31,8 @@ pub struct Settings(Arc<Inner>);
 #[derive(Debug, Clone, Deserialize)]
 pub struct Inner {
     #[serde(default)]
+    pub task: Task,
+    #[serde(default)]
     pub node: Node,
     #[serde(default)]
     pub rpc: Rpc,
@@ -56,19 +58,22 @@ impl Deref for Settings {
 
 impl Settings {
     fn new(opts: Options) -> Result<Self> {
-        let mut s = Config::new();
+        let mut builder = Config::builder()
+            .add_source(File::with_name("/etc/rmqtt/rmqtt").required(false))
+            .add_source(File::with_name("/etc/rmqtt").required(false))
+            .add_source(File::with_name("rmqtt").required(false))
+            .add_source(
+                config::Environment::with_prefix("rmqtt")
+                    .try_parsing(true)
+                    .list_separator(" ")
+                    .with_list_parse_key("plugins.default_startups"),
+            );
 
-        // if let Ok(cfg_filename) = std::env::var("RMQTT-CONFIG-FILENAME") {
-        //     s.merge(File::with_name(&cfg_filename).required(false))?;
-        // }
-        s.merge(File::with_name("/etc/rmqtt/rmqtt").required(false))?;
-        s.merge(File::with_name("/etc/rmqtt").required(false))?;
-        s.merge(File::with_name("rmqtt").required(false))?;
         if let Some(cfg) = opts.cfg_name.as_ref() {
-            s.merge(File::with_name(cfg).required(false))?;
+            builder = builder.add_source(File::with_name(cfg).required(false));
         }
 
-        let mut inner: Inner = s.try_into()?;
+        let mut inner: Inner = builder.build()?.try_deserialize()?;
 
         inner.listeners.init();
         if inner.listeners.tcps.is_empty() && inner.listeners.tlss.is_empty() {
@@ -106,11 +111,17 @@ impl Settings {
         let cfg = Self::instance();
         crate::log::debug!("Config info is {:?}", cfg.0);
         crate::log::info!("node_id is {}", cfg.node.id);
+        crate::log::info!("exec_workers is {}", cfg.task.exec_workers);
+        crate::log::info!("exec_queue_max is {}", cfg.task.exec_queue_max);
+
         if cfg.opts.node_grpc_addrs.is_some() {
             crate::log::info!("node_grpc_addrs is {:?}", cfg.opts.node_grpc_addrs);
         }
         if cfg.opts.raft_peer_addrs.is_some() {
             crate::log::info!("raft_peer_addrs is {:?}", cfg.opts.raft_peer_addrs);
+        }
+        if cfg.opts.raft_leader_id.is_some() {
+            crate::log::info!("raft_leader_id is {:?}", cfg.opts.raft_leader_id);
         }
     }
 }
@@ -119,6 +130,30 @@ impl fmt::Debug for Settings {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Settings ...")?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Task {
+    #[serde(default = "Task::exec_workers_default")]
+    pub exec_workers: usize,
+    #[serde(default = "Task::exec_queue_max_default")]
+    pub exec_queue_max: usize,
+}
+
+impl Default for Task {
+    #[inline]
+    fn default() -> Self {
+        Self { exec_workers: Self::exec_workers_default(), exec_queue_max: Self::exec_queue_max_default() }
+    }
+}
+
+impl Task {
+    fn exec_workers_default() -> usize {
+        1000
+    }
+    fn exec_queue_max_default() -> usize {
+        300_000
     }
 }
 
@@ -219,12 +254,36 @@ impl Plugins {
     }
 
     pub fn load_config<'de, T: serde::Deserialize<'de>>(&self, name: &str) -> Result<T> {
-        let (cfg, _) = self.load_config_with_required(name, true)?;
+        let (cfg, _) = self.load_config_with_required(name, true, &[])?;
         Ok(cfg)
     }
 
     pub fn load_config_default<'de, T: serde::Deserialize<'de>>(&self, name: &str) -> Result<T> {
-        let (cfg, def) = self.load_config_with_required(name, false)?;
+        let (cfg, def) = self.load_config_with_required(name, false, &[])?;
+        if def {
+            crate::log::warn!(
+                "The configuration for plugin '{}' does not exist, default values will be used!",
+                name
+            );
+        }
+        Ok(cfg)
+    }
+
+    pub fn load_config_with<'de, T: serde::Deserialize<'de>>(
+        &self,
+        name: &str,
+        env_list_keys: &[&str],
+    ) -> Result<T> {
+        let (cfg, _) = self.load_config_with_required(name, true, env_list_keys)?;
+        Ok(cfg)
+    }
+
+    pub fn load_config_default_with<'de, T: serde::Deserialize<'de>>(
+        &self,
+        name: &str,
+        env_list_keys: &[&str],
+    ) -> Result<T> {
+        let (cfg, def) = self.load_config_with_required(name, false, env_list_keys)?;
         if def {
             crate::log::warn!(
                 "The configuration for plugin '{}' does not exist, default values will be used!",
@@ -238,12 +297,24 @@ impl Plugins {
         &self,
         name: &str,
         required: bool,
+        env_list_keys: &[&str],
     ) -> Result<(T, bool)> {
         let dir = self.dir.trim_end_matches(|c| c == '/' || c == '\\');
-        let mut s = Config::new();
-        s.merge(File::with_name(&format!("{}/{}", dir, name)).required(required))?;
+        let mut builder =
+            Config::builder().add_source(File::with_name(&format!("{}/{}", dir, name)).required(required));
+
+        let mut env = config::Environment::with_prefix(&format!("rmqtt_plugin_{}", name.replace('-', "_")));
+        if !env_list_keys.is_empty() {
+            env = env.try_parsing(true).list_separator(" ");
+            for key in env_list_keys {
+                env = env.with_list_parse_key(key);
+            }
+        }
+        builder = builder.add_source(env);
+
+        let s = builder.build()?;
         let count = s.collect()?.len();
-        Ok((s.try_into::<T>()?, count == 0))
+        Ok((s.try_deserialize::<T>()?, count == 0))
     }
 }
 
@@ -519,19 +590,12 @@ impl<'de> de::Deserialize<'de> for NodeAddr {
 }
 
 #[inline]
-fn timestamp_parse_from_str(ts: &str, fmt: &str)  -> anyhow::Result<i64> {
+fn timestamp_parse_from_str(ts: &str, fmt: &str) -> anyhow::Result<i64> {
     let ndt = chrono::NaiveDateTime::parse_from_str(ts, fmt)?;
-    let ndt = ndt.and_local_timezone(chrono::Local::now().offset().clone());
-    match ndt{
-        LocalResult::None => {
-            Err(anyhow::Error::msg("Impossible"))
-        },
-        LocalResult::Single(d) => {
-            Ok(d.timestamp())
-        },
-        LocalResult::Ambiguous(d, _tz) => {
-            Ok(d.timestamp())
-        }
+    let ndt = ndt.and_local_timezone(*chrono::Local::now().offset());
+    match ndt {
+        LocalResult::None => Err(anyhow::Error::msg("Impossible")),
+        LocalResult::Single(d) => Ok(d.timestamp()),
+        LocalResult::Ambiguous(d, _tz) => Ok(d.timestamp()),
     }
 }
-

@@ -3,6 +3,7 @@ use std::convert::From as _f;
 use std::net::SocketAddr;
 
 use ntex_mqtt::v3::{self};
+use rust_box::task_exec_queue::LocalSpawnExt;
 use uuid::Uuid;
 
 use crate::broker::executor::get_handshake_exec;
@@ -78,16 +79,18 @@ pub async fn handshake<Io: 'static>(
 
     Runtime::instance().stats.handshakings.max_max(handshake.handshakings());
 
-    let exec = get_handshake_exec(local_addr.port(), listen_cfg.clone()).await;
-    match exec.spawn(_handshake(id.clone(), listen_cfg, handshake)).await {
+    let exec = get_handshake_exec(local_addr.port(), listen_cfg.clone());
+    match _handshake(id.clone(), listen_cfg, handshake).spawn(&exec).result().await {
         Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => {
-            log::warn!("{:?} Connection Refused, handshake error, reason: {}", id, e);
+            log::warn!("{:?} Connection Refused, handshake error, reason: {:?}", id, e.to_string());
             Err(e)
         }
         Err(e) => {
-            log::warn!("{:?} Connection Refused, handshake timeout, reason: {}", id, e);
-            Err(MqttError::from("Connection Refused, execute handshake timeout"))
+            Runtime::instance().metrics.client_handshaking_timeout_inc();
+            let err = MqttError::from("Connection Refused, execute handshake timeout");
+            log::warn!("{:?} {:?}, reason: {:?}", id, err, e.to_string());
+            Err(err)
         }
     }
 }
@@ -318,13 +321,26 @@ pub async fn publish(state: v3::Session<SessionState>, pub_msg: v3::PublishMessa
 
     match pub_msg {
         v3::PublishMessage::Publish(publish) => {
-            if let Err(e) = state.publish_v3(&publish).await {
-                log::error!(
-                    "{:?} Publish failed, reason: {}",
-                    state.id,
-                    state.client.get_disconnected_reason().await
-                );
-                return Err(e);
+            let publish_fut = async move {
+                if let Err(e) = state.publish_v3(&publish).await {
+                    log::error!(
+                        "{:?} Publish failed, reason: {}",
+                        state.id,
+                        state.client.get_disconnected_reason().await
+                    );
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            };
+            if Runtime::instance().is_busy() {
+                Runtime::local_exec()
+                    .spawn(publish_fut)
+                    .result()
+                    .await
+                    .map_err(|e| MqttError::from(e.to_string()))??;
+            } else {
+                publish_fut.await?;
             }
         }
         v3::PublishMessage::PublishAck(packet_id) => {

@@ -11,13 +11,7 @@ use std::time::Duration;
 use config::PluginConfig;
 use handler::HookHandler;
 use retainer::ClusterRetainer;
-use rmqtt::{
-    ahash, anyhow,
-    async_trait::async_trait,
-    log, rand,
-    serde_json::{self, json},
-    tokio,
-};
+use rmqtt::{ahash, anyhow, async_trait::async_trait, log, NodeId, rand, serde_json::{self, json}, tokio};
 use rmqtt::{
     broker::{
         error::MqttError,
@@ -138,7 +132,9 @@ impl ClusterPlugin {
         log::info!("raft_laddr: {:?}", raft_laddr);
 
         //verify the listening address
-        parse_addr(&raft_laddr).await?;
+        if cfg.verify_addr {
+            parse_addr(&raft_laddr).await?;
+        }
 
         let raft = Raft::new(raft_laddr, router, logger, cfg.raft.to_raft_config())
             .map_err(|e| MqttError::StdError(Box::new(e)))?;
@@ -147,7 +143,11 @@ impl ClusterPlugin {
         let mut peer_addrs = Vec::new();
         for peer in raft_peer_addrs.iter() {
             if peer.id != id {
-                peer_addrs.push(parse_addr(&peer.addr).await?.to_string())
+                if cfg.verify_addr {
+                    peer_addrs.push(parse_addr(&peer.addr).await?.to_string());
+                } else {
+                    peer_addrs.push(peer.addr.to_string());
+                }
             }
         }
         log::info!("peer_addrs: {:?}", peer_addrs);
@@ -156,22 +156,15 @@ impl ClusterPlugin {
             Some(leader_info) => {
                 log::info!("Specify a leader: {:?}", leader_info);
                 if id == leader_info.id {
-                    //This node is the leader.
-                    None
+                    //First, check if the Leader exists.
+                    let actual_leader_info = find_actual_leader(&raft, peer_addrs, 3).await?;
+                    if actual_leader_info.is_some() {
+                        log::info!("Leader already exists, {:?}", actual_leader_info);
+                    }
+                    actual_leader_info
                 } else {
                     //The other nodes are leader.
-                    let mut actual_leader_info = None;
-                    for i in 0..30 {
-                        actual_leader_info = raft
-                            .find_leader_info(peer_addrs.clone())
-                            .await
-                            .map_err(|e| MqttError::StdError(Box::new(e)))?;
-                        if actual_leader_info.is_some() {
-                            break;
-                        }
-                        log::info!("Leader not found, rounds: {}", i);
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                    let actual_leader_info = find_actual_leader(&raft, peer_addrs, 60).await?;
                     let (actual_leader_id, actual_leader_addr) =
                         actual_leader_info.ok_or_else(|| MqttError::from("Leader does not exist"))?;
                     if actual_leader_id != leader_info.id {
@@ -194,9 +187,9 @@ impl ClusterPlugin {
 
         //let (status_tx, status_rx) = futures::channel::oneshot::channel::<Result<Status>>();
         let _child = std::thread::Builder::new().name("cluster-raft".to_string()).spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .worker_threads(8)
+                .worker_threads(cfg.worker_threads)
                 .thread_name("cluster-raft-worker")
                 .thread_stack_size(4 * 1024 * 1024)
                 .build()
@@ -256,7 +249,7 @@ impl Plugin for ClusterPlugin {
 
         let raft_mailbox = Self::start_raft(self.cfg.clone(), self.router).await?;
 
-        for i in 0..30 {
+        for i in 0..60 {
             match raft_mailbox.status().await {
                 Ok(status) => {
                     if status.is_started() {
@@ -355,7 +348,7 @@ impl Plugin for ClusterPlugin {
             "task_exec_queue": {
                 "waiting_count": exec.waiting_count(),
                 "active_count": exec.active_count(),
-                "completed_count": exec.completed_count(),
+                "completed_count": exec.completed_count().await,
             }
         })
     }
@@ -379,6 +372,24 @@ async fn parse_addr(addr: &str) -> Result<SocketAddr> {
         tokio::time::sleep(Duration::from_millis((rand::random::<u64>() % 300) + 500)).await;
     }
     Err(MqttError::from(format!("Parsing address{:?} error", addr)))
+}
+
+async fn find_actual_leader(
+    raft: &Raft<&ClusterRouter>,
+    peer_addrs: Vec<String>,
+    rounds: usize,
+) -> Result<Option<(NodeId, String)>> {
+    let mut actual_leader_info = None;
+    for i in 0..rounds {
+        actual_leader_info =
+            raft.find_leader_info(peer_addrs.clone()).await.map_err(|e| MqttError::StdError(Box::new(e)))?;
+        if actual_leader_info.is_some() {
+            break;
+        }
+        log::info!("Leader not found, rounds: {}", i);
+        sleep(Duration::from_millis(500)).await;
+    }
+    Ok(actual_leader_info)
 }
 
 pub(crate) struct MessageSender {

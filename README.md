@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2023/02/09/Rust-1.67.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.67%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2023/08/03/Rust-1.71.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.71.1%2B-blue" /></a>
 
 English | [简体中文](./README-CN.md)
 
@@ -23,6 +23,8 @@ and mobile applications that can handle millions of concurrent clients on a sing
 - [WebHook](./docs/en_US/web-hook.md);
 - [HTTP APIs](./docs/en_US/http-api.md);
 - [$SYS System Topics](./docs/en_US/sys-topic.md)
+- [Store session information](./docs/en_US/store-session.md)
+- [Store unexpired messages](./docs/en_US/store-message.md)
 - Distributed cluster;
 - Hooks;
 - TLS support;
@@ -152,16 +154,16 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 ### Benchmark Testing
 
 #### environment
-| Item        | Content                                   |                                                                 |
-|-------------|-------------------------------------------|-----------------------------------------------------------------|
-| System      | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                                     |
+| Item        | Content                                   |                                                              |
+|-------------|-------------------------------------------|--------------------------------------------------------------|
+| System      | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                                  |
 | CPU         | Intel(R) Xeon(R) CPU E5-2696 v3 @ 2.30GHz | 72(CPU(s)) = 18(Core(s)) * 2(Thread(s) per core) * 2(Socket(s)) |
-| Memory      | DDR3/2333                                 | 128G                                                            |
-| Disk        |                                           | 2T                                                              |
-| Container   | podman                                    | v4.4.1                                                          |
-| MQTT Bench  | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                          |
-| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.2.20                                                         |
-| Other       | MQTT Bench and MQTT Broker coexistence    |                                                                 |
+| Memory      | DDR3/2333                                 | 128G                                                         |
+| Disk        |                                           | 2T                                                           |
+| Container   | podman                                    | v4.4.1                                                       |
+| MQTT Bench  | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                       |
+| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.3.0                                                       |
+| Other       | MQTT Bench and MQTT Broker coexistence    |                                                              |
 
 #### Connection Concurrency Performance
 | Item                  | Single Node       | Raft Cluster Mode |

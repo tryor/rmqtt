@@ -196,6 +196,7 @@ pub struct ListenerInner {
 
     #[serde(default = "ListenerInner::retain_available_default")]
     pub retain_available: bool,
+
     #[serde(
         default = "ListenerInner::session_expiry_interval_default",
         deserialize_with = "deserialize_duration"
@@ -304,10 +305,6 @@ impl ListenerInner {
     fn backlog_default() -> i32 {
         1024
     }
-    //    #[inline]
-    //    fn idle_timeout_default() -> Duration {
-    //        Duration::from_secs(15)
-    //    }
     #[inline]
     fn allow_anonymous_default() -> bool {
         true
@@ -356,7 +353,6 @@ impl ListenerInner {
     fn max_topic_levels_default() -> usize {
         0
     }
-
     #[inline]
     fn retain_available_default() -> bool {
         true

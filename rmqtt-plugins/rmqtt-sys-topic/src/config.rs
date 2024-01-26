@@ -1,10 +1,12 @@
 use serde::de::{self, Deserialize, Deserializer};
 use std::time::Duration;
 
-use rmqtt::broker::types::QoS;
 use rmqtt::serde_json;
-use rmqtt::settings::to_duration;
-use rmqtt::Result;
+use rmqtt::{
+    broker::types::QoS,
+    settings::{deserialize_duration, to_duration},
+    Result,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
@@ -19,6 +21,18 @@ pub struct PluginConfig {
         deserialize_with = "PluginConfig::deserialize_publish_interval"
     )]
     pub publish_interval: Duration,
+
+    #[serde(default = "PluginConfig::message_retain_available_default")]
+    pub message_retain_available: bool,
+
+    #[serde(default = "PluginConfig::message_storage_available_default")]
+    pub message_storage_available: bool,
+
+    #[serde(
+        default = "PluginConfig::message_expiry_interval_default",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub message_expiry_interval: Duration,
 }
 
 impl PluginConfig {
@@ -30,6 +44,21 @@ impl PluginConfig {
     #[inline]
     fn publish_interval_default() -> Duration {
         Duration::from_secs(60)
+    }
+
+    #[inline]
+    fn message_retain_available_default() -> bool {
+        false
+    }
+
+    #[inline]
+    fn message_storage_available_default() -> bool {
+        false
+    }
+
+    #[inline]
+    fn message_expiry_interval_default() -> Duration {
+        Duration::from_secs(300)
     }
 
     #[inline]

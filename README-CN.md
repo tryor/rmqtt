@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2023/02/09/Rust-1.67.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.67%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2023/08/03/Rust-1.71.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.71.1%2B-blue" /></a>
 
 [English](./README.md)  | 简体中文
 
@@ -22,6 +22,8 @@
 - [WebHook](./docs/zh_CN/web-hook.md);
 - [HTTP APIs](./docs/zh_CN/http-api.md);
 - [$SYS 系统主题](./docs/zh_CN/sys-topic.md)
+- [存储会话信息](./docs/zh_CN/store-session.md)
+- [存储未过期消息](./docs/zh_CN/store-message.md)
 - 分布式集群;
 - 钩子(Hooks);
 - TLS支持;
@@ -158,7 +160,7 @@ UnspecifiedError = 0x80, NotAuthorized = 0x87。
 | 磁盘          |                                           | 2T                                                              |
 | 容器          | podman                                    | v4.4.1                                                          |
 | 测试客户端       | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                          |
-| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.2.20                                                         |
+| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.3.0                                                          |
 | 其它          | 测试客户端和MQTT Broker同服         |                                                                 |
 
 #### 连接并发性能

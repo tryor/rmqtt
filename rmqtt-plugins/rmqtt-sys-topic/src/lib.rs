@@ -5,20 +5,21 @@ extern crate serde;
 use config::PluginConfig;
 use rmqtt::{
     async_trait::async_trait,
+    base64::{engine::general_purpose, Engine as _},
     bytes::Bytes,
     chrono, log,
     serde_json::{self, json},
     tokio::spawn,
     tokio::sync::RwLock,
     tokio::time::sleep,
-    base64::{Engine as _, engine::general_purpose},
 };
 use rmqtt::{
     broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
     broker::types::{From, Id, QoSEx},
     plugin::{DynPlugin, DynPluginResult, Plugin},
-    ClientId, NodeId, Publish, PublishProperties, QoS, Result, Runtime, TopicName, UserName,
+    ClientId, NodeId, Publish, PublishProperties, QoS, Result, Runtime, SessionState, TopicName, UserName,
 };
+use std::convert::From as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,15 +74,36 @@ impl SystemTopicPlugin {
         spawn(async move {
             let min = Duration::from_secs(1);
             loop {
-                let (publish_interval, publish_qos) = {
-                    let cfg = cfg.read().await;
-                    (cfg.publish_interval, cfg.publish_qos)
+                let (publish_interval, publish_qos, retain_available, storage_available, expiry_interval) = {
+                    let cfg_rl = cfg.read().await;
+                    (
+                        cfg_rl.publish_interval,
+                        cfg_rl.publish_qos,
+                        cfg_rl.message_retain_available,
+                        cfg_rl.message_storage_available,
+                        cfg_rl.message_expiry_interval,
+                    )
                 };
+
                 let publish_interval = if publish_interval < min { min } else { publish_interval };
                 sleep(publish_interval).await;
                 if running.load(Ordering::SeqCst) {
-                    Self::send_stats(runtime, publish_qos).await;
-                    Self::send_metrics(runtime, publish_qos).await;
+                    Self::send_stats(
+                        runtime,
+                        publish_qos,
+                        retain_available,
+                        storage_available,
+                        expiry_interval,
+                    )
+                    .await;
+                    Self::send_metrics(
+                        runtime,
+                        publish_qos,
+                        retain_available,
+                        storage_available,
+                        expiry_interval,
+                    )
+                    .await;
                 }
             }
         });
@@ -89,20 +111,50 @@ impl SystemTopicPlugin {
 
     //Statistics
     //$SYS/brokers/${node}/stats
-    async fn send_stats(runtime: &'static Runtime, publish_qos: QoS) {
+    async fn send_stats(
+        runtime: &'static Runtime,
+        publish_qos: QoS,
+        retain_available: bool,
+        storage_available: bool,
+        expiry_interval: Duration,
+    ) {
         let payload = runtime.stats.clone().await.to_json().await;
         let nodeid = runtime.node.id();
         let topic = format!("$SYS/brokers/{}/stats", nodeid);
-        sys_publish(nodeid, topic, publish_qos, payload).await;
+        sys_publish(
+            nodeid,
+            topic,
+            publish_qos,
+            payload,
+            retain_available,
+            storage_available,
+            expiry_interval,
+        )
+        .await;
     }
 
     //Metrics
     //$SYS/brokers/${node}/metrics
-    async fn send_metrics(runtime: &'static Runtime, publish_qos: QoS) {
+    async fn send_metrics(
+        runtime: &'static Runtime,
+        publish_qos: QoS,
+        retain_available: bool,
+        storage_available: bool,
+        expiry_interval: Duration,
+    ) {
         let payload = Runtime::instance().metrics.to_json();
         let nodeid = runtime.node.id();
         let topic = format!("$SYS/brokers/{}/metrics", nodeid);
-        sys_publish(nodeid, topic, publish_qos, payload).await;
+        sys_publish(
+            nodeid,
+            topic,
+            publish_qos,
+            payload,
+            retain_available,
+            storage_available,
+            expiry_interval,
+        )
+        .await;
     }
 }
 
@@ -190,87 +242,97 @@ impl Handler for SystemTopicHandler {
         let now = chrono::Local::now();
         let now_time = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         if let Some((topic, payload)) = match param {
-            Parameter::SessionCreated(session, client) => {
+            Parameter::SessionCreated(session) => {
                 let body = json!({
-                    "node": client.id.node(),
-                    "ipaddress": client.id.remote_addr,
-                    "clientid": client.id.client_id,
-                    "username": client.id.username_ref(),
-                    "created_at": session.created_at,
+                    "node": session.id.node(),
+                    "ipaddress": session.id.remote_addr,
+                    "clientid": session.id.client_id,
+                    "username": session.id.username_ref(),
+                    "created_at": session.created_at().await.unwrap_or_default(),
                     "time": now_time
                 });
-                let topic = format!("$SYS/brokers/{}/session/{}/created", self.nodeid, client.id.client_id);
+                let topic = format!("$SYS/brokers/{}/session/{}/created", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
 
-            Parameter::SessionTerminated(_session, client, reason) => {
+            Parameter::SessionTerminated(session, reason) => {
                 let body = json!({
-                    "node": client.id.node(),
-                    "ipaddress": client.id.remote_addr,
-                    "clientid": client.id.client_id,
-                    "username": client.id.username_ref(),
+                    "node": session.id.node(),
+                    "ipaddress": session.id.remote_addr,
+                    "clientid": session.id.client_id,
+                    "username": session.id.username_ref(),
                     "reason": reason.to_string(),
                     "time": now_time
                 });
                 let topic =
-                    format!("$SYS/brokers/{}/session/{}/terminated", self.nodeid, client.id.client_id);
+                    format!("$SYS/brokers/{}/session/{}/terminated", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
-            Parameter::ClientConnected(_session, client) => {
-                let mut body = client.connect_info.to_hook_body();
+            Parameter::ClientConnected(session) => {
+                let mut body = session
+                    .connect_info()
+                    .await
+                    .map(|connect_info| connect_info.to_hook_body())
+                    .unwrap_or_default();
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert(
                         "connected_at".into(),
-                        serde_json::Value::Number(serde_json::Number::from(client.connected_at)),
+                        serde_json::Value::Number(serde_json::Number::from(
+                            session.connected_at().await.unwrap_or_default(),
+                        )),
                     );
-                    obj.insert("session_present".into(), serde_json::Value::Bool(client.session_present));
+                    obj.insert(
+                        "session_present".into(),
+                        serde_json::Value::Bool(session.session_present().await.unwrap_or_default()),
+                    );
                     obj.insert("time".into(), serde_json::Value::String(now_time));
                 }
-                let topic = format!("$SYS/brokers/{}/clients/{}/connected", self.nodeid, client.id.client_id);
+                let topic =
+                    format!("$SYS/brokers/{}/clients/{}/connected", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
-            Parameter::ClientDisconnected(_session, client, reason) => {
+            Parameter::ClientDisconnected(session, reason) => {
                 let body = json!({
-                    "node": client.id.node(),
-                    "ipaddress": client.id.remote_addr,
-                    "clientid": client.id.client_id,
-                    "username": client.id.username_ref(),
-                    "disconnected_at": client.disconnected_at(),
+                    "node": session.id.node(),
+                    "ipaddress": session.id.remote_addr,
+                    "clientid": session.id.client_id,
+                    "username": session.id.username_ref(),
+                    "disconnected_at": session.disconnected_at().await.unwrap_or_default(),
                     "reason": reason.to_string(),
                     "time": now_time
                 });
                 let topic =
-                    format!("$SYS/brokers/{}/clients/{}/disconnected", self.nodeid, client.id.client_id);
+                    format!("$SYS/brokers/{}/clients/{}/disconnected", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
 
-            Parameter::SessionSubscribed(_session, client, subscribe) => {
+            Parameter::SessionSubscribed(session, subscribe) => {
                 let body = json!({
-                    "node": client.id.node(),
-                    "ipaddress": client.id.remote_addr,
-                    "clientid": client.id.client_id,
-                    "username": client.id.username_ref(),
+                    "node": session.id.node(),
+                    "ipaddress": session.id.remote_addr,
+                    "clientid": session.id.client_id,
+                    "username": session.id.username_ref(),
                     "topic": subscribe.topic_filter,
                     "opts": subscribe.opts.to_json(),
                     "time": now_time
                 });
                 let topic =
-                    format!("$SYS/brokers/{}/session/{}/subscribed", self.nodeid, client.id.client_id);
+                    format!("$SYS/brokers/{}/session/{}/subscribed", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
 
-            Parameter::SessionUnsubscribed(_session, client, unsubscribed) => {
+            Parameter::SessionUnsubscribed(session, unsubscribed) => {
                 let topic = unsubscribed.topic_filter.clone();
                 let body = json!({
-                    "node": client.id.node(),
-                    "ipaddress": client.id.remote_addr,
-                    "clientid": client.id.client_id,
-                    "username": client.id.username_ref(),
+                    "node": session.id.node(),
+                    "ipaddress": session.id.remote_addr,
+                    "clientid": session.id.client_id,
+                    "username": session.id.username_ref(),
                     "topic": topic,
                     "time": now_time
                 });
                 let topic =
-                    format!("$SYS/brokers/{}/session/{}/unsubscribed", self.nodeid, client.id.client_id);
+                    format!("$SYS/brokers/{}/session/{}/unsubscribed", self.nodeid, session.id.client_id);
                 Some((topic, body))
             }
 
@@ -301,15 +363,40 @@ impl Handler for SystemTopicHandler {
             }
         } {
             let nodeid = self.nodeid;
-            let publish_qos = self.cfg.read().await.publish_qos;
-            spawn(sys_publish(nodeid, topic, publish_qos, payload));
+            let (publish_qos, retain_available, storage_available, expiry_interval) = {
+                let cfg_rl = self.cfg.read().await;
+                (
+                    cfg_rl.publish_qos,
+                    cfg_rl.message_retain_available,
+                    cfg_rl.message_storage_available,
+                    cfg_rl.message_expiry_interval,
+                )
+            };
+
+            spawn(sys_publish(
+                nodeid,
+                topic,
+                publish_qos,
+                payload,
+                retain_available,
+                storage_available,
+                expiry_interval,
+            ));
         }
         (true, acc)
     }
 }
 
 #[inline]
-async fn sys_publish(nodeid: NodeId, topic: String, publish_qos: QoS, payload: serde_json::Value) {
+async fn sys_publish(
+    nodeid: NodeId,
+    topic: String,
+    publish_qos: QoS,
+    payload: serde_json::Value,
+    retain_available: bool,
+    storage_available: bool,
+    message_expiry_interval: Duration,
+) {
     match serde_json::to_string(&payload) {
         Ok(payload) => {
             let from = From::from_system(Id::new(
@@ -336,20 +423,20 @@ async fn sys_publish(nodeid: NodeId, topic: String, publish_qos: QoS, payload: s
                 .extends
                 .hook_mgr()
                 .await
-                .message_publish(None, None, from.clone(), &p)
+                .message_publish(None, from.clone(), &p)
                 .await
                 .unwrap_or(p);
 
-            let replys = Runtime::instance().extends.shared().await.forwards(from.clone(), p).await;
-            match replys {
-                Ok(0) => {
-                    //hook, message_nonsubscribed
-                    Runtime::instance().extends.hook_mgr().await.message_nonsubscribed(from).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("send system message error, {:?}", e);
-                }
+            if let Err(e) = SessionState::forwards(
+                from,
+                p,
+                retain_available,
+                storage_available,
+                Some(message_expiry_interval),
+            )
+            .await
+            {
+                log::warn!("{:?}", e);
             }
         }
         Err(e) => {

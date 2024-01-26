@@ -3,15 +3,16 @@ use std::convert::From as _f;
 use once_cell::sync::OnceCell;
 
 use rmqtt::grpc::MessageSender;
-use rmqtt::{ahash, async_trait::async_trait, futures, log, once_cell, tokio, SubscriptionOptions};
+use rmqtt::{ahash, async_trait::async_trait, futures, log, once_cell, tokio};
 use rmqtt::{
     broker::{
         default::DefaultShared,
-        session::{ClientInfo, Session, SessionOfflineInfo},
+        session::{Session, SessionOfflineInfo},
         types::{
             ClientId, From, Id, IsAdmin, IsOnline, NodeId, Publish, Reason, SessionStatus, SharedGroup,
-            SubRelations, SubRelationsMap, SubsSearchParams, SubsSearchResult, Subscribe, SubscribeReturn,
-            SubscriptionIdentifier, SubscriptionSize, To, TopicFilter, Tx, Unsubscribe,
+            SharedGroupType, SubRelations, SubRelationsMap, SubsSearchParams, SubsSearchResult, Subscribe,
+            SubscribeReturn, SubscriptionClientIds, SubscriptionIdentifier, SubscriptionOptions, To,
+            TopicFilter, Tx, Unsubscribe,
         },
         Entry, Shared,
     },
@@ -58,17 +59,17 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
-    async fn set(&mut self, session: Session, tx: Tx, conn: ClientInfo) -> Result<()> {
-        self.inner.set(session, tx, conn).await
+    async fn set(&mut self, session: Session, tx: Tx) -> Result<()> {
+        self.inner.set(session, tx).await
     }
 
     #[inline]
-    async fn remove(&mut self) -> Result<Option<(Session, Tx, ClientInfo)>> {
+    async fn remove(&mut self) -> Result<Option<(Session, Tx)>> {
         self.inner.remove().await
     }
 
     #[inline]
-    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx, ClientInfo)>> {
+    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx)>> {
         self.inner.remove_with(id).await
     }
 
@@ -79,7 +80,7 @@ impl Entry for ClusterLockEntry {
         clear_subscriptions: bool,
         is_admin: IsAdmin,
     ) -> Result<Option<SessionOfflineInfo>> {
-        log::debug!("{:?} ClusterLockEntry kick 1 ...", self.client().map(|c| c.id.clone()));
+        log::debug!("{:?} ClusterLockEntry kick 1 ...", self.session().map(|s| s.id.clone()));
         if let Some(kicked) = self.inner.kick(clean_start, clear_subscriptions, is_admin).await? {
             log::debug!("{:?} broadcast kick reply kicked: {:?}", self.id(), kicked);
             return Ok(Some(kicked));
@@ -133,18 +134,13 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
-    fn is_connected(&self) -> bool {
-        self.inner.is_connected()
+    async fn is_connected(&self) -> bool {
+        self.inner.is_connected().await
     }
 
     #[inline]
     fn session(&self) -> Option<Session> {
         self.inner.session()
-    }
-
-    #[inline]
-    fn client(&self) -> Option<ClientInfo> {
-        self.inner.client()
     }
 
     #[inline]
@@ -228,13 +224,13 @@ impl Shared for &'static ClusterShared {
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<SubscriptionSize, Vec<(To, From, Publish, Reason)>> {
+    ) -> Result<SubscriptionClientIds, Vec<(To, From, Publish, Reason)>> {
         let this_node_id = Runtime::instance().node.id();
         let topic = publish.topic();
         log::debug!("forwards, from: {:?}, topic: {:?}", from, topic.to_string());
 
         //Matching subscriptions
-        let (relations, shared_relations, subs_size) = match Runtime::instance()
+        let (relations, shared_relations, sub_client_ids) = match Runtime::instance()
             .extends
             .router()
             .await
@@ -242,7 +238,8 @@ impl Shared for &'static ClusterShared {
             .await
         {
             Ok(mut relations_map) => {
-                let subs_size: SubscriptionSize = relations_map.values().map(|subs| subs.len()).sum();
+                //let subs_size: SubscriptionSize = relations_map.values().map(|subs| subs.len()).sum();
+                let sub_client_ids = self.inner()._collect_subscription_client_ids(&relations_map);
                 let mut relations = SubRelations::new();
                 let mut shared_relations = Vec::new();
                 for (node_id, rels) in relations_map.drain() {
@@ -255,11 +252,11 @@ impl Shared for &'static ClusterShared {
                         }
                     }
                 }
-                (relations, shared_relations, subs_size)
+                (relations, shared_relations, sub_client_ids)
             }
             Err(e) => {
                 log::warn!("forwards, from:{:?}, topic:{:?}, error: {:?}", from, topic, e);
-                (Vec::new(), Vec::new(), 0)
+                (Vec::new(), Vec::new(), None)
             }
         };
 
@@ -273,7 +270,7 @@ impl Shared for &'static ClusterShared {
         let grpc_clients = self.grpc_clients.clone();
         let message_type = self.message_type;
         let inner = self.inner;
-        let (subs_size_tx, subs_size_rx) = tokio::sync::oneshot::channel();
+        let (sub_client_ids_tx, sub_client_ids_rx) = tokio::sync::oneshot::channel();
         let broadcast_fut = async move {
             //forwards to other node and get shared subscription relations
             let replys = MessageBroadcaster::new(
@@ -303,7 +300,7 @@ impl Shared for &'static ClusterShared {
                 ClientId,
                 SubscriptionOptions,
                 Option<Vec<SubscriptionIdentifier>>,
-                (SharedGroup, IsOnline),
+                SharedGroupType,
             );
 
             #[allow(clippy::mutable_key_type)]
@@ -311,7 +308,8 @@ impl Shared for &'static ClusterShared {
 
             let add_one_to_shared_sub_groups =
                 |shared_groups: &mut SharedSubGroups, shared_rel: SharedRelation| {
-                    let (topic_filter, node_id, client_id, opts, sub_ids, (group, is_online)) = shared_rel;
+                    let (topic_filter, node_id, client_id, opts, sub_ids, (group, is_online, _client_ids)) =
+                        shared_rel;
                     if let Some(groups) = shared_groups.get_mut(&topic_filter) {
                         groups.entry(group).or_default().push((
                             node_id,
@@ -321,6 +319,7 @@ impl Shared for &'static ClusterShared {
                             Some(is_online),
                         ));
                     } else {
+                        #[allow(clippy::mutable_key_type)]
                         let mut groups = HashMap::default();
                         groups.insert(group, vec![(node_id, client_id, opts, sub_ids, Some(is_online))]);
                         shared_groups.insert(topic_filter, groups);
@@ -335,17 +334,21 @@ impl Shared for &'static ClusterShared {
                 };
 
             add_to_shared_sub_groups(&mut shared_sub_groups, shared_relations);
-            let mut all_subs_size = 0;
+            let mut all_sub_client_ids = Vec::new();
             for (_, reply) in replys {
                 match reply {
                     Ok(reply) => {
-                        if let MessageReply::Forwards(mut o_relations_map, subs_size) = reply {
+                        if let MessageReply::Forwards(mut o_relations_map, o_sub_client_ids) = reply {
                             log::debug!(
-                                "other noade relations: {:?}, subs_size: {}",
+                                "other noade relations: {:?}, o_sub_client_ids: {:?}",
                                 o_relations_map,
-                                subs_size
+                                o_sub_client_ids
                             );
-                            all_subs_size += subs_size;
+
+                            if let Some(o_sub_client_ids) = o_sub_client_ids {
+                                all_sub_client_ids.extend(o_sub_client_ids);
+                            }
+
                             for (node_id, rels) in o_relations_map.drain() {
                                 for (topic_filter, client_id, opts, sub_ids, group) in rels {
                                     if let Some(group) = group {
@@ -368,7 +371,7 @@ impl Shared for &'static ClusterShared {
                 }
             }
 
-            let _ = subs_size_tx.send(all_subs_size);
+            let _ = sub_client_ids_tx.send(all_sub_client_ids);
 
             //shared subscription choice
             let mut node_shared_subs: HashMap<NodeId, SubRelations> = HashMap::default();
@@ -418,9 +421,12 @@ impl Shared for &'static ClusterShared {
         };
 
         tokio::spawn(broadcast_fut);
-        let subs_size = subs_size + subs_size_rx.await.unwrap_or_default();
+
+        let sub_client_ids =
+            self.inner()._merge_subscription_client_ids(sub_client_ids, sub_client_ids_rx.await.ok());
+
         local_res?;
-        Ok(subs_size)
+        Ok(sub_client_ids)
     }
 
     #[inline]
@@ -428,7 +434,7 @@ impl Shared for &'static ClusterShared {
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<(SubRelationsMap, SubscriptionSize), Vec<(To, From, Publish, Reason)>> {
+    ) -> Result<(SubRelationsMap, SubscriptionClientIds), Vec<(To, From, Publish, Reason)>> {
         self.inner.forwards_and_get_shareds(from, publish).await
     }
 
@@ -448,7 +454,7 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    fn random_session(&self) -> Option<(Session, ClientInfo)> {
+    fn random_session(&self) -> Option<Session> {
         self.inner.random_session()
     }
 

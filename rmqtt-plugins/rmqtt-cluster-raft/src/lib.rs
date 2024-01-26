@@ -11,7 +11,15 @@ use std::time::Duration;
 use config::PluginConfig;
 use handler::HookHandler;
 use retainer::ClusterRetainer;
-use rmqtt::{ahash, anyhow, async_trait::async_trait, log, NodeId, rand, serde_json::{self, json}, tokio};
+
+use rmqtt::anyhow::anyhow;
+use rmqtt::{
+    ahash, anyhow,
+    async_trait::async_trait,
+    log, rand,
+    serde_json::{self, json},
+    tokio, NodeId,
+};
 use rmqtt::{
     broker::{
         error::MqttError,
@@ -293,11 +301,33 @@ impl Plugin for ClusterPlugin {
         self.register.start().await;
         let status = raft_mailbox.status().await.map_err(anyhow::Error::new)?;
         log::info!("raft status: {:?}", status);
-        if status.is_started() {
-            Ok(())
-        } else {
-            Err(MqttError::from("Raft cluster status is abnormal"))
+        if !status.is_started() {
+            return Err(MqttError::from("Raft cluster status is abnormal"));
         }
+
+        let ping = message::Message::Ping.encode()?;
+        for _ in 0..100 {
+            match raft_mailbox.send_proposal(ping.clone()).await {
+                Ok(reply) => match message::MessageReply::decode(&reply)? {
+                    message::MessageReply::Ping => {
+                        log::info!("ping ok");
+                        return Ok(());
+                    }
+                    message::MessageReply::Error(e) => {
+                        log::warn!("ping error, {:?}", e);
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                },
+                Err(e) => {
+                    log::warn!("ping error, {:?}", e);
+                }
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        Err(MqttError::from("Raft cluster status is unavailable"))
     }
 
     #[inline]
@@ -381,8 +411,7 @@ async fn find_actual_leader(
 ) -> Result<Option<(NodeId, String)>> {
     let mut actual_leader_info = None;
     for i in 0..rounds {
-        actual_leader_info =
-            raft.find_leader_info(peer_addrs.clone()).await.map_err(|e| MqttError::StdError(Box::new(e)))?;
+        actual_leader_info = raft.find_leader_info(peer_addrs.clone()).await.map_err(|e| anyhow!(e))?;
         if actual_leader_info.is_some() {
             break;
         }

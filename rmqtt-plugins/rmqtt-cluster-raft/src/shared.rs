@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::convert::From as _;
 use std::time::Duration;
 
 use rmqtt::{
@@ -8,11 +9,11 @@ use rmqtt::{
 use rmqtt::{
     broker::{
         default::DefaultShared,
-        session::{ClientInfo, Session, SessionOfflineInfo},
+        session::{Session, SessionOfflineInfo},
         types::{
             From, Id, IsAdmin, NodeId, NodeName, Publish, Reason, SessionStatus, SubRelations,
             SubRelationsMap, SubsSearchParams, SubsSearchResult, Subscribe, SubscribeReturn,
-            SubscriptionSize, To, Tx, Unsubscribe,
+            SubscriptionClientIds, To, Tx, Unsubscribe,
         },
         Entry, Router, Shared,
     },
@@ -61,10 +62,11 @@ impl Entry for ClusterLockEntry {
                     prev_node_id = prev_id.map(|id| id.node_id);
                     log::debug!(
                         "{:?} ClusterLockEntry try_lock prev_node_id: {:?}",
-                        self.client().map(|c| c.id.clone()),
+                        self.session().map(|s| s.id.clone()),
                         prev_node_id
                     );
-                } // _ => unreachable!()
+                }
+                _ => unreachable!(),
             }
         }
         Ok(Box::new(ClusterLockEntry::new(self.inner.try_lock().await?, self.cluster_shared, prev_node_id)))
@@ -86,7 +88,7 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
-    async fn set(&mut self, session: Session, tx: Tx, conn: ClientInfo) -> Result<()> {
+    async fn set(&mut self, session: Session, tx: Tx) -> Result<()> {
         let msg = RaftMessage::Connected { id: session.id.clone() }.encode()?;
         let raft_mailbox = self.cluster_shared.router.raft_mailbox().await;
         let reply = raft_mailbox.send_proposal(msg).await.map_err(anyhow::Error::new)?;
@@ -94,6 +96,7 @@ impl Entry for ClusterLockEntry {
             let reply = RaftMessageReply::decode(&reply)?;
             match reply {
                 RaftMessageReply::Error(e) => {
+                    log::error!("RaftMessage::Connected reply: {:?}", e);
                     return Err(MqttError::Msg(e));
                 }
                 _ => {
@@ -102,16 +105,16 @@ impl Entry for ClusterLockEntry {
                 }
             }
         }
-        self.inner.set(session, tx, conn).await
+        self.inner.set(session, tx).await
     }
 
     #[inline]
-    async fn remove(&mut self) -> Result<Option<(Session, Tx, ClientInfo)>> {
+    async fn remove(&mut self) -> Result<Option<(Session, Tx)>> {
         self.inner.remove().await
     }
 
     #[inline]
-    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx, ClientInfo)>> {
+    async fn remove_with(&mut self, id: &Id) -> Result<Option<(Session, Tx)>> {
         self.inner.remove_with(id).await
     }
 
@@ -124,7 +127,7 @@ impl Entry for ClusterLockEntry {
     ) -> Result<Option<SessionOfflineInfo>> {
         log::debug!(
             "{:?} ClusterLockEntry kick ..., clean_start: {}, clear_subscriptions: {}, is_admin: {}",
-            self.client().map(|c| c.id.clone()),
+            self.session().map(|s| s.id.clone()),
             clean_start,
             clear_subscriptions,
             is_admin
@@ -146,11 +149,12 @@ impl Entry for ClusterLockEntry {
             //kicked from other node
             if let Some(client) = self.cluster_shared.grpc_client(prev_node_id) {
                 let message_type = self.cluster_shared.message_type;
+                let id1 = id.clone();
                 let kick_fut = async move {
                     let mut msg_sender = MessageSender {
                         client,
                         msg_type: message_type,
-                        msg: Message::Kick(id.clone(), clean_start, true, is_admin), //clear_subscriptions
+                        msg: Message::Kick(id1, clean_start, true, is_admin), //clear_subscriptions
                         max_retries: 0,
                         retry_interval: Duration::from_millis(500),
                     };
@@ -202,18 +206,13 @@ impl Entry for ClusterLockEntry {
     }
 
     #[inline]
-    fn is_connected(&self) -> bool {
-        self.inner.is_connected()
+    async fn is_connected(&self) -> bool {
+        self.inner.is_connected().await
     }
 
     #[inline]
     fn session(&self) -> Option<Session> {
         self.inner.session()
-    }
-
-    #[inline]
-    fn client(&self) -> Option<ClientInfo> {
-        self.inner.client()
     }
 
     #[inline]
@@ -296,8 +295,8 @@ impl ClusterShared {
     }
 
     #[inline]
-    pub(crate) fn inner(&self) -> Box<dyn Shared> {
-        Box::new(self.inner)
+    pub(crate) fn inner(&self) -> &'static DefaultShared {
+        self.inner
     }
 
     #[inline]
@@ -323,7 +322,7 @@ impl Shared for &'static ClusterShared {
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<SubscriptionSize, Vec<(To, From, Publish, Reason)>> {
+    ) -> Result<SubscriptionClientIds, Vec<(To, From, Publish, Reason)>> {
         log::debug!("[forwards] from: {:?}, publish: {:?}", from, publish);
 
         let topic = publish.topic();
@@ -341,7 +340,8 @@ impl Shared for &'static ClusterShared {
             }
         };
 
-        let subs_size: SubscriptionSize = relations_map.values().map(|subs| subs.len()).sum();
+        //let subs_size: SubscriptionSize = relations_map.values().map(|subs| subs.len()).sum();
+        let sub_client_ids = self.inner()._collect_subscription_client_ids(&relations_map);
 
         let mut errs = Vec::new();
 
@@ -403,7 +403,7 @@ impl Shared for &'static ClusterShared {
         }
 
         if errs.is_empty() {
-            Ok(subs_size)
+            Ok(sub_client_ids)
         } else {
             Err(errs)
         }
@@ -424,7 +424,7 @@ impl Shared for &'static ClusterShared {
         &self,
         from: From,
         publish: Publish,
-    ) -> Result<(SubRelationsMap, SubscriptionSize), Vec<(To, From, Publish, Reason)>> {
+    ) -> Result<(SubRelationsMap, SubscriptionClientIds), Vec<(To, From, Publish, Reason)>> {
         self.inner.forwards_and_get_shareds(from, publish).await
     }
 
@@ -434,7 +434,7 @@ impl Shared for &'static ClusterShared {
     }
 
     #[inline]
-    fn random_session(&self) -> Option<(Session, ClientInfo)> {
+    fn random_session(&self) -> Option<Session> {
         self.inner.random_session()
     }
 

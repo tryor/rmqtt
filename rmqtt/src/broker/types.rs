@@ -1,7 +1,11 @@
+use anyhow::anyhow;
 use std::any::Any;
 use std::convert::From as _f;
 use std::fmt;
 use std::fmt::Display;
+use std::hash::Hash;
+use std::iter::Iterator;
+use std::mem::{size_of, size_of_val};
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::Deref;
@@ -9,11 +13,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::de::{self, Deserialize, Deserializer};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
+use tokio::sync::{oneshot, RwLock};
+
 use base64::{engine::general_purpose, Engine as _};
-use bitflags::bitflags;
+use bitflags::{self, *};
 use bytestring::ByteString;
+use get_size::GetSize;
 use itertools::Itertools;
+
 use ntex::util::Bytes;
+
 use ntex_mqtt::error::SendPacketError;
 pub use ntex_mqtt::types::{Protocol, MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
 pub use ntex_mqtt::v3::{
@@ -22,8 +33,6 @@ pub use ntex_mqtt::v3::{
     codec::SubscribeReturnCode as SubscribeReturnCodeV3, HandshakeAck as HandshakeAckV3,
     MqttSink as MqttSinkV3,
 };
-use tokio::sync::{oneshot, RwLock};
-
 use ntex_mqtt::v5::codec::{PublishAckReason, RetainHandling};
 pub use ntex_mqtt::v5::{
     self, codec::Connect as ConnectV5, codec::ConnectAckReason as ConnectAckReasonV5,
@@ -35,9 +44,11 @@ pub use ntex_mqtt::v5::{
     codec::UnsubscribeAck as UnsubscribeAckV5, codec::UserProperties, codec::UserProperty,
     HandshakeAck as HandshakeAckV5, MqttSink as MqttSinkV5,
 };
-use serde::de::{self, Deserialize, Deserializer};
-use serde::ser::{Serialize, SerializeStruct, Serializer};
+use ntex_mqtt::TopicLevel;
 
+use crate::broker::fitter::Fitter;
+use crate::broker::inflight::Inflight;
+use crate::broker::queue::{Queue, Sender};
 use crate::{MqttError, Result, Runtime};
 
 pub type NodeId = u64;
@@ -55,7 +66,7 @@ pub type TopicName = bytestring::ByteString;
 pub type Topic = ntex_mqtt::Topic;
 ///topic filter
 pub type TopicFilter = bytestring::ByteString;
-pub type SharedGroup = String;
+pub type SharedGroup = bytestring::ByteString;
 pub type IsDisconnect = bool;
 pub type MessageExpiry = bool;
 pub type TimestampMillis = i64;
@@ -64,6 +75,8 @@ pub type IsOnline = bool;
 pub type IsAdmin = bool;
 pub type LimiterName = u16;
 pub type CleanStart = bool;
+
+pub type IsPing = bool;
 
 pub type Tx = SessionTx; //futures::channel::mpsc::UnboundedSender<Message>;
 pub type Rx = futures::channel::mpsc::UnboundedReceiver<Message>;
@@ -75,11 +88,19 @@ pub type QoS = ntex_mqtt::types::QoS;
 pub type PublishReceiveTime = TimestampMillis;
 pub type Subscriptions = Vec<(TopicFilter, SubscriptionOptions)>;
 pub type TopicFilters = Vec<TopicFilter>;
-pub type SubscriptionSize = usize;
+pub type SubscriptionClientIds = Option<Vec<(ClientId, Option<(TopicFilter, SharedGroup)>)>>;
 pub type SubscriptionIdentifier = NonZeroU32;
 
 pub type HookSubscribeResult = Vec<Option<TopicFilter>>;
 pub type HookUnsubscribeResult = Vec<Option<TopicFilter>>;
+
+pub type MessageSender = Sender<(From, Publish)>;
+pub type MessageQueue = Queue<(From, Publish)>;
+pub type MessageQueueType = Arc<MessageQueue>;
+pub type InflightType = Arc<RwLock<Inflight>>;
+
+pub type ConnectInfoType = Arc<ConnectInfo>;
+pub type FitterType = Arc<dyn Fitter>;
 
 pub(crate) const UNDEFINED: &str = "undefined";
 
@@ -114,10 +135,16 @@ impl SessionTx {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum ConnectInfo {
     V3(Id, ConnectV3),
     V5(Id, Box<ConnectV5>),
+}
+
+impl std::convert::From<Id> for ConnectInfo {
+    fn from(id: Id) -> Self {
+        ConnectInfo::V3(id, ConnectV3::default())
+    }
 }
 
 impl ConnectInfo {
@@ -132,46 +159,46 @@ impl ConnectInfo {
     #[inline]
     pub fn client_id(&self) -> &ClientId {
         match self {
-            ConnectInfo::V3(_, c) => &c.client_id,
-            ConnectInfo::V5(_, c) => &c.client_id,
+            ConnectInfo::V3(id, _) => &id.client_id,
+            ConnectInfo::V5(id, _) => &id.client_id,
         }
     }
 
     #[inline]
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            ConnectInfo::V3(id, conn_info) => {
+            ConnectInfo::V3(id, c) => {
                 json!({
                     "node": id.node(),
                     "ipaddress": id.remote_addr,
                     "clientid": id.client_id,
                     "username": id.username_ref(),
-                    "keepalive": conn_info.keep_alive,
-                    "proto_ver": conn_info.protocol.level(),
-                    "clean_session": conn_info.clean_session,
+                    "keepalive": c.keep_alive,
+                    "proto_ver": c.protocol.level(),
+                    "clean_session": c.clean_session,
                     "last_will": self.last_will().map(|lw|lw.to_json())
                 })
             }
-            ConnectInfo::V5(id, conn_info) => {
+            ConnectInfo::V5(id, c) => {
                 json!({
                     "node": id.node(),
                     "ipaddress": id.remote_addr,
                     "clientid": id.client_id,
                     "username": id.username_ref(),
-                    "keepalive": conn_info.keep_alive,
+                    "keepalive": c.keep_alive,
                     "proto_ver": ntex_mqtt::types::MQTT_LEVEL_5,
-                    "clean_start": conn_info.clean_start,
+                    "clean_start": c.clean_start,
                     "last_will": self.last_will().map(|lw|lw.to_json()),
 
-                    "session_expiry_interval_secs": conn_info.session_expiry_interval_secs,
-                    "auth_method": conn_info.auth_method,
-                    "auth_data": conn_info.auth_data,
-                    "request_problem_info": conn_info.request_problem_info,
-                    "request_response_info": conn_info.request_response_info,
-                    "receive_max": conn_info.receive_max,
-                    "topic_alias_max": conn_info.topic_alias_max,
-                    "user_properties": conn_info.user_properties,
-                    "max_packet_size": conn_info.max_packet_size,
+                    "session_expiry_interval_secs": c.session_expiry_interval_secs,
+                    "auth_method": c.auth_method,
+                    "auth_data": c.auth_data,
+                    "request_problem_info": c.request_problem_info,
+                    "request_response_info": c.request_response_info,
+                    "receive_max": c.receive_max,
+                    "topic_alias_max": c.topic_alias_max,
+                    "user_properties": c.user_properties,
+                    "max_packet_size": c.max_packet_size,
                 })
             }
         }
@@ -180,26 +207,26 @@ impl ConnectInfo {
     #[inline]
     pub fn to_hook_body(&self) -> serde_json::Value {
         match self {
-            ConnectInfo::V3(id, conn_info) => {
+            ConnectInfo::V3(id, c) => {
                 json!({
                     "node": id.node(),
                     "ipaddress": id.remote_addr,
                     "clientid": id.client_id,
                     "username": id.username_ref(),
-                    "keepalive": conn_info.keep_alive,
-                    "proto_ver": conn_info.protocol.level(),
-                    "clean_session": conn_info.clean_session,
+                    "keepalive": c.keep_alive,
+                    "proto_ver": c.protocol.level(),
+                    "clean_session": c.clean_session,
                 })
             }
-            ConnectInfo::V5(id, conn_info) => {
+            ConnectInfo::V5(id, c) => {
                 json!({
                     "node": id.node(),
                     "ipaddress": id.remote_addr,
                     "clientid": id.client_id,
                     "username": id.username_ref(),
-                    "keepalive": conn_info.keep_alive,
+                    "keepalive": c.keep_alive,
                     "proto_ver": ntex_mqtt::types::MQTT_LEVEL_5,
-                    "clean_start": conn_info.clean_start,
+                    "clean_start": c.clean_start,
                 })
             }
         }
@@ -264,7 +291,7 @@ impl ConnectInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Disconnect {
     V3,
     V5(DisconnectV5),
@@ -357,12 +384,14 @@ pub type SharedSubRelations = HashMap<TopicFilter, Vec<(SharedGroup, NodeId, Cli
 pub type OtherSubRelations = HashMap<NodeId, Vec<TopicFilter>>;
 pub type ClearSubscriptions = bool;
 
+pub type SharedGroupType = (SharedGroup, IsOnline, Vec<ClientId>);
+
 pub type SubRelation = (
     TopicFilter,
     ClientId,
     SubscriptionOptions,
     Option<Vec<SubscriptionIdentifier>>,
-    Option<(SharedGroup, IsOnline)>,
+    Option<SharedGroupType>,
 );
 pub type SubRelations = Vec<SubRelation>;
 pub type SubRelationsMap = HashMap<NodeId, SubRelations>;
@@ -386,12 +415,7 @@ pub struct SubscriptioRelationsCollector {
     v3_rels: Vec<SubRelation>,
     v5_rels: HashMap<
         ClientId,
-        (
-            TopicFilter,
-            SubscriptionOptions,
-            Option<Vec<SubscriptionIdentifier>>,
-            Option<(SharedGroup, IsOnline)>,
-        ),
+        (TopicFilter, SubscriptionOptions, Option<Vec<SubscriptionIdentifier>>, Option<SharedGroupType>),
     >,
 }
 
@@ -402,7 +426,7 @@ impl SubscriptioRelationsCollector {
         topic_filter: &TopicFilter,
         client_id: ClientId,
         opts: SubscriptionOptions,
-        group: Option<(SharedGroup, IsOnline)>,
+        group: Option<SharedGroupType>,
     ) {
         if opts.is_v3() {
             self.v3_rels.push((topic_filter.clone(), client_id, opts, None, group));
@@ -601,7 +625,7 @@ impl SubOptionsV3 {
         });
         if let Some(g) = &self.shared_group {
             if let Some(obj) = obj.as_object_mut() {
-                obj.insert("group".into(), serde_json::Value::String(g.clone()));
+                obj.insert("group".into(), serde_json::Value::String(g.to_string()));
             }
         }
         obj
@@ -647,7 +671,7 @@ impl SubOptionsV5 {
         });
         if let Some(obj) = obj.as_object_mut() {
             if let Some(g) = &self.shared_group {
-                obj.insert("group".into(), serde_json::Value::String(g.clone()));
+                obj.insert("group".into(), serde_json::Value::String(g.to_string()));
             }
             if let Some(id) = &self.id {
                 obj.insert("id".into(), serde_json::Value::Number(serde_json::Number::from(id.get())));
@@ -1348,7 +1372,7 @@ impl Publish {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(GetSize, Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum FromType {
     Custom,
     Admin,
@@ -1369,7 +1393,7 @@ impl std::fmt::Display for FromType {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(GetSize, Clone, Deserialize, Serialize)]
 pub struct From {
     typ: FromType,
     pub id: Id,
@@ -1441,6 +1465,12 @@ pub type To = Id;
 
 #[derive(Clone)]
 pub struct Id(Arc<_Id>);
+
+impl get_size::GetSize for Id {
+    fn get_heap_size(&self) -> usize {
+        self.0.get_heap_size()
+    }
+}
 
 impl Id {
     #[inline]
@@ -1529,12 +1559,13 @@ impl ToString for Id {
     #[inline]
     fn to_string(&self) -> String {
         format!(
-            "{}@{}/{}/{}/{}",
+            "{}@{}/{}/{}/{}/{}",
             self.node_id,
             self.local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
             self.remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
             self.client_id,
-            self.username_ref()
+            self.username_ref(),
+            self.create_time
         )
     }
 }
@@ -1542,7 +1573,7 @@ impl ToString for Id {
 impl std::fmt::Debug for Id {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.to_string(), self.create_time)
+        write!(f, "{}", self.to_string())
     }
 }
 
@@ -1600,20 +1631,99 @@ impl<'de> Deserialize<'de> for Id {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, GetSize, Deserialize, Serialize)]
 pub struct _Id {
     pub node_id: NodeId,
+    #[get_size(size_fn = get_option_addr_size_helper)]
     pub local_addr: Option<SocketAddr>,
+    #[get_size(size_fn = get_option_addr_size_helper)]
     pub remote_addr: Option<SocketAddr>,
+    #[get_size(size_fn = get_bytestring_size_helper)]
     pub client_id: ClientId,
+    #[get_size(size_fn = get_option_bytestring_size_helper)]
     pub username: Option<UserName>,
     pub create_time: TimestampMillis,
 }
 
+fn get_bytestring_size_helper(s: &ByteString) -> usize {
+    s.len()
+}
+
+fn get_option_bytestring_size_helper(s: &Option<ByteString>) -> usize {
+    if let Some(s) = s {
+        s.len()
+    } else {
+        0
+    }
+}
+
+fn get_option_addr_size_helper(s: &Option<SocketAddr>) -> usize {
+    if let Some(s) = s {
+        match s {
+            SocketAddr::V4(s) => size_of_val(s),
+            SocketAddr::V6(s) => size_of_val(s),
+        }
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Retain {
+    pub msg_id: Option<MsgID>,
     pub from: From,
     pub publish: Publish,
+}
+
+pub type MsgID = usize;
+
+#[derive(Debug, Clone, Deserialize, Serialize, GetSize)]
+pub struct StoredMessage {
+    pub msg_id: MsgID,
+    pub from: From,
+    #[get_size(size_fn = get_publish_size_helper)]
+    pub publish: Publish,
+    pub expiry_time_at: TimestampMillis,
+}
+
+fn get_bytes_size_helper(s: &Bytes) -> usize {
+    s.len()
+}
+
+fn get_properties_size_helper(s: &PublishProperties) -> usize {
+    s.content_type.as_ref().map(|ct| ct.len()).unwrap_or_default()
+        + s.correlation_data.as_ref().map(|cd| cd.len()).unwrap_or_default()
+        + s.user_properties.len() * size_of::<UserProperty>()
+        + s.response_topic.as_ref().map(|rt| rt.len()).unwrap_or_default()
+        + s.subscription_ids.as_ref().map(|si| si.len() * size_of::<NonZeroU32>()).unwrap_or_default()
+}
+
+fn get_publish_size_helper(p: &Publish) -> usize {
+    // p.create_time.get_heap_size()
+    p.packet_id.get_heap_size()
+        // + p.dup.get_heap_size()
+        + get_bytes_size_helper(&p.payload)
+        // + p.retain.get_heap_size()
+        + get_bytestring_size_helper(&p.topic)
+        + size_of_val(&p.qos)
+        + get_properties_size_helper(&p.properties)
+}
+
+impl StoredMessage {
+    #[inline]
+    pub fn is_expiry(&self) -> bool {
+        self.expiry_time_at < timestamp_millis()
+    }
+
+    #[inline]
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(&self).map_err(|e| anyhow!(e))?)
+    }
+
+    #[inline]
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize(data).map_err(|e| anyhow!(e))?)
+    }
 }
 
 #[derive(Debug)]
@@ -1622,7 +1732,7 @@ pub enum Message {
     Kick(oneshot::Sender<()>, Id, CleanStart, IsAdmin),
     Disconnect(Disconnect),
     Closed(Reason),
-    Keepalive,
+    Keepalive(IsPing),
     Subscribe(Subscribe, oneshot::Sender<Result<SubscribeReturn>>),
     Unsubscribe(Unsubscribe, oneshot::Sender<Result<()>>),
 }
@@ -1674,55 +1784,40 @@ pub struct Route {
     pub topic: TopicFilter,
 }
 
+pub type SessionSubMap = HashMap<TopicFilter, SubscriptionOptions>;
 #[derive(Clone)]
 pub struct SessionSubs {
-    subs: Arc<RwLock<HashMap<TopicFilter, SubscriptionOptions>>>,
+    subs: Arc<RwLock<SessionSubMap>>,
 }
 
 impl Deref for SessionSubs {
-    type Target = Arc<RwLock<HashMap<TopicFilter, SubscriptionOptions>>>;
+    type Target = Arc<RwLock<SessionSubMap>>;
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.subs
     }
 }
 
-/*
-impl Serialize for SessionSubs {
-    #[inline]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.subs.read().deref().serialize(serializer)
+impl Default for SessionSubs {
+    fn default() -> Self {
+        Self::new()
     }
 }
-
-impl<'de> Deserialize<'de> for SessionSubs {
-    #[inline]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(SessionSubs::from(HashMap::deserialize(deserializer)?))
-    }
-}
-*/
 
 impl SessionSubs {
     #[inline]
-    pub(crate) fn new() -> Self {
-        Self::from(HashMap::default())
+    pub fn new() -> Self {
+        Self::from(SessionSubMap::default())
     }
 
     #[inline]
     #[allow(clippy::mutable_key_type)]
-    pub(crate) fn from(subs: HashMap<TopicFilter, SubscriptionOptions>) -> Self {
+    pub fn from(subs: SessionSubMap) -> Self {
         Self { subs: Arc::new(RwLock::new(subs)) }
     }
 
     #[inline]
-    pub async fn add(
+    pub async fn _add(
         &self,
         topic_filter: TopicFilter,
         opts: SubscriptionOptions,
@@ -1758,7 +1853,7 @@ impl SessionSubs {
     }
 
     #[inline]
-    pub async fn remove(&self, topic_filter: &str) -> Option<(TopicFilter, SubscriptionOptions)> {
+    pub async fn _remove(&self, topic_filter: &str) -> Option<(TopicFilter, SubscriptionOptions)> {
         let removed = {
             let mut subs = self.subs.write().await;
             let removed = subs.remove_entry(topic_filter);
@@ -1777,13 +1872,11 @@ impl SessionSubs {
     }
 
     #[inline]
-    pub async fn drain(&self) -> Subscriptions {
+    pub async fn _drain(&self) -> Subscriptions {
         let topic_filters = self.subs.read().await.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-        //let subs = topic_filters.iter().filter_map(|tf| Some(async move { self.remove(tf).await }));
-        //futures::future::join_all(subs).await.into_iter().filter_map(|item| item).collect()
         let mut subs = Vec::new();
         for tf in topic_filters {
-            if let Some(sub) = self.remove(&tf).await {
+            if let Some(sub) = self._remove(&tf).await {
                 subs.push(sub);
             }
         }
@@ -1791,14 +1884,14 @@ impl SessionSubs {
     }
 
     #[inline]
-    pub async fn extend(&self, subs: Subscriptions) {
+    pub async fn _extend(&self, subs: Subscriptions) {
         for (topic_filter, opts) in subs {
-            self.add(topic_filter, opts).await;
+            self._add(topic_filter, opts).await;
         }
     }
 
     #[inline]
-    pub async fn clear(&self) {
+    pub async fn _clear(&self) {
         {
             let subs = self.subs.read().await;
             for (_, opts) in subs.iter() {
@@ -1819,6 +1912,11 @@ impl SessionSubs {
     }
 
     #[inline]
+    pub async fn shared_len(&self) -> usize {
+        self.subs.read().await.iter().filter(|(_, opts)| opts.has_shared_group()).count()
+    }
+
+    #[inline]
     pub async fn is_empty(&self) -> bool {
         self.subs.read().await.is_empty()
     }
@@ -1826,6 +1924,86 @@ impl SessionSubs {
     #[inline]
     pub async fn to_topic_filters(&self) -> TopicFilters {
         self.subs.read().await.iter().map(|(key, _)| key.clone()).collect()
+    }
+}
+
+pub struct ExtraData<K, T> {
+    attrs: Arc<rust_box::std_ext::RwLock<HashMap<K, T>>>,
+}
+
+impl<K, T> Deref for ExtraData<K, T> {
+    type Target = Arc<rust_box::std_ext::RwLock<HashMap<K, T>>>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.attrs
+    }
+}
+
+impl<K, T> Serialize for ExtraData<K, T>
+where
+    K: serde::Serialize,
+    T: serde::Serialize,
+{
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.attrs.read().deref().serialize(serializer)
+    }
+}
+
+impl<'de, K, T> Deserialize<'de> for ExtraData<K, T>
+where
+    K: Eq + Hash,
+    K: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned,
+{
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = HashMap::deserialize(deserializer)?;
+        Ok(Self { attrs: Arc::new(rust_box::std_ext::RwLock::new(v)) })
+    }
+}
+
+impl<K, T> Default for ExtraData<K, T>
+where
+    K: Eq + Hash,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<K, T> ExtraData<K, T>
+where
+    K: Eq + Hash,
+{
+    #[inline]
+    pub fn new() -> Self {
+        Self { attrs: Arc::new(rust_box::std_ext::RwLock::new(HashMap::default())) }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.attrs.read().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.attrs.read().is_empty()
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        self.attrs.write().clear()
+    }
+
+    #[inline]
+    pub fn insert(&self, key: K, value: T) {
+        self.attrs.write().insert(key, value);
     }
 }
 
@@ -1883,6 +2061,15 @@ impl ExtraAttrs {
     ) -> Option<&mut T> {
         self.attrs.entry(key).or_insert_with(|| Box::new(def_fn())).downcast_mut::<T>()
     }
+
+    #[inline]
+    pub fn serialize_key<S, T>(&self, key: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Any + Sync + Send + serde::ser::Serialize,
+        S: Serializer,
+    {
+        self.get::<T>(key).serialize(serializer)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1928,6 +2115,38 @@ bitflags! {
         const ByAdminKick = 0b00000010;
         const DisconnectReceived = 0b00000100;
         const CleanStart = 0b00001000;
+        const Ping = 0b00010000;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SessionStateFlags: u8 {
+        const SessionPresent = 0b00000001;
+        const Superuser = 0b00000010;
+        const Connected = 0b00000100;
+    }
+}
+
+impl Serialize for SessionStateFlags {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let v: u8 = self.0 .0;
+        v.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionStateFlags {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = u8::deserialize(deserializer)?;
+        Ok(SessionStateFlags::from_bits_retain(v))
     }
 }
 
@@ -2163,6 +2382,95 @@ impl ClientTopicAliases {
                 ByteString::from("implementation specific error, ‘alias’ and ‘topic’ are both empty"),
             )),
             (None, _) => Ok(topic),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DisconnectInfo {
+    pub disconnected_at: TimestampMillis,
+    pub reasons: Vec<Reason>,
+    pub mqtt_disconnect: Option<Disconnect>, //MQTT Disconnect
+}
+
+impl DisconnectInfo {
+    #[inline]
+    pub fn new(disconnected_at: TimestampMillis) -> Self {
+        Self { disconnected_at, reasons: Vec::new(), mqtt_disconnect: None }
+    }
+
+    #[inline]
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected_at != 0
+    }
+}
+
+#[inline]
+pub fn topic_size(topic: &Topic) -> usize {
+    topic
+        .iter()
+        .map(|l| {
+            let data_len = match l {
+                TopicLevel::Normal(s) => s.len(),
+                TopicLevel::Metadata(s) => s.len(),
+                _ => 0,
+            };
+            size_of::<TopicLevel>() + data_len
+        })
+        .sum::<usize>()
+}
+
+#[inline]
+pub fn timestamp() -> Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| {
+        let now = chrono::Local::now();
+        Duration::new(now.timestamp() as u64, now.timestamp_subsec_nanos())
+    })
+}
+
+#[inline]
+pub fn timestamp_secs() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or_else(|_| chrono::Local::now().timestamp())
+}
+
+#[inline]
+pub fn timestamp_millis() -> TimestampMillis {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|t| t.as_millis() as i64)
+        .unwrap_or_else(|_| chrono::Local::now().timestamp_millis())
+}
+
+#[inline]
+pub fn format_timestamp(t: Timestamp) -> String {
+    if t <= 0 {
+        "".into()
+    } else {
+        use chrono::TimeZone;
+        if let chrono::LocalResult::Single(t) = chrono::Local.timestamp_opt(t, 0) {
+            t.format("%Y-%m-%d %H:%M:%S").to_string()
+        } else {
+            "".into()
+        }
+    }
+}
+
+#[inline]
+pub fn format_timestamp_millis(t: TimestampMillis) -> String {
+    if t <= 0 {
+        "".into()
+    } else {
+        use chrono::TimeZone;
+        if let chrono::LocalResult::Single(t) = chrono::Local.timestamp_millis_opt(t) {
+            t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        } else {
+            "".into()
         }
     }
 }

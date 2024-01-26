@@ -1,0 +1,13 @@
+[package]
+name = "rmqtt-session-storage"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+
+[dependencies]
+rmqtt.workspace = true
+rmqtt-storage = { version = "0.4", default-features = false, features = ["ttl"]}
+#rmqtt-storage = { path = "../../../rmqtt-storage", default-features = false, features = ["ttl"]}
+serde = { workspace = true, features = ["derive"] }

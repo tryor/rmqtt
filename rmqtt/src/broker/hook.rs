@@ -1,5 +1,6 @@
+use crate::broker::inflight::InflightMessage;
 use crate::broker::types::*;
-use crate::{grpc, ClientInfo, Result, Session};
+use crate::{grpc, Result, Session};
 
 pub type Priority = u32;
 pub type Proceed = bool;
@@ -7,7 +8,7 @@ pub type ReturnType = (Proceed, Option<HookResult>);
 
 #[async_trait]
 pub trait HookManager: Sync + Send {
-    fn hook(&self, s: &Session, c: &ClientInfo) -> std::rc::Rc<dyn Hook>;
+    fn hook(&self, s: &Session) -> std::rc::Rc<dyn Hook>;
 
     fn register(&self) -> Box<dyn Register>;
 
@@ -32,13 +33,7 @@ pub trait HookManager: Sync + Send {
     ) -> ConnectAckReason;
 
     ///Publish message received
-    async fn message_publish(
-        &self,
-        s: Option<&Session>,
-        c: Option<&ClientInfo>,
-        from: From,
-        publish: &Publish,
-    ) -> Option<Publish>;
+    async fn message_publish(&self, s: Option<&Session>, from: From, publish: &Publish) -> Option<Publish>;
 
     ///Publish message Dropped
     async fn message_dropped(&self, to: Option<To>, from: From, p: Publish, reason: Reason);
@@ -107,13 +102,19 @@ pub trait Hook: Sync + Send {
     ///Publish message received
     async fn message_publish(&self, from: From, p: &Publish) -> Option<Publish>;
 
-    ///message delivered
+    ///Message delivered
     async fn message_delivered(&self, from: From, publish: &Publish) -> Option<Publish>;
 
-    ///message acked
+    ///Message acked
     async fn message_acked(&self, from: From, publish: &Publish);
 
-    ///message expiry check
+    ///Offline publish message
+    async fn offline_message(&self, from: From, publish: &Publish);
+
+    ///Offline inflight messages
+    async fn offline_inflight_messages(&self, inflight_messages: Vec<InflightMessage>);
+
+    ///Message expiry check
     async fn message_expiry_check(&self, from: From, publish: &Publish) -> MessageExpiryCheckResult;
 }
 
@@ -142,6 +143,9 @@ pub enum Type {
     MessageDropped,
     MessageExpiryCheck,
     MessageNonsubscribed,
+
+    OfflineMessage,
+    OfflineInflightMessages,
 
     GrpcMessageReceived,
 }
@@ -173,6 +177,9 @@ impl std::convert::From<&str> for Type {
             "message_expiry_check" => Type::MessageExpiryCheck,
             "message_nonsubscribed" => Type::MessageNonsubscribed,
 
+            "offline_message" => Type::OfflineMessage,
+            "offline_inflight_messages" => Type::OfflineInflightMessages,
+
             "grpc_message_received" => Type::GrpcMessageReceived,
 
             _ => unreachable!("{:?} is not defined", t),
@@ -184,27 +191,30 @@ impl std::convert::From<&str> for Type {
 pub enum Parameter<'a> {
     BeforeStartup,
 
-    SessionCreated(&'a Session, &'a ClientInfo),
-    SessionTerminated(&'a Session, &'a ClientInfo, Reason),
-    SessionSubscribed(&'a Session, &'a ClientInfo, Subscribe),
-    SessionUnsubscribed(&'a Session, &'a ClientInfo, Unsubscribe),
+    SessionCreated(&'a Session),
+    SessionTerminated(&'a Session, Reason),
+    SessionSubscribed(&'a Session, Subscribe),
+    SessionUnsubscribed(&'a Session, Unsubscribe),
 
     ClientConnect(&'a ConnectInfo),
     ClientConnack(&'a ConnectInfo, &'a ConnectAckReason),
     ClientAuthenticate(&'a ConnectInfo),
-    ClientConnected(&'a Session, &'a ClientInfo),
-    ClientDisconnected(&'a Session, &'a ClientInfo, Reason),
-    ClientSubscribe(&'a Session, &'a ClientInfo, &'a Subscribe),
-    ClientUnsubscribe(&'a Session, &'a ClientInfo, &'a Unsubscribe),
-    ClientSubscribeCheckAcl(&'a Session, &'a ClientInfo, &'a Subscribe),
+    ClientConnected(&'a Session),
+    ClientDisconnected(&'a Session, Reason),
+    ClientSubscribe(&'a Session, &'a Subscribe),
+    ClientUnsubscribe(&'a Session, &'a Unsubscribe),
+    ClientSubscribeCheckAcl(&'a Session, &'a Subscribe),
 
-    MessagePublishCheckAcl(&'a Session, &'a ClientInfo, &'a Publish),
-    MessagePublish(Option<&'a Session>, Option<&'a ClientInfo>, From, &'a Publish),
-    MessageDelivered(&'a Session, &'a ClientInfo, From, &'a Publish),
-    MessageAcked(&'a Session, &'a ClientInfo, From, &'a Publish),
+    MessagePublishCheckAcl(&'a Session, &'a Publish),
+    MessagePublish(Option<&'a Session>, From, &'a Publish),
+    MessageDelivered(&'a Session, From, &'a Publish),
+    MessageAcked(&'a Session, From, &'a Publish),
     MessageDropped(Option<To>, From, Publish, Reason),
-    MessageExpiryCheck(&'a Session, &'a ClientInfo, From, &'a Publish),
+    MessageExpiryCheck(&'a Session, From, &'a Publish),
     MessageNonsubscribed(From),
+
+    OfflineMessage(&'a Session, From, &'a Publish),
+    OfflineInflightMessages(&'a Session, Vec<InflightMessage>),
 
     GrpcMessageReceived(grpc::MessageType, grpc::Message),
 }
@@ -214,27 +224,30 @@ impl<'a> Parameter<'a> {
         match self {
             Parameter::BeforeStartup => Type::BeforeStartup,
 
-            Parameter::SessionCreated(_, _) => Type::SessionCreated,
-            Parameter::SessionTerminated(_, _, _) => Type::SessionTerminated,
-            Parameter::SessionSubscribed(_, _, _) => Type::SessionSubscribed,
-            Parameter::SessionUnsubscribed(_, _, _) => Type::SessionUnsubscribed,
+            Parameter::SessionCreated(_) => Type::SessionCreated,
+            Parameter::SessionTerminated(_, _) => Type::SessionTerminated,
+            Parameter::SessionSubscribed(_, _) => Type::SessionSubscribed,
+            Parameter::SessionUnsubscribed(_, _) => Type::SessionUnsubscribed,
 
             Parameter::ClientAuthenticate(_) => Type::ClientAuthenticate,
             Parameter::ClientConnect(_) => Type::ClientConnect,
             Parameter::ClientConnack(_, _) => Type::ClientConnack,
-            Parameter::ClientConnected(_, _) => Type::ClientConnected,
-            Parameter::ClientDisconnected(_, _, _) => Type::ClientDisconnected,
-            Parameter::ClientSubscribe(_, _, _) => Type::ClientSubscribe,
-            Parameter::ClientUnsubscribe(_, _, _) => Type::ClientUnsubscribe,
-            Parameter::ClientSubscribeCheckAcl(_, _, _) => Type::ClientSubscribeCheckAcl,
+            Parameter::ClientConnected(_) => Type::ClientConnected,
+            Parameter::ClientDisconnected(_, _) => Type::ClientDisconnected,
+            Parameter::ClientSubscribe(_, _) => Type::ClientSubscribe,
+            Parameter::ClientUnsubscribe(_, _) => Type::ClientUnsubscribe,
+            Parameter::ClientSubscribeCheckAcl(_, _) => Type::ClientSubscribeCheckAcl,
 
-            Parameter::MessagePublishCheckAcl(_, _, _) => Type::MessagePublishCheckAcl,
-            Parameter::MessagePublish(_, _, _, _) => Type::MessagePublish,
-            Parameter::MessageDelivered(_, _, _, _) => Type::MessageDelivered,
-            Parameter::MessageAcked(_, _, _, _) => Type::MessageAcked,
+            Parameter::MessagePublishCheckAcl(_, _) => Type::MessagePublishCheckAcl,
+            Parameter::MessagePublish(_, _, _) => Type::MessagePublish,
+            Parameter::MessageDelivered(_, _, _) => Type::MessageDelivered,
+            Parameter::MessageAcked(_, _, _) => Type::MessageAcked,
             Parameter::MessageDropped(_, _, _, _) => Type::MessageDropped,
-            Parameter::MessageExpiryCheck(_, _, _, _) => Type::MessageExpiryCheck,
+            Parameter::MessageExpiryCheck(_, _, _) => Type::MessageExpiryCheck,
             Parameter::MessageNonsubscribed(_) => Type::MessageNonsubscribed,
+
+            Parameter::OfflineMessage(_, _, _) => Type::OfflineMessage,
+            Parameter::OfflineInflightMessages(_, _) => Type::OfflineInflightMessages,
 
             Parameter::GrpcMessageReceived(_, _) => Type::GrpcMessageReceived,
         }

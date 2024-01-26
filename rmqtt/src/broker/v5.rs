@@ -1,6 +1,7 @@
 use bytestring::ByteString;
 use std::convert::From as _f;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ntex_mqtt::v5;
 use ntex_mqtt::v5::codec::{Auth, DisconnectReasonCode, PublishAckReason};
@@ -12,7 +13,7 @@ use uuid::Uuid;
 use crate::broker::executor::get_handshake_exec;
 use crate::broker::{inflight::MomentStatus, types::*};
 use crate::settings::listener::Listener;
-use crate::{ClientInfo, MqttError, Result, Runtime, Session, SessionState};
+use crate::{MqttError, Result, Runtime, Session, SessionState};
 
 #[inline]
 async fn refused_ack<Io>(
@@ -93,7 +94,7 @@ pub async fn _handshake<Io: 'static>(
     mut handshake: v5::Handshake<Io>,
     is_assigned_client_id: bool,
 ) -> Result<v5::HandshakeAck<Io, SessionState>, MqttError> {
-    let connect_info = ConnectInfo::V5(id.clone(), Box::new(handshake.packet().clone()));
+    let connect_info = Arc::new(ConnectInfo::V5(id.clone(), Box::new(handshake.packet().clone())));
 
     //hook, client connect
     let _user_props = Runtime::instance().extends.hook_mgr().await.client_connect(&connect_info).await;
@@ -167,24 +168,42 @@ pub async fn _handshake<Io: 'static>(
         };
 
     let connected_at = chrono::Local::now().timestamp_millis();
-    let client = ClientInfo::new(connect_info, session_present, superuser, connected_at);
 
-    let fitter =
-        Runtime::instance().extends.fitter_mgr().await.get(client.clone(), id.clone(), listen_cfg.clone());
+    let fitter = Runtime::instance().extends.fitter_mgr().await.create(
+        connect_info.clone(),
+        id.clone(),
+        listen_cfg.clone(),
+    );
 
     log::debug!("{:?} offline_info: {:?}", id, offline_info);
     let created_at =
         if let Some(ref offline_info) = offline_info { offline_info.created_at } else { connected_at };
 
     let max_inflight = fitter.max_inflight();
-    let session = Session::new(id, fitter, listen_cfg, max_inflight, created_at);
-
-    let keep_alive = match session.fitter.keep_alive(&mut packet.keep_alive) {
-        Ok(keep_alive) => keep_alive,
+    let max_mqueue_len = fitter.max_mqueue_len();
+    let session = match Session::new(
+        id,
+        max_mqueue_len,
+        listen_cfg,
+        fitter,
+        max_inflight,
+        created_at,
+        connect_info.clone(),
+        session_present,
+        superuser,
+        true,
+        connected_at,
+        SessionSubs::new(),
+        None,
+        offline_info.as_ref().map(|o| o.id.clone()),
+    )
+    .await
+    {
+        Ok(s) => s,
         Err(e) => {
             return Ok(refused_ack(
                 handshake,
-                &client.connect_info,
+                connect_info.as_ref(),
                 ConnectAckReasonV5::ServerUnavailable,
                 format!("{}", e),
             )
@@ -192,7 +211,20 @@ pub async fn _handshake<Io: 'static>(
         }
     };
 
-    let hook = Runtime::instance().extends.hook_mgr().await.hook(&session, &client);
+    let keep_alive = match session.fitter.keep_alive(&mut packet.keep_alive) {
+        Ok(keep_alive) => keep_alive,
+        Err(e) => {
+            return Ok(refused_ack(
+                handshake,
+                connect_info.as_ref(),
+                ConnectAckReasonV5::ServerUnavailable,
+                format!("{}", e),
+            )
+            .await);
+        }
+    };
+
+    let hook = Runtime::instance().extends.hook_mgr().await.hook(&session);
 
     if offline_info.is_none() {
         //hook, session created
@@ -201,21 +233,15 @@ pub async fn _handshake<Io: 'static>(
 
     let client_topic_alias_max = session.fitter.max_client_topic_aliases();
     let server_topic_alias_max = session.fitter.max_server_topic_aliases();
-    let (state, tx) = SessionState::new(
-        session,
-        client,
-        Sink::V5(sink),
-        hook,
-        server_topic_alias_max,
-        client_topic_alias_max,
-    )
-    .start(keep_alive)
-    .await;
+    let (state, tx) =
+        SessionState::new(session, Sink::V5(sink), hook, server_topic_alias_max, client_topic_alias_max)
+            .start(keep_alive)
+            .await;
 
-    if let Err(e) = entry.set(state.session.clone(), tx, state.client.clone()).await {
+    if let Err(e) = entry.set(state.session.clone(), tx).await {
         return Ok(refused_ack(
             handshake,
-            &state.client.connect_info,
+            connect_info.as_ref(),
             ConnectAckReasonV5::ServerUnavailable,
             format!("{}", e),
         )
@@ -227,7 +253,7 @@ pub async fn _handshake<Io: 'static>(
         .extends
         .hook_mgr()
         .await
-        .client_connack(&state.client.connect_info, ConnectAckReason::V5(ConnectAckReasonV5::Success))
+        .client_connack(connect_info.as_ref(), ConnectAckReason::V5(ConnectAckReasonV5::Success))
         .await;
 
     //hook, client connected
@@ -248,11 +274,11 @@ pub async fn _handshake<Io: 'static>(
     let id = state.id.clone();
     let session_expiry_interval_secs = packet.session_expiry_interval_secs;
     let server_keepalive_sec = packet.keep_alive;
-    let max_qos = state.listen_cfg.max_qos_allowed;
-    let retain_available = Runtime::instance().extends.retain().await.is_supported(&state.listen_cfg);
-    let max_server_packet_size = state.listen_cfg.max_packet_size.as_u32();
+    let max_qos = state.listen_cfg().max_qos_allowed;
+    let retain_available = Runtime::instance().extends.retain().await.is_supported(state.listen_cfg());
+    let max_server_packet_size = state.listen_cfg().max_packet_size.as_u32();
     let shared_subscription_available =
-        Runtime::instance().extends.shared_subscription().await.is_supported(&state.listen_cfg);
+        Runtime::instance().extends.shared_subscription().await.is_supported(state.listen_cfg());
     let assigned_client_id = if is_assigned_client_id { Some(state.id.client_id.clone()) } else { None };
     Ok(handshake.ack(state).keep_alive(keep_alive).with(|ack: &mut v5::codec::ConnectAck| {
         ack.session_present = session_present;
@@ -276,7 +302,7 @@ async fn subscribes(
     mut subs: v5::control::Subscribe,
 ) -> Result<v5::ControlResult> {
     let shared_subscription_supported =
-        Runtime::instance().extends.shared_subscription().await.is_supported(&state.listen_cfg);
+        Runtime::instance().extends.shared_subscription().await.is_supported(state.listen_cfg());
     let sub_id = subs.packet().id;
     for mut sub in subs.iter_mut() {
         let s = Subscribe::from_v5(sub.topic(), sub.options(), shared_subscription_supported, sub_id)?;
@@ -295,7 +321,7 @@ async fn unsubscribes(
     unsubs: v5::control::Unsubscribe,
 ) -> Result<v5::ControlResult> {
     let shared_subscription_supported =
-        Runtime::instance().extends.shared_subscription().await.is_supported(&state.listen_cfg);
+        Runtime::instance().extends.shared_subscription().await.is_supported(state.listen_cfg());
     for topic_filter in unsubs.iter() {
         let unsub = Unsubscribe::from(topic_filter, shared_subscription_supported)?;
         state.unsubscribe(unsub).await?;
@@ -309,33 +335,45 @@ pub async fn control_message<E: std::fmt::Debug>(
 ) -> Result<v5::ControlResult, MqttError> {
     log::debug!("{:?} incoming control message -> {:?}", state.id, ctrl_msg);
 
-    let _ = state.send(Message::Keepalive);
-
     let crs = match ctrl_msg {
-        v5::ControlMessage::Auth(auth) => auth.ack(Auth::default()),
-        v5::ControlMessage::Ping(ping) => ping.ack(),
-        v5::ControlMessage::Subscribe(subs) => match subscribes(&state, subs).await {
-            Err(e) => {
-                state
-                    .client
-                    .add_disconnected_reason(Reason::SubscribeFailed(Some(ByteString::from(e.to_string()))))
-                    .await;
-                log::error!("{:?} Subscribe failed, reason: {}", state.id, e);
-                return Err(e);
+        v5::ControlMessage::Auth(auth) => {
+            let _ = state.send(Message::Keepalive(false));
+            auth.ack(Auth::default())
+        }
+        v5::ControlMessage::Ping(ping) => {
+            let _ = state.send(Message::Keepalive(true));
+            ping.ack()
+        }
+        v5::ControlMessage::Subscribe(subs) => {
+            let _ = state.send(Message::Keepalive(false));
+            match subscribes(&state, subs).await {
+                Err(e) => {
+                    log::warn!("{:?} Subscribe failed, reason: {}", state.id, e);
+                    state
+                        .disconnected_reason_add(Reason::SubscribeFailed(Some(ByteString::from(
+                            e.to_string(),
+                        ))))
+                        .await?;
+                    return Err(e);
+                }
+                Ok(r) => r,
             }
-            Ok(r) => r,
-        },
-        v5::ControlMessage::Unsubscribe(unsubs) => match unsubscribes(&state, unsubs).await {
-            Err(e) => {
-                state
-                    .client
-                    .add_disconnected_reason(Reason::UnsubscribeFailed(Some(ByteString::from(e.to_string()))))
-                    .await;
-                log::error!("{:?} Unsubscribe failed, reason: {}", state.id, e);
-                return Err(e);
+        }
+        v5::ControlMessage::Unsubscribe(unsubs) => {
+            let _ = state.send(Message::Keepalive(false));
+            match unsubscribes(&state, unsubs).await {
+                Err(e) => {
+                    log::warn!("{:?} Unsubscribe failed, reason: {}", state.id, e);
+                    state
+                        .disconnected_reason_add(Reason::UnsubscribeFailed(Some(ByteString::from(
+                            e.to_string(),
+                        ))))
+                        .await?;
+                    return Err(e);
+                }
+                Ok(r) => r,
             }
-            Ok(r) => r,
-        },
+        }
         v5::ControlMessage::Disconnect(disconnect) => {
             //disconnect.packet().user_properties
             state.send(Message::Disconnect(Disconnect::V5(disconnect.packet().clone())))?;
@@ -376,16 +414,16 @@ pub async fn publish(
 ) -> Result<v5::PublishResult, MqttError> {
     log::debug!("{:?} incoming publish message: {:?}", state.id, pub_msg);
 
-    let _ = state.send(Message::Keepalive);
+    let _ = state.send(Message::Keepalive(false));
 
     match pub_msg {
         v5::PublishMessage::Publish(publish) => {
             let publish_fut = async move {
                 if let Err(e) = state.publish_v5(&publish).await {
-                    log::error!(
-                        "{:?} Publish failed, reason: {}",
+                    log::warn!(
+                        "{:?} Publish failed, reason: {:?}",
                         state.id,
-                        state.client.get_disconnected_reason().await
+                        state.disconnected_reason().await
                     );
                     Err(e)
                 } else {
@@ -404,16 +442,16 @@ pub async fn publish(
             return Ok(PublishResult::PublishAck(PublishAck::new(PublishAckReason::Success)));
         }
         v5::PublishMessage::PublishAck(ref ack) => {
-            if let Some(iflt_msg) = state.inflight_win.write().await.remove(&ack.packet_id.get()) {
+            if let Some(iflt_msg) = state.inflight_win().write().await.remove(&ack.packet_id.get()) {
                 //hook, message_ack
                 state.hook.message_acked(iflt_msg.from, &iflt_msg.publish).await;
             }
         }
         v5::PublishMessage::PublishReceived(ref ack) => {
-            state.inflight_win.write().await.update_status(&ack.packet_id.get(), MomentStatus::UnComplete);
+            state.inflight_win().write().await.update_status(&ack.packet_id.get(), MomentStatus::UnComplete);
         }
         v5::PublishMessage::PublishComplete(ref ack2) => {
-            if let Some(iflt_msg) = state.inflight_win.write().await.remove(&ack2.packet_id.get()) {
+            if let Some(iflt_msg) = state.inflight_win().write().await.remove(&ack2.packet_id.get()) {
                 //hook, message_ack
                 state.hook.message_acked(iflt_msg.from, &iflt_msg.publish).await;
             }

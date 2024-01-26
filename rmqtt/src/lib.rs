@@ -1,12 +1,13 @@
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
-#[macro_use]
-pub extern crate async_trait;
+
 extern crate proc_macro;
 #[macro_use]
-pub extern crate serde;
+extern crate serde;
 #[macro_use]
 pub extern crate serde_json;
+#[macro_use]
+pub extern crate async_trait;
 
 pub use ahash;
 pub use anyhow;
@@ -18,6 +19,7 @@ pub use chrono;
 pub use crossbeam;
 pub use dashmap;
 pub use futures;
+pub use get_size;
 pub use itertools;
 pub use log;
 pub use ntex;
@@ -27,6 +29,7 @@ pub use pin_project_lite;
 pub use rand;
 pub use reqwest;
 pub use rust_box;
+pub use scc;
 pub use structopt;
 pub use tokio;
 pub use tokio_cron_scheduler;
@@ -36,7 +39,7 @@ pub use url;
 pub use crate::broker::{
     error::MqttError,
     metrics,
-    session::{ClientInfo, Session, SessionState},
+    session::{Session, SessionState},
     stats,
     types::*,
 };

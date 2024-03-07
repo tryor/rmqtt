@@ -15,15 +15,15 @@
 - 支持MQTT v3.1,v3.1.1 及 v5.0协议;
     - QoS0, QoS1, QoS2 消息支持;
     - 离线消息支持;
-    - Retained 消息支持;
+    - [Retained 消息支持](./docs/zh_CN/retainer.md);
     - Last Will 消息支持;
 - [内置 AUTH/ACL](./docs/zh_CN/acl.md);
 - [HTTP AUTH/ACL](./docs/zh_CN/auth-http.md);
 - [WebHook](./docs/zh_CN/web-hook.md);
 - [HTTP APIs](./docs/zh_CN/http-api.md);
-- [$SYS 系统主题](./docs/zh_CN/sys-topic.md)
-- [存储会话信息](./docs/zh_CN/store-session.md)
-- [存储未过期消息](./docs/zh_CN/store-message.md)
+- [$SYS 系统主题](./docs/zh_CN/sys-topic.md);
+- [存储会话信息](./docs/zh_CN/store-session.md);
+- [存储未过期消息](./docs/zh_CN/store-message.md);
 - 分布式集群;
 - 钩子(Hooks);
 - TLS支持;
@@ -90,9 +90,11 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 
 ## 体验
 
-- MQTT Broker：47.103.110.134:1883
-- Account: 无
-- HTTP APIs: http://47.103.110.134:6080/api/v1/
+[//]: # (- MQTT Broker：47.103.110.134:1883)
+
+[//]: # (- Account: 无)
+
+[//]: # (- HTTP APIs: http://47.103.110.134:6080/api/v1/)
 
 ## 测试
 

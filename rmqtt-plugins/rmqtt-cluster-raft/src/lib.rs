@@ -2,6 +2,9 @@
 #[macro_use]
 extern crate serde;
 
+#[macro_use]
+extern crate rmqtt_macros;
+
 use rmqtt_raft::{Mailbox, Raft};
 use std::convert::From as _f;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -10,7 +13,6 @@ use std::time::Duration;
 
 use config::PluginConfig;
 use handler::HookHandler;
-use retainer::ClusterRetainer;
 
 use rmqtt::anyhow::anyhow;
 use rmqtt::{
@@ -27,7 +29,8 @@ use rmqtt::{
         types::{From, Publish, Reason, To},
     },
     grpc::{client::NodeGrpcClient, GrpcClients, Message, MessageReply, MessageType},
-    plugin::{DynPlugin, DynPluginResult, Plugin},
+    plugin::{PackageInfo, Plugin},
+    register,
     tokio::time::sleep,
     Result, Runtime,
 };
@@ -41,40 +44,20 @@ use shared::ClusterShared;
 mod config;
 mod handler;
 mod message;
-mod retainer;
 mod router;
 mod shared;
 
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
-#[inline]
-pub async fn register(
-    runtime: &'static Runtime,
-    name: &'static str,
-    descr: &'static str,
-    default_startup: bool,
-    immutable: bool,
-) -> Result<()> {
-    runtime
-        .plugins
-        .register(name, default_startup, immutable, move || -> DynPluginResult {
-            Box::pin(async move {
-                ClusterPlugin::new(runtime, name, descr).await.map(|p| -> DynPlugin { Box::new(p) })
-            })
-        })
-        .await?;
-    Ok(())
-}
+register!(ClusterPlugin::new);
 
+#[derive(Plugin)]
 struct ClusterPlugin {
     runtime: &'static Runtime,
-    name: String,
-    descr: String,
     register: Box<dyn Register>,
     cfg: Arc<PluginConfig>,
     grpc_clients: GrpcClients,
     shared: &'static ClusterShared,
-    retainer: &'static ClusterRetainer,
 
     router: &'static ClusterRouter,
     raft_mailbox: Option<Mailbox>,
@@ -82,7 +65,7 @@ struct ClusterPlugin {
 
 impl ClusterPlugin {
     #[inline]
-    async fn new<S: Into<String>>(runtime: &'static Runtime, name: S, descr: S) -> Result<Self> {
+    async fn new<S: Into<String>>(runtime: &'static Runtime, name: S) -> Result<Self> {
         let name = name.into();
         let env_list_keys = ["node_grpc_addrs", "raft_peer_addrs"];
         let mut cfg = runtime.settings.plugins.load_config_with::<PluginConfig>(&name, &env_list_keys)?;
@@ -109,21 +92,9 @@ impl ClusterPlugin {
         let grpc_clients = Arc::new(grpc_clients);
         let router = ClusterRouter::get_or_init(cfg.try_lock_timeout);
         let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), node_names, cfg.message_type);
-        let retainer = ClusterRetainer::get_or_init(grpc_clients.clone(), cfg.message_type);
         let raft_mailbox = None;
         let cfg = Arc::new(cfg);
-        Ok(Self {
-            runtime,
-            name,
-            descr: descr.into(),
-            register,
-            cfg,
-            grpc_clients,
-            shared,
-            retainer,
-            router,
-            raft_mailbox,
-        })
+        Ok(Self { runtime, register, cfg, grpc_clients, shared, router, raft_mailbox })
     }
 
     //raft init ...
@@ -235,9 +206,7 @@ impl ClusterPlugin {
 
     #[inline]
     async fn hook_register(&self, typ: Type) {
-        self.register
-            .add(typ, Box::new(HookHandler::new(self.shared, self.retainer, self.raft_mailbox())))
-            .await;
+        self.register.add(typ, Box::new(HookHandler::new(self.shared, self.raft_mailbox()))).await;
     }
 
     fn raft_mailbox(&self) -> Mailbox {
@@ -253,7 +222,7 @@ impl ClusterPlugin {
 impl Plugin for ClusterPlugin {
     #[inline]
     async fn init(&mut self) -> Result<()> {
-        log::info!("{} init", self.name);
+        log::info!("{} init", self.name());
 
         let raft_mailbox = Self::start_raft(self.cfg.clone(), self.router).await?;
 
@@ -263,10 +232,10 @@ impl Plugin for ClusterPlugin {
                     if status.is_started() {
                         break;
                     }
-                    log::info!("{} Initializing cluster, raft status({}): {:?}", self.name, i, status);
+                    log::info!("{} Initializing cluster, raft status({}): {:?}", self.name(), i, status);
                 }
                 Err(e) => {
-                    log::info!("{} init error, {:?}", self.name, e);
+                    log::info!("{} init error, {:?}", self.name(), e);
                 }
             }
             sleep(Duration::from_millis(500)).await;
@@ -283,18 +252,13 @@ impl Plugin for ClusterPlugin {
     }
 
     #[inline]
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[inline]
     async fn get_config(&self) -> Result<serde_json::Value> {
         self.cfg.to_json()
     }
 
     #[inline]
     async fn start(&mut self) -> Result<()> {
-        log::info!("{} start", self.name);
+        log::info!("{} start", self.name());
         let raft_mailbox = self.raft_mailbox();
         *self.runtime.extends.router_mut().await = Box::new(self.router);
         *self.runtime.extends.shared_mut().await = Box::new(self.shared);
@@ -332,18 +296,8 @@ impl Plugin for ClusterPlugin {
 
     #[inline]
     async fn stop(&mut self) -> Result<bool> {
-        log::warn!("{} stop, once the cluster is started, it cannot be stopped", self.name);
+        log::warn!("{} stop, once the cluster is started, it cannot be stopped", self.name());
         Ok(false)
-    }
-
-    #[inline]
-    fn version(&self) -> &str {
-        "0.1.1"
-    }
-
-    #[inline]
-    fn descr(&self) -> &str {
-        &self.descr
     }
 
     #[inline]

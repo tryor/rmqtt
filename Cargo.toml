@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rmqtt",
+    "rmqtt-plugins/rmqtt-plugin-template",
     "rmqtt-plugins/rmqtt-acl",
     "rmqtt-plugins/rmqtt-web-hook",
     "rmqtt-plugins/rmqtt-auth-http",
@@ -20,6 +21,7 @@ members = [
 [patch.crates-io]
 rmqtt = { path = "rmqtt" }
 rmqtt-macros = { path = "rmqtt-macros" }
+rmqtt-plugin-template = { path = "rmqtt-plugins/rmqtt-plugin-template" }
 rmqtt-acl = { path = "rmqtt-plugins/rmqtt-acl" }
 rmqtt-web-hook = { path = "rmqtt-plugins/rmqtt-web-hook" }
 rmqtt-auth-http = { path = "rmqtt-plugins/rmqtt-auth-http" }
@@ -33,7 +35,7 @@ rmqtt-session-storage = { path = "rmqtt-plugins/rmqtt-session-storage" }
 rmqtt-message-storage = { path = "rmqtt-plugins/rmqtt-message-storage" }
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["rmqtt <rmqttd@126.com>"]
 description = "MQTT Server for v3.1, v3.1.1 and v5.0 protocols"
@@ -46,5 +48,6 @@ rust-version = "1.71.1"
 
 
 [workspace.dependencies]
-rmqtt = "0.3"
+rmqtt = "0.4"
+rmqtt-macros = "0.1"
 serde = "1.0"

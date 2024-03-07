@@ -1146,7 +1146,7 @@ impl DefaultSharedSubscription {
 impl SharedSubscription for &'static DefaultSharedSubscription {}
 
 pub struct DefaultRetainStorage {
-    messages: RwLock<RetainTree<TimedValue<Retain>>>,
+    pub messages: RwLock<RetainTree<TimedValue<Retain>>>,
 }
 
 impl DefaultRetainStorage {
@@ -1157,7 +1157,7 @@ impl DefaultRetainStorage {
     }
 
     #[inline]
-    pub async fn remove_expired_messages(&self) {
+    pub async fn remove_expired_messages(&self) -> usize {
         let mut messages = self.messages.write().await;
         messages.retain(usize::MAX, |tv| {
             if tv.is_expired() {
@@ -1166,7 +1166,7 @@ impl DefaultRetainStorage {
             } else {
                 true
             }
-        });
+        })
     }
 
     #[inline]
@@ -1189,17 +1189,9 @@ impl DefaultRetainStorage {
         }
         Ok(())
     }
-}
-
-#[async_trait]
-impl RetainStorage for &'static DefaultRetainStorage {
-    #[inline]
-    async fn set(&self, topic: &TopicName, retain: Retain) -> Result<()> {
-        self.set_with_timeout(topic, retain, None).await
-    }
 
     #[inline]
-    async fn get(&self, topic_filter: &TopicFilter) -> Result<Vec<(TopicName, Retain)>> {
+    pub async fn get_message(&self, topic_filter: &TopicFilter) -> Result<Vec<(TopicName, Retain)>> {
         let topic = Topic::from_str(topic_filter)?;
         let retains = self
             .messages
@@ -1217,14 +1209,29 @@ impl RetainStorage for &'static DefaultRetainStorage {
             .collect::<Vec<(TopicName, Retain)>>();
         Ok(retains)
     }
+}
+
+#[async_trait]
+impl RetainStorage for &'static DefaultRetainStorage {
+    #[inline]
+    async fn set(&self, _topic: &TopicName, _retain: Retain) -> Result<()> {
+        log::warn!("Please use the \"rmqtt-retainer\" plugin as the main program no longer supports retain messages.");
+        Ok(())
+    }
 
     #[inline]
-    fn count(&self) -> isize {
+    async fn get(&self, _topic_filter: &TopicFilter) -> Result<Vec<(TopicName, Retain)>> {
+        log::warn!("Please use the \"rmqtt-retainer\" plugin as the main program no longer supports retain messages.");
+        Ok(Vec::new())
+    }
+
+    #[inline]
+    async fn count(&self) -> isize {
         Runtime::instance().stats.retaineds.count()
     }
 
     #[inline]
-    fn max(&self) -> isize {
+    async fn max(&self) -> isize {
         Runtime::instance().stats.retaineds.max()
     }
 }

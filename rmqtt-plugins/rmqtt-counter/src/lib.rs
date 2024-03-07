@@ -1,49 +1,29 @@
 #![deny(unsafe_code)]
 
+#[macro_use]
+extern crate rmqtt_macros;
+
 use rmqtt::broker::hook::Priority;
 use rmqtt::{async_trait::async_trait, log, FromType};
 use rmqtt::{
     broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
     broker::metrics::Metrics,
-    plugin::{DynPlugin, DynPluginResult, Plugin},
-    Result, Runtime,
+    plugin::{PackageInfo, Plugin},
+    register, Result, Runtime,
 };
 
-#[inline]
-pub async fn register(
-    runtime: &'static Runtime,
-    name: &'static str,
-    descr: &'static str,
-    default_startup: bool,
-    immutable: bool,
-) -> Result<()> {
-    runtime
-        .plugins
-        .register(name, default_startup, immutable, move || -> DynPluginResult {
-            Box::pin(async move {
-                CounterPlugin::new(runtime, name, descr).await.map(|p| -> DynPlugin { Box::new(p) })
-            })
-        })
-        .await?;
-    Ok(())
-}
+register!(CounterPlugin::new);
 
+#[derive(Plugin)]
 struct CounterPlugin {
-    name: String,
-    descr: String,
     register: Box<dyn Register>,
 }
 
 impl CounterPlugin {
     #[inline]
-    async fn new<N: Into<String>, D: Into<String>>(
-        runtime: &'static Runtime,
-        name: N,
-        descr: D,
-    ) -> Result<Self> {
-        let name = name.into();
+    async fn new<S: Into<String>>(runtime: &'static Runtime, _name: S) -> Result<Self> {
         let register = runtime.extends.hook_mgr().await.register();
-        Ok(Self { name, descr: descr.into(), register })
+        Ok(Self { register })
     }
 }
 
@@ -51,7 +31,7 @@ impl CounterPlugin {
 impl Plugin for CounterPlugin {
     #[inline]
     async fn init(&mut self) -> Result<()> {
-        log::info!("{} init", self.name);
+        log::info!("{} init", self.name());
         self.register.add_priority(Type::ClientConnect, Priority::MAX, Box::new(CounterHandler::new())).await;
         self.register
             .add_priority(Type::ClientAuthenticate, Priority::MAX, Box::new(CounterHandler::new()))
@@ -108,36 +88,21 @@ impl Plugin for CounterPlugin {
     }
 
     #[inline]
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[inline]
     async fn load_config(&mut self) -> Result<()> {
         Ok(())
     }
 
     #[inline]
     async fn start(&mut self) -> Result<()> {
-        log::info!("{} start", self.name);
+        log::info!("{} start", self.name());
         self.register.start().await;
         Ok(())
     }
 
     #[inline]
     async fn stop(&mut self) -> Result<bool> {
-        log::warn!("{} stop, the Counter plug-in, it cannot be stopped", self.name);
+        log::warn!("{} stop, the Counter plug-in, it cannot be stopped", self.name());
         Ok(false)
-    }
-
-    #[inline]
-    fn version(&self) -> &str {
-        "0.1.0"
-    }
-
-    #[inline]
-    fn descr(&self) -> &str {
-        &self.descr
     }
 }
 

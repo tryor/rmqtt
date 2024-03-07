@@ -2,6 +2,9 @@
 #[macro_use]
 extern crate serde;
 
+#[macro_use]
+extern crate rmqtt_macros;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,8 +23,8 @@ use rmqtt::{
     broker::types::{
         AuthResult, Password, PublishAclResult, SubscribeAckReason, SubscribeAclResult, Superuser,
     },
-    plugin::{DynPlugin, DynPluginResult, Plugin},
-    MqttError, Result, Runtime, TopicName,
+    plugin::{PackageInfo, Plugin},
+    register, MqttError, Result, Runtime, TopicName,
 };
 
 mod config;
@@ -69,41 +72,23 @@ impl ACLType {
     }
 }
 
-#[inline]
-pub async fn register(
-    runtime: &'static Runtime,
-    name: &'static str,
-    descr: &'static str,
-    default_startup: bool,
-    immutable: bool,
-) -> Result<()> {
-    runtime
-        .plugins
-        .register(name, default_startup, immutable, move || -> DynPluginResult {
-            Box::pin(async move {
-                AuthHttpPlugin::new(runtime, name, descr).await.map(|p| -> DynPlugin { Box::new(p) })
-            })
-        })
-        .await?;
-    Ok(())
-}
+register!(AuthHttpPlugin::new);
 
+#[derive(Plugin)]
 struct AuthHttpPlugin {
     runtime: &'static Runtime,
-    name: String,
-    descr: String,
     register: Box<dyn Register>,
     cfg: Arc<RwLock<PluginConfig>>,
 }
 
 impl AuthHttpPlugin {
     #[inline]
-    async fn new<S: Into<String>>(runtime: &'static Runtime, name: S, descr: S) -> Result<Self> {
+    async fn new<S: Into<String>>(runtime: &'static Runtime, name: S) -> Result<Self> {
         let name = name.into();
         let cfg = Arc::new(RwLock::new(runtime.settings.plugins.load_config::<PluginConfig>(&name)?));
         log::debug!("{} AuthHttpPlugin cfg: {:?}", name, cfg.read().await);
         let register = runtime.extends.hook_mgr().await.register();
-        Ok(Self { runtime, name, descr: descr.into(), register, cfg })
+        Ok(Self { runtime, register, cfg })
     }
 }
 
@@ -111,7 +96,7 @@ impl AuthHttpPlugin {
 impl Plugin for AuthHttpPlugin {
     #[inline]
     async fn init(&mut self) -> Result<()> {
-        log::info!("{} init", self.name);
+        log::info!("{} init", self.name());
         let cfg = &self.cfg;
 
         let priority = cfg.read().await.priority;
@@ -127,18 +112,13 @@ impl Plugin for AuthHttpPlugin {
     }
 
     #[inline]
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[inline]
     async fn get_config(&self) -> Result<serde_json::Value> {
         self.cfg.read().await.to_json()
     }
 
     #[inline]
     async fn load_config(&mut self) -> Result<()> {
-        let new_cfg = self.runtime.settings.plugins.load_config::<PluginConfig>(&self.name)?;
+        let new_cfg = self.runtime.settings.plugins.load_config::<PluginConfig>(self.name())?;
         *self.cfg.write().await = new_cfg;
         log::debug!("load_config ok,  {:?}", self.cfg);
         Ok(())
@@ -146,26 +126,16 @@ impl Plugin for AuthHttpPlugin {
 
     #[inline]
     async fn start(&mut self) -> Result<()> {
-        log::info!("{} start", self.name);
+        log::info!("{} start", self.name());
         self.register.start().await;
         Ok(())
     }
 
     #[inline]
     async fn stop(&mut self) -> Result<bool> {
-        log::info!("{} stop", self.name);
+        log::info!("{} stop", self.name());
         self.register.stop().await;
         Ok(true)
-    }
-
-    #[inline]
-    fn version(&self) -> &str {
-        "0.1.1"
-    }
-
-    #[inline]
-    fn descr(&self) -> &str {
-        &self.descr
     }
 
     #[inline]

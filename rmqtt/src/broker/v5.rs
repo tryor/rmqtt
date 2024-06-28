@@ -3,8 +3,7 @@ use std::convert::From as _f;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ntex_mqtt::v5;
-use ntex_mqtt::v5::codec::{Auth, DisconnectReasonCode, PublishAckReason};
+use ntex_mqtt::v5::codec::{Auth, PublishAckReason};
 use ntex_mqtt::v5::PublishAck;
 use ntex_mqtt::v5::PublishResult;
 use rust_box::task_exec_queue::LocalSpawnExt;
@@ -272,7 +271,9 @@ pub async fn _handshake<Io: 'static>(
 
     log::debug!("{:?} keep_alive: {}, server_keepalive_sec: {}", state.id, keep_alive, packet.keep_alive);
     let id = state.id.clone();
-    let session_expiry_interval_secs = packet.session_expiry_interval_secs;
+    let session_expiry_interval = state.fitter.session_expiry_interval(None).as_secs() as u32;
+    let session_expiry_interval_secs =
+        if session_expiry_interval > 0 { Some(session_expiry_interval) } else { None };
     let server_keepalive_sec = packet.keep_alive;
     let max_qos = if state.listen_cfg().max_qos_allowed == QoS::ExactlyOnce {
         None

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::convert::From as _f;
-use std::iter::Iterator;
 use std::num::NonZeroU16;
 use std::num::NonZeroU32;
 use std::str::FromStr;
@@ -25,12 +24,9 @@ use crate::broker::topic::{Topic, VecToTopic};
 use crate::broker::types::*;
 use crate::settings::listener::Listener;
 use crate::stats::Counter;
-use crate::{grpc, ClientId, Id, MqttError, NodeId, Result, Runtime, TopicFilter};
+use crate::{grpc, MqttError, Result, Runtime};
 
-use super::{
-    retain::RetainTree, topic::TopicTree, Entry, IsOnline, RetainStorage, Router, Shared, SharedSubscription,
-    SubRelations, SubRelationsMap,
-};
+use super::{retain::RetainTree, topic::TopicTree, Entry, RetainStorage, Router, Shared, SharedSubscription};
 
 type DashSet<V> = dashmap::DashSet<V, ahash::RandomState>;
 type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
@@ -1147,13 +1143,15 @@ impl SharedSubscription for &'static DefaultSharedSubscription {}
 
 pub struct DefaultRetainStorage {
     pub messages: RwLock<RetainTree<TimedValue<Retain>>>,
+    retaineds: Counter,
 }
 
 impl DefaultRetainStorage {
     #[inline]
     pub fn instance() -> &'static DefaultRetainStorage {
         static INSTANCE: OnceCell<DefaultRetainStorage> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self { messages: RwLock::new(RetainTree::default()) })
+        INSTANCE
+            .get_or_init(|| Self { messages: RwLock::new(RetainTree::default()), retaineds: Counter::new() })
     }
 
     #[inline]
@@ -1161,7 +1159,7 @@ impl DefaultRetainStorage {
         let mut messages = self.messages.write().await;
         messages.retain(usize::MAX, |tv| {
             if tv.is_expired() {
-                Runtime::instance().stats.retaineds.dec();
+                self.retaineds.dec();
                 false
             } else {
                 true
@@ -1182,10 +1180,10 @@ impl DefaultRetainStorage {
         if !retain.publish.is_empty() {
             messages.insert(&topic, TimedValue::new(retain, timeout));
             if old.is_none() {
-                Runtime::instance().stats.retaineds.inc();
+                self.retaineds.inc();
             }
         } else if old.is_some() {
-            Runtime::instance().stats.retaineds.dec();
+            self.retaineds.dec();
         }
         Ok(())
     }
@@ -1214,7 +1212,12 @@ impl DefaultRetainStorage {
 #[async_trait]
 impl RetainStorage for &'static DefaultRetainStorage {
     #[inline]
-    async fn set(&self, _topic: &TopicName, _retain: Retain) -> Result<()> {
+    async fn set(
+        &self,
+        _topic: &TopicName,
+        _retain: Retain,
+        _expiry_interval: Option<Duration>,
+    ) -> Result<()> {
         log::warn!("Please use the \"rmqtt-retainer\" plugin as the main program no longer supports retain messages.");
         Ok(())
     }
@@ -1227,12 +1230,12 @@ impl RetainStorage for &'static DefaultRetainStorage {
 
     #[inline]
     async fn count(&self) -> isize {
-        Runtime::instance().stats.retaineds.count()
+        self.retaineds.count()
     }
 
     #[inline]
     async fn max(&self) -> isize {
-        Runtime::instance().stats.retaineds.max()
+        self.retaineds.max()
     }
 }
 
@@ -1713,8 +1716,8 @@ impl Hook for DefaultHook {
     async fn client_subscribe(&self, sub: &Subscribe) -> Option<TopicFilter> {
         let reply = self.manager.exec(Type::ClientSubscribe, Parameter::ClientSubscribe(&self.s, sub)).await;
         log::debug!("{:?} result: {:?}", self.s.id, reply);
-        if let Some(HookResult::TopicFilter(tf)) = reply {
-            tf
+        if let Some(HookResult::TopicFilter(Some(tf))) = reply {
+            Some(tf)
         } else {
             None
         }
@@ -1733,9 +1736,8 @@ impl Hook for DefaultHook {
         let reply =
             self.manager.exec(Type::ClientUnsubscribe, Parameter::ClientUnsubscribe(&self.s, unsub)).await;
         log::debug!("{:?} result: {:?}", self.s.id, reply);
-
-        if let Some(HookResult::TopicFilter(topic_filter)) = reply {
-            topic_filter
+        if let Some(HookResult::TopicFilter(Some(tf))) = reply {
+            Some(tf)
         } else {
             None
         }

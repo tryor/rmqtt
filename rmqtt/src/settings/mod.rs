@@ -89,7 +89,7 @@ impl Settings {
             }
         }
         if let Some(plugins_default_startups) = opts.plugins_default_startups.as_ref() {
-            inner.plugins.default_startups = plugins_default_startups.clone()
+            inner.plugins.default_startups.clone_from(plugins_default_startups)
         }
 
         inner.opts = opts;
@@ -411,7 +411,7 @@ impl Plugins {
         required: bool,
         env_list_keys: &[&str],
     ) -> Result<(T, bool)> {
-        let dir = self.dir.trim_end_matches(|c| c == '/' || c == '\\');
+        let dir = self.dir.trim_end_matches(['/', '\\']);
         let mut builder =
             Config::builder().add_source(File::with_name(&format!("{}/{}", dir, name)).required(required));
 
@@ -437,7 +437,7 @@ const BYTESIZE_K: usize = 1024;
 const BYTESIZE_M: usize = 1048576;
 const BYTESIZE_G: usize = 1073741824;
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Default)]
 pub struct Bytesize(usize);
 
 impl Bytesize {
@@ -543,7 +543,7 @@ impl<'de> Deserialize<'de> for Bytesize {
 #[inline]
 pub fn to_bytesize(text: &str) -> usize {
     let text = text.to_uppercase().replace("GB", "G").replace("MB", "M").replace("KB", "K");
-    text.split_inclusive(|x| x == 'G' || x == 'M' || x == 'K' || x == 'B')
+    text.split_inclusive(['G', 'M', 'K', 'B'])
         .map(|x| {
             let mut chars = x.chars();
             let u = match chars.nth_back(0) {
@@ -591,7 +591,7 @@ where
 pub fn to_duration(text: &str) -> Duration {
     let text = text.to_lowercase().replace("ms", "Y");
     let ms: u64 = text
-        .split_inclusive(|x| x == 's' || x == 'm' || x == 'h' || x == 'd' || x == 'w' || x == 'f' || x == 'Y')
+        .split_inclusive(['s', 'm', 'h', 'd', 'w', 'f', 'Y'])
         .map(|x| {
             let mut chars = x.chars();
             let u = match chars.nth_back(0) {

@@ -78,6 +78,8 @@ plugins.default_startups = [
     #"rmqtt-sys-topic",
     #"rmqtt-message-storage",
     #"rmqtt-session-storage",
+    #"rmqtt-bridge-ingress-mqtt",
+    #"rmqtt-bridge-egress-mqtt",
     "rmqtt-web-hook",
     "rmqtt-http-api"
 ]

@@ -32,10 +32,10 @@ pub enum Policy {
 
 pub trait PolicyFn<P>: 'static + Fn(&P) -> Policy {}
 
-impl<T, P> PolicyFn<P> for T where T: 'static + Clone + ?Sized + Fn(&P) -> Policy {}
+impl<T, P> PolicyFn<P> for T where T: 'static + Clone + Fn(&P) -> Policy {}
 
 pub trait OnEventFn: 'static + Sync + Send + Fn() {}
-impl<T> OnEventFn for T where T: 'static + Sync + Send + Clone + ?Sized + Fn() {}
+impl<T> OnEventFn for T where T: 'static + Sync + Send + Clone + Fn() {}
 
 #[derive(Clone)]
 pub struct Sender<T> {
@@ -257,7 +257,7 @@ mod test {
         });
 
         while let Some(v) = rx.next().await {
-            println!("{} queue recv: {:?}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f %z").to_string(), v);
+            println!("{} queue recv: {:?}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f %z"), v);
         }
     }
 }

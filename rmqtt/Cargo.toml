@@ -21,8 +21,8 @@ debug = []
 
 [dependencies]
 rmqtt-macros = "0.1"
-ntex = { git = "https://github.com/rmqtt/ntex.git", branch = "0.3.21", features = ["rustls"] }
-ntex-mqtt = { git = "https://github.com/rmqtt/ntex-mqtt", branch = "0.6.22" }
+ntex = { git = "https://github.com/rmqtt/ntex.git", branch = "0.3.22", features = ["rustls"] }
+ntex-mqtt = { git = "https://github.com/rmqtt/ntex-mqtt", branch = "0.6.23" }
 #ntex = { path = "../../ntex/ntex", features = ["rustls"]}
 #ntex-mqtt = { path = "../../ntex-mqtt" }
 futures = "0.3"
@@ -61,7 +61,7 @@ itertools = "0.12"
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
 rust-box = { version = "0.11", features = ["task-exec-queue", "task-exec-queue-rate", "std-ext", "dequemap", "stream-ext-leaky-bucket"] }
 structopt = "0.3"
-tokio-tungstenite = "0.20"
+tokio-tungstenite = "0.21"
 pin-project-lite = "0.2.13"
 tokio-cron-scheduler = "0.9.4"
 bitflags = "2.4"

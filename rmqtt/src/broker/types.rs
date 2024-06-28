@@ -4,7 +4,6 @@ use std::convert::From as _f;
 use std::fmt;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::iter::Iterator;
 use std::mem::{size_of, size_of_val};
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
@@ -18,7 +17,7 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use tokio::sync::{oneshot, RwLock};
 
 use base64::{engine::general_purpose, Engine as _};
-use bitflags::{self, *};
+use bitflags::*;
 use bytestring::ByteString;
 use get_size::GetSize;
 use itertools::Itertools;
@@ -1378,6 +1377,7 @@ pub enum FromType {
     Admin,
     System,
     LastWill,
+    Bridge,
 }
 
 impl std::fmt::Display for FromType {
@@ -1388,6 +1388,7 @@ impl std::fmt::Display for FromType {
             FromType::Admin => "admin",
             FromType::System => "system",
             FromType::LastWill => "lastwill",
+            FromType::Bridge => "bridge",
         };
         write!(f, "{}", typ)
     }
@@ -1408,6 +1409,11 @@ impl From {
     #[inline]
     pub fn from_admin(id: Id) -> From {
         From { typ: FromType::Admin, id }
+    }
+
+    #[inline]
+    pub fn from_bridge(id: Id) -> From {
+        From { typ: FromType::Bridge, id }
     }
 
     #[inline]
@@ -1456,7 +1462,7 @@ impl Deref for From {
 impl std::fmt::Debug for From {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{:?}", self.id.to_string(), self.typ)
+        write!(f, "{}-{:?}", self.id, self.typ)
     }
 }
 
@@ -1555,10 +1561,10 @@ impl Id {
     }
 }
 
-impl ToString for Id {
-    #[inline]
-    fn to_string(&self) -> String {
-        format!(
+impl Display for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
             "{}@{}/{}/{}/{}/{}",
             self.node_id,
             self.local_addr.map(|addr| addr.to_string()).unwrap_or_default(),
@@ -1573,7 +1579,7 @@ impl ToString for Id {
 impl std::fmt::Debug for Id {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}", self)
     }
 }
 
@@ -2357,7 +2363,7 @@ impl ClientTopicAliases {
                             "implementation specific error, the ‘topic‘ associated with the ‘alias‘ was not found",
                         ),
                     )
-                }).map(|topic|topic.clone())
+                }).cloned()
             }
             (Some(alias), _) => {
                 let mut aliases = self.aliases.write().await;
@@ -2475,16 +2481,25 @@ pub fn format_timestamp_millis(t: TimestampMillis) -> String {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StatsMergeMode {
+    None,    // Represents no merging;
+    Sum,     // Represents summing the data;
+    Average, // Represents averaging the data;
+    Max,     // Represents taking the maximum value of the data;
+    Min,     // Represents taking the minimum value of the data;
+}
+
 #[test]
 fn test_reason() {
-    assert_eq!(Reason::ConnectKicked(false).is_kicked(false), true);
-    assert_eq!(Reason::ConnectKicked(false).is_kicked(true), false);
-    assert_eq!(Reason::ConnectKicked(true).is_kicked(true), true);
-    assert_eq!(Reason::ConnectKicked(true).is_kicked(false), false);
-    assert_eq!(Reason::ConnectKicked(true).is_kicked_by_admin(), true);
-    assert_eq!(Reason::ConnectKicked(false).is_kicked_by_admin(), false);
-    assert_eq!(Reason::ConnectDisconnect(None).is_kicked(false), false);
-    assert_eq!(Reason::ConnectDisconnect(None).is_kicked_by_admin(), false);
+    assert!(Reason::ConnectKicked(false).is_kicked(false));
+    assert!(!Reason::ConnectKicked(false).is_kicked(true));
+    assert!(Reason::ConnectKicked(true).is_kicked(true));
+    assert!(!Reason::ConnectKicked(true).is_kicked(false));
+    assert!(Reason::ConnectKicked(true).is_kicked_by_admin());
+    assert!(!Reason::ConnectKicked(false).is_kicked_by_admin());
+    assert!(!Reason::ConnectDisconnect(None).is_kicked(false));
+    assert!(!Reason::ConnectDisconnect(None).is_kicked_by_admin());
 
     let reasons = Reason::Reasons(vec![
         Reason::PublishRefused,

@@ -1,5 +1,4 @@
 use std::num::NonZeroU32;
-use std::str::FromStr;
 use std::time::Duration;
 
 use serde::de::{self, Deserialize, Deserializer};
@@ -12,8 +11,8 @@ use ntex_mqtt::v5::codec::UserProperties;
 use ntex_mqtt::QoS;
 
 use rmqtt::{
-    anyhow::{self, anyhow},
-    base64::{engine::general_purpose, Engine as _},
+    anyhow,
+    base64::prelude::{Engine, BASE64_STANDARD},
     ntex_mqtt::types::{Protocol, MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5},
     serde_json::{self, Map, Value},
 };
@@ -23,22 +22,6 @@ use rmqtt::{
     settings::{deserialize_duration, to_duration, Bytesize},
     MqttError, Result, TopicName,
 };
-
-enum Encoding {
-    Plain,
-    Base64,
-}
-
-impl FromStr for Encoding {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "plain" => Ok(Encoding::Plain),
-            "base64" => Ok(Encoding::Base64),
-            _ => Err(anyhow!("invalid value")),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
@@ -69,6 +52,14 @@ pub struct Bridge {
     pub keepalive: Duration,
     #[serde(default = "Bridge::reconnect_interval_default", deserialize_with = "deserialize_duration")]
     pub reconnect_interval: Duration,
+
+    #[serde(default = "Bridge::retain_available_default")]
+    pub retain_available: bool,
+    #[serde(default = "Bridge::storage_available_default")]
+    pub storage_available: bool,
+    #[serde(default = "Bridge::expiry_interval_default", deserialize_with = "deserialize_duration")]
+    pub expiry_interval: Duration,
+
     #[serde(default = "Bridge::mqtt_ver_default", deserialize_with = "Bridge::deserialize_mqtt_ver")]
     pub mqtt_ver: Protocol,
     #[serde(default)]
@@ -99,6 +90,18 @@ impl Bridge {
 
     fn mqtt_ver_default() -> Protocol {
         Protocol::MQTT(MQTT_LEVEL_311)
+    }
+
+    fn retain_available_default() -> bool {
+        false
+    }
+
+    fn storage_available_default() -> bool {
+        false
+    }
+
+    fn expiry_interval_default() -> Duration {
+        Duration::from_secs(300)
     }
 
     #[inline]
@@ -285,32 +288,6 @@ pub struct Entry {
 
     #[serde(default)]
     pub local: Local,
-
-    #[serde(default = "Entry::retain_available_default")]
-    pub retain_available: bool,
-
-    #[serde(default = "Entry::storage_available_default")]
-    pub storage_available: bool,
-
-    #[serde(default = "Entry::expiry_interval_default", deserialize_with = "deserialize_duration")]
-    pub expiry_interval: Duration,
-}
-
-impl Entry {
-    #[inline]
-    fn retain_available_default() -> bool {
-        false
-    }
-
-    #[inline]
-    fn storage_available_default() -> bool {
-        false
-    }
-
-    #[inline]
-    fn expiry_interval_default() -> Duration {
-        Duration::from_secs(300)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -432,7 +409,7 @@ fn last_will_basic(obj: &Map<String, Value>) -> Result<(QoS, bool, ByteString, B
     let message = if encoding.eq_ignore_ascii_case("plain") {
         Bytes::from(String::from(message))
     } else if encoding.eq_ignore_ascii_case("base64") {
-        Bytes::from(general_purpose::STANDARD.decode(message).map_err(anyhow::Error::new)?)
+        Bytes::from(BASE64_STANDARD.decode(message).map_err(anyhow::Error::new)?)
     } else {
         Bytes::from(String::from(message))
     };

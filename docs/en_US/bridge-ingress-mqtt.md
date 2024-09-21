@@ -99,8 +99,6 @@ keepalive = "60s"
 reconnect_interval = "5s"
 # Support retain messages, values: true/false, default: false
 retain_available = false
-# Support message storage, values: true/false, default: false
-storage_available = false
 # Message expiry interval, 0 means no expiry
 expiry_interval = "5m"
 # MQTT protocol version, values: v4, v5, corresponding to MQTT 3.1.1, 5.0
@@ -154,9 +152,8 @@ local.retain = false
 
 ```
 
-By default, this plugin is not activated. To enable the session storage plugin, you must add the "rmqtt-bridge-ingress-mqtt"
-entry to the "plugins.default_startups" configuration in the main configuration file "rmqtt.toml", for example:
-
+By default, this plugin is not enabled. To activate it, you must add the `rmqtt-bridge-ingress-mqtt` entry to the
+`plugins.default_startups` configuration in the main configuration file `rmqtt.toml`, as shown below:
 ```bash
 ##--------------------------------------------------------------------
 ## Plugins

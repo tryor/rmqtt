@@ -11,11 +11,11 @@ use salvo::prelude::*;
 use rmqtt::{
     anyhow::{self, anyhow},
     base64::prelude::{Engine, BASE64_STANDARD},
-    bytes, chrono, futures, log,
+    bytes, futures, log,
     serde_json::{self, json},
     tokio,
     tokio::sync::oneshot,
-    HashMap, SessionState,
+    HashMap,
 };
 use rmqtt::{
     broker::types::NodeId,
@@ -24,8 +24,8 @@ use rmqtt::{
         MessageSender, MessageType,
     },
     node::NodeStatus,
-    ClientId, From, Id, MqttError, Publish, PublishProperties, QoS, Result, Runtime, SubsSearchParams,
-    TopicFilter, TopicName, UserName,
+    timestamp_millis, ClientId, From, Id, MqttError, Publish, PublishProperties, QoS, Result, Runtime,
+    SessionState, SubsSearchParams, TopicFilter, TopicName, UserName,
 };
 
 use super::types::{
@@ -56,7 +56,7 @@ impl Handler for BearerValidator {
 }
 
 fn route(cfg: PluginConfigType, token: Option<String>) -> Router {
-    let mut router = Router::with_path("api/v1").hoop(affix::inject(cfg)).hoop(api_logger);
+    let mut router = Router::with_path("api/v1").hoop(affix_state::inject(cfg)).hoop(api_logger);
     if let Some(token) = token {
         router = router.hoop(BearerValidator::new(&token));
     }
@@ -623,13 +623,14 @@ async fn kick_client(req: &mut Request, res: &mut Response) {
             .shared()
             .await
             .entry(Id::from(Runtime::instance().node.id(), ClientId::from(clientid)));
-
-        match entry.kick(true, true, true).await {
-            Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
-            Ok(None) => {
-                res.status_code(StatusCode::NOT_FOUND);
+        let s = entry.session();
+        if let Some(s) = s {
+            match entry.kick(true, true, true).await {
+                Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
+                Ok(_) => res.render(Json(s.id.to_json())),
             }
-            Ok(Some(offline_info)) => res.render(Text::Plain(offline_info.id.to_string())),
+        } else {
+            res.status_code(StatusCode::NOT_FOUND);
         }
     } else {
         res.render(StatusError::bad_request())
@@ -739,14 +740,9 @@ async fn get_route(req: &mut Request, res: &mut Response) {
 #[handler]
 async fn publish(req: &mut Request, depot: &mut Depot, res: &mut Response) -> Result<(), salvo::Error> {
     let cfg = get_cfg(depot)?;
-    let (http_laddr, retain_available, storage_available, expiry_interval) = {
+    let (http_laddr, retain_available, expiry_interval) = {
         let cfg_rl = cfg.read().await;
-        (
-            cfg_rl.http_laddr,
-            cfg_rl.message_retain_available,
-            cfg_rl.message_storage_available,
-            cfg_rl.message_expiry_interval,
-        )
+        (cfg_rl.http_laddr, cfg_rl.message_retain_available, cfg_rl.message_expiry_interval)
     };
 
     let addr = req.remote_addr();
@@ -763,9 +759,7 @@ async fn publish(req: &mut Request, depot: &mut Depot, res: &mut Response) -> Re
             return Ok(());
         }
     };
-    match _publish(params, remote_addr, http_laddr, retain_available, storage_available, expiry_interval)
-        .await
-    {
+    match _publish(params, remote_addr, http_laddr, retain_available, expiry_interval).await {
         Ok(()) => res.render(Text::Plain("ok")),
         Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
     }
@@ -777,7 +771,6 @@ async fn _publish(
     remote_addr: Option<SocketAddr>,
     http_laddr: SocketAddr,
     retain_available: bool,
-    storage_available: bool,
     expiry_interval: Duration,
 ) -> Result<()> {
     let mut topics = if let Some(topics) = params.topics {
@@ -816,7 +809,8 @@ async fn _publish(
         packet_id: None,
         payload,
         properties: PublishProperties::default(),
-        create_time: chrono::Local::now().timestamp_millis(),
+        delay_interval: None,
+        create_time: timestamp_millis(),
     };
 
     let message_expiry_interval = params
@@ -827,6 +821,8 @@ async fn _publish(
         })
         .unwrap_or(expiry_interval);
     log::debug!("message_expiry_interval: {:?}", message_expiry_interval);
+
+    let storage_available = Runtime::instance().extends.message_mgr().await.enable();
 
     let mut futs = Vec::new();
     for topic in topics {

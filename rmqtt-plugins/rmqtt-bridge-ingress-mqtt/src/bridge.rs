@@ -225,6 +225,7 @@ async fn send_publish(
             packet_id: None,
             payload: Bytes::from(p.payload.to_vec()), //@TODO ...
             properties: PublishProperties::default(),
+            delay_interval: None,
             create_time: timestamp_millis(),
         },
         BridgePublish::V5(p) => Publish {
@@ -235,6 +236,7 @@ async fn send_publish(
             packet_id: None,
             payload: Bytes::from(p.payload.to_vec()), //@TODO ...
             properties: to_properties(p.properties),  //@TODO ...
+            delay_interval: None,
             create_time: timestamp_millis(),
         },
     };
@@ -256,8 +258,10 @@ async fn send_publish(
         .await
         .unwrap_or(msg);
 
+    let storage_available = Runtime::instance().extends.message_mgr().await.enable();
+
     if let Err(e) =
-        SessionState::forwards(from, msg, cfg.retain_available, cfg.storage_available, Some(expiry_interval))
+        SessionState::forwards(from, msg, cfg.retain_available, storage_available, Some(expiry_interval))
             .await
     {
         log::warn!("{:?}", e);

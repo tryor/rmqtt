@@ -42,7 +42,9 @@ node.busy.handshaking = 0
 ##--------------------------------------------------------------------
 ## RPC
 ##--------------------------------------------------------------------
+#gRPC listening address
 rpc.server_addr = "0.0.0.0:5363"
+#Number of worker threads
 rpc.server_workers = 4
 #Maximum number of messages sent in batch
 rpc.batch_size = 128
@@ -56,7 +58,7 @@ rpc.client_timeout = "10s"
 ## Log
 ##--------------------------------------------------------------------
 # Value: off | file | console | both
-log.to = "console"
+log.to = "both"
 # Value: trace, debug, info, warn, error
 log.level = "info"
 log.dir = "/var/log/rmqtt"
@@ -82,6 +84,10 @@ plugins.default_startups = [
     #"rmqtt-bridge-egress-mqtt",
     #"rmqtt-bridge-ingress-kafka",
     #"rmqtt-bridge-egress-kafka",
+    #"rmqtt-topic-rewrite",
+    #"rmqtt-auto-subscription",
+    #"rmqtt-bridge-egress-pulsar",
+    #"rmqtt-auth-jwt",
     "rmqtt-web-hook",
     "rmqtt-http-api"
 ]
@@ -90,7 +96,13 @@ plugins.default_startups = [
 ##--------------------------------------------------------------------
 ## MQTT
 ##--------------------------------------------------------------------
-
+#Delayed message send limit
+mqtt.delayed_publish_max = 100_000
+#Send immediately when limit exceeded, true/false,
+#true -  message will be sent immediately,
+#false - message will be discarded,
+#default: true
+mqtt.delayed_publish_immediate = true
 
 ##--------------------------------------------------------------------
 ## Listeners
@@ -158,9 +170,13 @@ listener.tcp.external.max_subscriptions = 0
 listener.tcp.external.shared_subscription = true
 #topic alias maximum, default value: 0, topic aliases not enabled. (MQTT 5.0)
 listener.tcp.external.max_topic_aliases = 32
+#Limit subscription switch, default value: false
+listener.tcp.external.limit_subscription = false
+#Delayed publish switch, default value: false
+listener.tcp.external.delayed_publish = false
 
 ##--------------------------------------------------------------------
-## Internal TCP Listener for MQTT Protocol
+## MQTT/TCP - Internal TCP Listener for MQTT Protocol
 listener.tcp.internal.enable = true
 listener.tcp.internal.addr = "0.0.0.0:11883"
 listener.tcp.internal.workers = 4
@@ -187,15 +203,22 @@ listener.tcp.internal.message_expiry_interval = "5m"
 listener.tcp.internal.max_subscriptions = 0
 listener.tcp.internal.shared_subscription = true
 listener.tcp.internal.max_topic_aliases = 0
+listener.tcp.internal.limit_subscription = false
 
 ##--------------------------------------------------------------------
 ## MQTT/TLS - External TLS Listener for MQTT Protocol, (TLSv1.2)
 listener.tls.external.addr = "0.0.0.0:8883"
+#Whether to enable cross-certification, default value: false
+listener.tls.external.cross_certificate = false
+#This certificate is used to authenticate the server during TLS handshakes.
+listener.tls.external.cert = "./rmqtt-bin/rmqtt.pem"
+#This key is used to establish a secure connection with the client.
+listener.tls.external.key = "./rmqtt-bin/rmqtt.key"
+
+#The following is the configuration using cross-certification
 #listener.tls.external.cross_certificate = true
 #listener.tls.external.cert = "./rmqtt-bin/rmqtt.fullchain.pem"
-listener.tls.external.cross_certificate = false
-listener.tls.external.cert = "./rmqtt-bin/rmqtt.pem"
-listener.tls.external.key = "./rmqtt-bin/rmqtt.key"
+#listener.tls.external.key = "./rmqtt-bin/rmqtt.key"
 
 ##--------------------------------------------------------------------
 ## MQTT/WebSocket - External WebSocket Listener for MQTT Protocol
@@ -204,8 +227,9 @@ listener.ws.external.addr = "0.0.0.0:8080"
 ##--------------------------------------------------------------------
 ## MQTT/TLS-WebSocket - External TLS-WebSocket Listener for MQTT Protocol, (TLSv1.2)
 listener.wss.external.addr = "0.0.0.0:8443"
-#listener.wss.external.cross_certificate = true
-#listener.wss.external.cert = "./rmqtt-bin/rmqtt.fullchain.pem"
 listener.wss.external.cross_certificate = false
 listener.wss.external.cert = "./rmqtt-bin/rmqtt.pem"
 listener.wss.external.key = "./rmqtt-bin/rmqtt.key"
+#listener.wss.external.cross_certificate = true
+#listener.wss.external.cert = "./rmqtt-bin/rmqtt.fullchain.pem"
+#listener.wss.external.key = "./rmqtt-bin/rmqtt.key"

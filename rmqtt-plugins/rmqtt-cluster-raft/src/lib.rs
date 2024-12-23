@@ -90,8 +90,15 @@ impl ClusterPlugin {
             node_names.insert(node_addr.id, format!("{}@{}", node_addr.id, node_addr.addr));
         }
         let grpc_clients = Arc::new(grpc_clients);
-        let router = ClusterRouter::get_or_init(cfg.try_lock_timeout);
-        let shared = ClusterShared::get_or_init(router, grpc_clients.clone(), node_names, cfg.message_type);
+        let router = ClusterRouter::get_or_init(cfg.try_lock_timeout, cfg.compression);
+        let shared = ClusterShared::get_or_init(
+            router,
+            grpc_clients.clone(),
+            node_names,
+            cfg.message_type,
+            cfg.task_exec_queue_max,
+            cfg.task_exec_queue_workers,
+        );
         let raft_mailbox = None;
         let cfg = Arc::new(cfg);
         Ok(Self { runtime, register, cfg, grpc_clients, shared, router, raft_mailbox })
@@ -213,12 +220,53 @@ impl ClusterPlugin {
         self.register.add(typ, Box::new(HookHandler::new(self.shared, self.raft_mailbox()))).await;
     }
 
+    #[inline]
     fn raft_mailbox(&self) -> Mailbox {
         if let Some(raft_mailbox) = &self.raft_mailbox {
             raft_mailbox.clone()
         } else {
             unreachable!()
         }
+    }
+
+    fn start_check_health(&self) {
+        let exit_on_node_unavailable = self.cfg.health.exit_on_node_unavailable;
+        let exit_code = self.cfg.health.exit_code;
+        let unavailable_check_interval = self.cfg.health.unavailable_check_interval;
+        let max_continuous_unavailable_count = self.cfg.health.max_continuous_unavailable_count;
+
+        let mut continuous_unavailable_count = 0;
+        let raft_mailbox = self.raft_mailbox();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(unavailable_check_interval).await;
+                match raft_mailbox.status().await {
+                    Err(e) => {
+                        log::error!("Error retrieving cluster status, {}", e);
+                    }
+                    Ok(s) => {
+                        if s.available() {
+                            if continuous_unavailable_count > 0 {
+                                continuous_unavailable_count = 0;
+                            }
+                        } else {
+                            continuous_unavailable_count += 1;
+                            log::error!(
+                                "cluster node unavailable({}), node status: {:?}",
+                                continuous_unavailable_count,
+                                s
+                            );
+                            if exit_on_node_unavailable
+                                && continuous_unavailable_count >= max_continuous_unavailable_count
+                            {
+                                std::thread::sleep(Duration::from_secs(2));
+                                std::process::exit(exit_code);
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -251,6 +299,8 @@ impl Plugin for ClusterPlugin {
         self.hook_register(Type::ClientDisconnected).await;
         self.hook_register(Type::SessionTerminated).await;
         self.hook_register(Type::GrpcMessageReceived).await;
+
+        self.start_check_health();
 
         Ok(())
     }
@@ -385,6 +435,7 @@ pub(crate) struct MessageSender {
     msg: Message,
     max_retries: usize,
     retry_interval: Duration,
+    timeout: Option<Duration>,
 }
 
 impl MessageSender {
@@ -392,7 +443,7 @@ impl MessageSender {
     async fn send(&mut self) -> Result<MessageReply> {
         let mut current_retry = 0usize;
         loop {
-            match self.client.send_message(self.msg_type, self.msg.clone()).await {
+            match self.client.send_message(self.msg_type, self.msg.clone(), self.timeout).await {
                 Ok(reply) => {
                     return Ok(reply);
                 }

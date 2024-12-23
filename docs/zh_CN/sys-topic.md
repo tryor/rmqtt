@@ -32,8 +32,6 @@ publish_qos = 1
 #$SYS system message publish period
 publish_interval = "1m"
 
-##Whether support retain message, true/false, default value: false
-message_retain_available = false
 ##Message expiration time, 0 means no expiration
 message_expiry_interval = "5m"
 ```
@@ -157,37 +155,6 @@ disconnected 事件消息的 Payload 解析成 JSON 格式如下:
 
 ```
 
-
-## 消息丢弃事件
-
-| 主题 (Topic) | 说明                                  |
-|------------|-------------------------------------|
-| $SYS/brokers/{node}/message/dropped     | 消息丢弃事件。当任意消息丢弃事件时，RMQTT 就会发布该主题的消息  |
-
-*dropped* 事件消息的 Payload 解析成 JSON 格式如下:
-```bash
-{
-  "from_node": 1,
-  "from_ipaddress": "127.0.0.1:1883",
-  "from_clientid": "rmqtt-12312431wewr232",
-  "from_username": "foo",
-  "node": 1,
-  "ipaddress": "127.0.0.1:1883",
-  "clientid": "rmqtt-12312431wewr232",
-  "username": "foo",
-  "dup": false,
-  "retain": false,
-  "qos": 1,
-  "topic": "foo/#",
-  "packet_id": 3,
-  "payload": "dGVzdCAvdGVzdC9sd3QgLi4u",
-  "reason": "MessageExpiration",
-  "pts": 1692069106000,
-  "ts": 1692069107000,
-  "time": "2023-08-15 11:11:46.984"
-}
-
-```
 
 ## 节点状态数据
 

@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2024/08/08/Rust-1.80.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.80.1%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2024/09/05/Rust-1.81.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.81.0%2B-blue" /></a>
 
 [English](./README.md)  | 简体中文
 
@@ -80,7 +80,7 @@ docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060
 
 #### 通过 docker-compose 创建静态集群
 
-1. [下载配置模板](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template.zip)
+1. [下载配置模板](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template-v0.7.zip)
 
 2. 启动 docker-compose 集群
 
@@ -117,6 +117,7 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 #### paho.mqtt.testing(MQTT V3.1.1) [client_test.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test.py)
 
 * client_test.py Test.test_retained_messages          [OK]
+  * 需要开启"rmqtt-retainer"插件
 * client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.will_message_test               [OK]
 * client_test.py Test.test_zero_length_clientid       [OK]
@@ -132,6 +133,7 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 #### paho.mqtt.testing(MQTT V5.0) [client_test5.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test5.py)
 
 * client_test5.py Test.test_retained_message            [OK]
+  * 需要开启"rmqtt-retainer"插件
 * client_test5.py Test.test_will_message                [OK]
 * client_test5.py Test.test_offline_message_queueing    [OK]
 * client_test5.py Test.test_dollar_topics               [OK]
@@ -164,6 +166,7 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 因为rmqtt返回错误码是0x87, 而test_subscribe_failure要求返回0x80。
 UnspecifiedError = 0x80, NotAuthorized = 0x87。
 
+注意：运行测试用例前请关闭"rmqtt-message-storage"插件。
 
 ### 基准测试
 

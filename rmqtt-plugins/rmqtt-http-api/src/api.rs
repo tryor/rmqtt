@@ -67,15 +67,15 @@ fn route(cfg: PluginConfigType, token: Option<String>) -> Router {
     }
     router
         .get(list_apis)
-        .push(Router::with_path("brokers").get(get_brokers).push(Router::with_path("<id>").get(get_brokers)))
-        .push(Router::with_path("nodes").get(get_nodes).push(Router::with_path("<id>").get(get_nodes)))
+        .push(Router::with_path("brokers").get(get_brokers).push(Router::with_path("{id}").get(get_brokers)))
+        .push(Router::with_path("nodes").get(get_nodes).push(Router::with_path("{id}").get(get_nodes)))
         .push(Router::with_path("health/check").get(check_health))
         .push(
             Router::with_path("clients")
                 .push(Router::with_path("offlines").get(search_offlines).delete(kick_offlines))
                 .get(search_clients)
                 .push(
-                    Router::with_path("<clientid>")
+                    Router::with_path("{clientid}")
                         .get(get_client)
                         .delete(kick_client)
                         .push(Router::with_path("online").get(check_online)),
@@ -84,9 +84,9 @@ fn route(cfg: PluginConfigType, token: Option<String>) -> Router {
         .push(
             Router::with_path("subscriptions")
                 .get(query_subscriptions)
-                .push(Router::with_path("<clientid>").get(get_client_subscriptions)),
+                .push(Router::with_path("{clientid}").get(get_client_subscriptions)),
         )
-        .push(Router::with_path("routes").get(get_routes).push(Router::with_path("<topic>").get(get_route)))
+        .push(Router::with_path("routes").get(get_routes).push(Router::with_path("{topic}").get(get_route)))
         .push(
             Router::with_path("mqtt")
                 .push(Router::with_path("publish").post(publish))
@@ -96,18 +96,18 @@ fn route(cfg: PluginConfigType, token: Option<String>) -> Router {
         .push(
             Router::with_path("plugins")
                 .get(all_plugins)
-                .push(Router::with_path("<node>").get(node_plugins))
-                .push(Router::with_path("<node>/<plugin>").get(node_plugin_info))
-                .push(Router::with_path("<node>/<plugin>/config").get(node_plugin_config))
-                .push(Router::with_path("<node>/<plugin>/config/reload").put(node_plugin_config_reload))
-                .push(Router::with_path("<node>/<plugin>/load").put(node_plugin_load))
-                .push(Router::with_path("<node>/<plugin>/unload").put(node_plugin_unload)),
+                .push(Router::with_path("{node}").get(node_plugins))
+                .push(Router::with_path("{node}/{plugin}").get(node_plugin_info))
+                .push(Router::with_path("{node}/{plugin}/config").get(node_plugin_config))
+                .push(Router::with_path("{node}/{plugin}/config/reload").put(node_plugin_config_reload))
+                .push(Router::with_path("{node}/{plugin}/load").put(node_plugin_load))
+                .push(Router::with_path("{node}/{plugin}/unload").put(node_plugin_unload)),
         )
         .push(
             Router::with_path("stats")
                 .get(get_stats)
                 .push(Router::with_path("sum").get(get_stats_sum))
-                .push(Router::with_path("<id>").get(get_stats)),
+                .push(Router::with_path("{id}").get(get_stats)),
         )
         .push(
             Router::with_path("metrics")
@@ -116,10 +116,10 @@ fn route(cfg: PluginConfigType, token: Option<String>) -> Router {
                     Router::with_path("prometheus")
                         .get(get_prometheus_metrics)
                         .push(Router::with_path("sum").get(get_prometheus_metrics_sum))
-                        .push(Router::with_path("<id>").get(get_prometheus_metrics)),
+                        .push(Router::with_path("{id}").get(get_prometheus_metrics)),
                 )
                 .push(Router::with_path("sum").get(get_metrics_sum))
-                .push(Router::with_path("<id>").get(get_metrics)),
+                .push(Router::with_path("{id}").get(get_metrics)),
         )
 }
 
@@ -1634,7 +1634,7 @@ async fn _get_stats_sum(message_type: MessageType) -> Result<serde_json::Value> 
         this_id,
         json!({
             "name": Runtime::instance().node.name(this_id).await,
-            "status": Runtime::instance().node.status().await,
+            "running": Runtime::instance().node.status().await.is_running(),
         }),
     );
 
@@ -1658,7 +1658,7 @@ async fn _get_stats_sum(message_type: MessageType) -> Result<serde_json::Value> 
                             id,
                             json!({
                                 "name": Runtime::instance().node.name(id).await,
-                                "status": node_status,
+                                "running": node_status.is_running(),
                             }),
                         );
                         stats_sum.add(*stats);
@@ -1810,7 +1810,7 @@ async fn _build_stats(id: NodeId, node_status: NodeStatus, stats: serde_json::Va
         "node": {
             "id": id,
             "name": node_name,
-            "status": node_status,
+            "running": node_status.is_running(),
         },
         "stats": stats
     });

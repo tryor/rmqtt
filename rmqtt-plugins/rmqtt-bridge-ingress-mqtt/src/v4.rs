@@ -4,7 +4,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ntex::connect::rustls::TlsConnector;
 use ntex::connect::Connector;
+use ntex::service::fn_service;
 use ntex::time;
 use ntex::time::Seconds;
 use ntex::util::ByteString;
@@ -21,8 +23,24 @@ use rmqtt::futures::StreamExt;
 use rmqtt::log;
 use rmqtt::{ClientId, MqttError, NodeId, Result, UserName};
 
-use crate::bridge::{BridgeClient, BridgePublish, Command, CommandMailbox, OnMessageEvent};
+use crate::bridge::{
+    build_tls_connector, BridgeClient, BridgePublish, Command, CommandMailbox, OnMessageEvent,
+};
 use crate::config::Bridge;
+
+enum MqttConnector {
+    Tcp(v3::client::MqttConnector<String, Connector<String>>),
+    Tls(v3::client::MqttConnector<String, TlsConnector<String>>),
+}
+
+impl MqttConnector {
+    async fn connect(&self) -> Result<v3::client::Client> {
+        Ok(match self {
+            MqttConnector::Tcp(c) => c.connect().await.map_err(|e| MqttError::Anyhow(e.into()))?,
+            MqttConnector::Tls(c) => c.connect().await.map_err(|e| MqttError::Anyhow(e.into()))?,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -64,7 +82,7 @@ impl Client {
             format!("{}:{}:ingress:{}:{}:{}", cfg.client_id_prefix, cfg.name, node_id, entry_idx, client_no);
         let username = cfg.username.clone().unwrap_or("undefined".into());
 
-        let server_addr = cfg.server.to_socket_addrs()?.next().ok_or_else(|| MqttError::from("None"))?;
+        let server_addr = cfg.server.addr.to_socket_addrs()?.next().ok_or_else(|| MqttError::from("None"))?;
 
         let client = Self {
             cfg: Rc::new(cfg),
@@ -77,7 +95,14 @@ impl Client {
             on_message,
         };
 
-        let mut builder = v3::client::MqttConnector::new(client.server_addr)
+        log::info!(
+            "server_addr: {}, server_addr: {}, cfg.server: {:?}",
+            client.server_addr,
+            server_addr,
+            &client.cfg.server
+        );
+
+        let mut builder = v3::client::MqttConnector::new(client.cfg.server.addr.clone())
             .client_id(ByteString::from(client.client_id.as_ref()))
             .keep_alive(Seconds(client.cfg.keepalive.as_secs() as u16))
             .handshake_timeout(Seconds(client.cfg.connect_timeout.as_secs() as u16));
@@ -98,7 +123,12 @@ impl Client {
                 builder = builder.last_will(last_will.clone());
             }
 
-            ntex::rt::spawn(client.clone().start(builder));
+            if client.cfg.server.is_tls() {
+                let builder = builder.connector(build_tls_connector(&client.cfg)?);
+                ntex::rt::spawn(client.clone().start(MqttConnector::Tls(builder)));
+            } else {
+                ntex::rt::spawn(client.clone().start(MqttConnector::Tcp(builder)));
+            }
             ntex::rt::spawn(client.clone().cmd_loop(cmd_rx));
         } else {
             unreachable!()
@@ -123,7 +153,7 @@ impl Client {
         }
     }
 
-    async fn start(self, builder: v3::client::MqttConnector<SocketAddr, Connector<SocketAddr>>) {
+    async fn start(self, builder: MqttConnector) {
         let client = self;
         let sleep_interval = client.cfg.reconnect_interval;
         loop {
@@ -150,7 +180,12 @@ impl Client {
                     client.clone().ev_loop(c).await;
                 }
                 Err(e) => {
-                    log::warn!("{} Connect to {:?} fail, {:?}", client.client_id, client.cfg.server, e);
+                    log::warn!(
+                        "{} Connect to {:?} fail, {:?}",
+                        client.client_id,
+                        client.cfg.server,
+                        e.to_string()
+                    );
                 }
             }
             if client.is_closed() {
@@ -197,8 +232,8 @@ impl Client {
 
     async fn ev_loop(self, c: v3::client::Client) {
         if let Err(e) = c
-            .start(move |control: v3::client::ControlMessage<()>| match control {
-                v3::client::ControlMessage::Publish(publish) => {
+            .start(fn_service(move |control: v3::client::Control<()>| match control {
+                v3::client::Control::Publish(publish) => {
                     log::debug!("{} publish: {:?}", self.client_id, publish);
                     self.on_message.fire((
                         BridgeClient::V4(self.clone()),
@@ -208,23 +243,23 @@ impl Client {
                     ));
                     Ready::Ok(publish.ack())
                 }
-                v3::client::ControlMessage::Error(msg) => {
+                v3::client::Control::Error(msg) => {
                     log::info!("{} Codec error: {:?}", self.client_id, msg);
                     Ready::Ok(msg.ack())
                 }
-                v3::client::ControlMessage::ProtocolError(msg) => {
+                v3::client::Control::ProtocolError(msg) => {
                     log::info!("{} Protocol error: {:?}", self.client_id, msg);
                     Ready::Ok(msg.ack())
                 }
-                v3::client::ControlMessage::PeerGone(msg) => {
+                v3::client::Control::PeerGone(msg) => {
                     log::info!("{} Peer closed connection: {:?}", self.client_id, msg.err());
                     Ready::Ok(msg.ack())
                 }
-                v3::client::ControlMessage::Closed(msg) => {
+                v3::client::Control::Closed(msg) => {
                     log::info!("{} Server closed connection", self.client_id);
                     Ready::Ok(msg.ack())
                 }
-            })
+            }))
             .await
         {
             log::error!("Start ev_loop error! {:?}", e);

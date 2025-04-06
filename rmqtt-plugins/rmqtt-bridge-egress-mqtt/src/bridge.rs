@@ -1,9 +1,15 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ntex_mqtt::v3::codec::Publish as PublishV3;
 use ntex_mqtt::v5::codec::Publish as PublishV5;
+
+use ntex::connect::rustls::TlsConnector;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
+use rustls::{ClientConfig, RootCertStore};
 
 use rmqtt::anyhow::anyhow;
 use rmqtt::bytestring::ByteString;
@@ -13,7 +19,7 @@ use rmqtt::{
     broker::topic::{TopicTree, VecToTopic},
     rand, ClientId, From, MqttError, NodeId, Publish, PublishProperties, Result, Topic,
 };
-use rmqtt::{log, tokio::sync::RwLock, DashMap};
+use rmqtt::{log, rustls, tokio, tokio::sync::RwLock, DashMap};
 
 use rmqtt::ntex_mqtt::types::{MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
 
@@ -83,7 +89,15 @@ impl BridgeManager {
         }
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&mut self) {
+        while let Err(e) = self._start().await {
+            log::error!("start bridge-egress-mqtt error, {:?}", e);
+            self.stop().await;
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+        }
+    }
+
+    async fn _start(&mut self) -> Result<()> {
         let mut topics = self.topics.write().await;
         let bridges = self.cfg.read().await.bridges.clone();
         let mut bridge_names: HashSet<&str> = HashSet::default();
@@ -158,7 +172,7 @@ impl BridgeManager {
     #[inline]
     pub(crate) async fn send(&self, _f: &From, p: &Publish) -> Result<()> {
         let topic = Topic::from_str(&p.topic)?;
-        let rnd = rand::random::<usize>();
+        let rnd = rand::random::<u64>() as usize;
         for (topic_filter, bridge_infos) in { self.topics.read().await.matches(&topic) }.iter() {
             let topic_filter = topic_filter.to_topic_filter();
             log::debug!("topic_filter: {:?}", topic_filter);
@@ -247,4 +261,30 @@ fn to_properties(props: &PublishProperties) -> ntex_mqtt::v5::codec::PublishProp
         response_topic: props.response_topic.as_ref().map(|data| ntex::util::ByteString::from(data.as_ref())),
         subscription_ids: props.subscription_ids.clone().unwrap_or_default(),
     }
+}
+
+pub(crate) fn build_tls_connector(cfg: &super::config::Bridge) -> Result<TlsConnector<String>> {
+    let mut root_store = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.into() };
+
+    if let Some(c) = &cfg.root_cert {
+        root_store.add_parsable_certificates(
+            CertificateDer::pem_file_iter(c)
+                .map_err(|e| anyhow!(e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow!(e))?,
+        );
+    }
+
+    let config = ClientConfig::builder().with_root_certificates(root_store);
+    let config = if let (Some(client_key), Some(client_cert)) = (&cfg.client_key, &cfg.client_cert) {
+        let c_certs = CertificateDer::pem_file_iter(client_cert)
+            .map_err(|e| anyhow!(e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!(e))?;
+        let c_key = rustls::pki_types::PrivateKeyDer::from_pem_file(client_key).map_err(|e| anyhow!(e))?;
+        config.with_client_auth_cert(c_certs, c_key).map_err(|e| MqttError::Anyhow(e.into()))?
+    } else {
+        config.with_no_client_auth()
+    };
+    Ok(TlsConnector::new(config))
 }

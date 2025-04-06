@@ -1,7 +1,7 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2024/08/08/Rust-1.80.1.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.80.1%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2024/09/05/Rust-1.81.0.html"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.81.0%2B-blue" /></a>
 
 English | [简体中文](./README-CN.md)
 
@@ -82,7 +82,7 @@ Node IDs: 1, 2, 3; Node IP Addrs: 172.17.0.3, 172.17.0.4, 172.17.0.5
 
 #### Create a static cluster by docker-compose
 
-1. [Download docker-compose configuration template](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template.zip)
+1. [Download docker-compose configuration template](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template-v0.7.zip)
 
 2. Start docker-compose cluster
 
@@ -119,6 +119,7 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 #### paho.mqtt.testing(MQTT V3.1.1) [client_test.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test.py)
 
 * client_test.py Test.test_retained_messages          [OK]
+  * Need to enable the "rmqtt-retainer" plugin.
 * client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.will_message_test               [OK]
 * client_test.py Test.test_zero_length_clientid       [OK]
@@ -134,6 +135,7 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
 #### paho.mqtt.testing(MQTT V5.0) [client_test5.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test5.py)
 
 * client_test5.py Test.test_retained_message            [OK]
+  * Need to enable the "rmqtt-retainer" plugin.
 * client_test5.py Test.test_will_message                [OK]
 * client_test5.py Test.test_offline_message_queueing    [OK]
 * client_test5.py Test.test_dollar_topics               [OK]
@@ -166,6 +168,7 @@ Get the binary package of the corresponding OS from [RMQTT Download](https://git
     Because `rmqtt` returns the error code 0x87, while `test_subscribe_failure` expects it to return 0x80.
     UnspecifiedError = 0x80, NotAuthorized = 0x87。
 
+Note: Before running test cases, please disable the `rmqtt-message-storage` plugin.
 
 ### Benchmark Testing
 

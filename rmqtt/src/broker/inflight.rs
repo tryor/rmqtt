@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +54,7 @@ impl InflightMessage {
 
     #[inline]
     pub fn release_packet_v5(&self) -> Option<Packet> {
-        log::info!("release_packet Publish V5 {:?}: ", self.publish);
+        log::debug!("release_packet Publish V5 {:?}: ", self.publish);
         if let Some(packet_id) = self.publish.packet_id {
             //@TODO ...
             let pack2 = PublishAck2 {
@@ -259,5 +260,10 @@ impl Inflight {
             inflight_messages.push(msg);
         }
         inflight_messages
+    }
+
+    #[inline]
+    pub fn clone_inflight_messages(&mut self) -> Vec<InflightMessage> {
+        self.queues.iter().map(|(_, msg)| msg.clone()).collect_vec()
     }
 }

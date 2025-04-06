@@ -37,8 +37,14 @@ pub struct Bridge {
     pub name: String,
     #[serde(default)]
     pub client_id_prefix: String,
-    #[serde(default)]
-    pub server: String,
+    #[serde(default, deserialize_with = "Bridge::deserialize_server")]
+    pub server: ServerAddr,
+    pub root_cert: Option<String>,
+    // #Client Certificate File
+    pub client_cert: Option<String>,
+    // #Client key file
+    pub client_key: Option<String>,
+
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -105,6 +111,54 @@ impl Bridge {
             _ => return Err(serde::de::Error::custom("invalid value")),
         };
         Ok(protocol)
+    }
+
+    #[inline]
+    pub fn deserialize_server<'de, D>(deserializer: D) -> Result<ServerAddr, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let addr: String = String::deserialize(deserializer)?;
+        let addr_split = addr.splitn(2, "://").collect::<Vec<_>>();
+
+        match addr_split.len() {
+            0 => Err(serde::de::Error::custom(format!("invalid value, {:?}", addr))),
+            1 => Ok(ServerAddr { typ: AddrType::Tcp, addr }),
+            _ => {
+                let typ = match addr_split[0].to_lowercase().as_str() {
+                    "tcp" => AddrType::Tcp,
+                    "tls" => AddrType::Tls,
+                    _ => return Err(serde::de::Error::custom(format!("invalid value, {:?}", addr))),
+                };
+                Ok(ServerAddr { typ, addr: addr_split[1].into() })
+            }
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+pub(crate) enum AddrType {
+    #[default]
+    Tcp,
+    Tls,
+}
+
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct ServerAddr {
+    pub typ: AddrType,
+    pub addr: String,
+}
+
+impl ServerAddr {
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn is_tcp(&self) -> bool {
+        matches!(self.typ, AddrType::Tcp)
+    }
+
+    #[inline]
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self.typ, AddrType::Tls)
     }
 }
 

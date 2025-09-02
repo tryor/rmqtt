@@ -1,14 +1,39 @@
 [package]
 name = "rmqtt-message-storage"
-version = "0.1.1"
+version.workspace = true
+description = "Published messages are stored until expiration and forwarded to new matching subscriptions. They’re cleared automatically after expiring."
+repository = "https://github.com/rmqtt/rmqtt/tree/master/rmqtt-plugins/rmqtt-message-storage"
 edition.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+ram = []
+redis = ["rmqtt-storage/redis"]
+redis-cluster = ["redis", "rmqtt-storage/redis-cluster"]
+
 [dependencies]
-rmqtt.workspace = true
-rmqtt-macros.workspace = true
+rmqtt = { workspace = true, features = ["plugin", "msgstore", "retain"] }
 serde = { workspace = true, features = ["derive"] }
-rmqtt-storage = { version = "0.6", default-features = false, features = ["ttl"]}
-#rmqtt-storage = { path = "../../../rmqtt-storage", default-features = false, features = ["ttl"]}
+tokio = { workspace = true, features = ["sync", "time"] }
+rmqtt-storage = { version = "0.7", default-features = false, features = ["ttl"], optional = true}
+#rmqtt-storage = { path = "../../../rmqtt-storage", default-features = false, features = ["ttl"], optional = true}
+rust-box.workspace = true
+futures.workspace = true
+futures-time.workspace = true
+async-trait.workspace = true
+log.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+get-size.workspace = true
+scc.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+
+

@@ -1,13 +1,14 @@
 use std::fmt;
 
+use itertools::Itertools;
 use jsonwebtoken::DecodingKey;
-use serde::de::{self, Deserialize, Deserializer};
-use serde::ser::{self, Serialize, Serializer};
+use serde::de::{self, Deserializer};
+use serde::ser::{self, Serializer};
+use serde::{Deserialize, Serialize};
 
-use rmqtt::{ahash, anyhow, itertools::Itertools, serde_json};
 use rmqtt::{
-    broker::hook::Priority,
-    settings::acl::{PLACEHOLDER_CLIENTID, PLACEHOLDER_IPADDR, PLACEHOLDER_PROTOCOL, PLACEHOLDER_USERNAME},
+    acl::{PLACEHOLDER_CLIENTID, PLACEHOLDER_IPADDR, PLACEHOLDER_PROTOCOL, PLACEHOLDER_USERNAME},
+    hook::Priority,
     Result,
 };
 
@@ -207,7 +208,7 @@ impl PluginConfig {
                 } else if let Some(true) = val.as_bool() {
                     vec![parse(claim.as_str(), val)]
                 } else {
-                    return Err(de::Error::custom(format!("invalid value, {}:{}", claim, val)));
+                    return Err(de::Error::custom(format!("invalid value, {claim}:{val}")));
                 };
                 for (exp_enable, nbf_enable, _) in items.iter() {
                     if *exp_enable && !validate_exp_enable {

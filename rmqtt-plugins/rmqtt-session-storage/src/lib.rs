@@ -1,39 +1,34 @@
 #![deny(unsafe_code)]
-#[macro_use]
-extern crate serde;
-
-#[macro_use]
-extern crate rmqtt_macros;
 
 use std::convert::From as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmqtt::{
-    async_trait::async_trait,
-    bytes::Bytes,
-    futures,
-    futures::channel::mpsc,
-    futures::channel::oneshot,
-    futures::{SinkExt, StreamExt},
-    log,
-    serde_json::{self, json},
-    tokio,
-};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::channel::{mpsc, oneshot};
+use futures::{SinkExt, StreamExt};
+use serde_json::{self, json};
 
 use rmqtt::{
-    broker::fitter::Fitter,
-    broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
-    broker::inflight::InflightMessage,
-    broker::types::DisconnectInfo,
+    fitter::Fitter,
+    hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
     plugin::{PackageInfo, Plugin},
-    register, timestamp_millis, ClientId, From, Publish, Result, Runtime, Session, SessionState,
-    SessionSubMap, SessionSubs, TimestampMillis,
+    register,
+    session::Session,
+    types::DisconnectInfo,
+    types::{ClientId, From, Publish, SessionSubMap, SessionSubs, TimestampMillis},
+    utils::timestamp_millis,
+    Result,
 };
 
 use rmqtt_storage::{init_db, DefaultStorageDB, List, Map, StorageType};
 
 use config::PluginConfig;
+use rmqtt::context::ServerContext;
+use rmqtt::inflight::OutInflightMessage;
+use rmqtt::macros::Plugin;
+use rmqtt::session::SessionState;
 use session::{Basic, StorageSessionManager, StoredSessionInfo, StoredSessionInfos};
 use session::{StoredKey, BASIC, DISCONNECT_INFO, INFLIGHT_MESSAGES, LAST_TIME, SESSION_SUB_MAP};
 
@@ -51,48 +46,56 @@ register!(StoragePlugin::new);
 
 #[derive(Plugin)]
 struct StoragePlugin {
-    runtime: &'static Runtime,
+    scx: ServerContext,
     cfg: Arc<PluginConfig>,
     storage_db: DefaultStorageDB,
     stored_session_infos: StoredSessionInfos,
     register: Box<dyn Register>,
-    session_mgr: &'static StorageSessionManager,
+    session_mgr: StorageSessionManager,
     rebuild_tx: mpsc::Sender<RebuildChanType>,
 }
 
 impl StoragePlugin {
     #[inline]
-    async fn new<S: Into<String>>(runtime: &'static Runtime, name: S) -> Result<Self> {
+    async fn new<S: Into<String>>(scx: ServerContext, name: S) -> Result<Self> {
         let name = name.into();
-        let mut cfg = runtime.settings.plugins.load_config_default::<PluginConfig>(&name)?;
+        let mut cfg = scx.plugins.read_config::<PluginConfig>(&name)?;
         match cfg.storage.typ {
+            #[cfg(feature = "sled")]
             StorageType::Sled => {
                 cfg.storage.sled.path =
-                    cfg.storage.sled.path.replace("{node}", &format!("{}", runtime.node.id()));
+                    cfg.storage.sled.path.replace("{node}", &format!("{}", scx.node.id()));
             }
+            #[cfg(feature = "redis")]
             StorageType::Redis => {
                 cfg.storage.redis.prefix =
-                    cfg.storage.redis.prefix.replace("{node}", &format!("{}", runtime.node.id()));
+                    cfg.storage.redis.prefix.replace("{node}", &format!("{}", scx.node.id()));
             }
+            #[cfg(feature = "redis-cluster")]
             StorageType::RedisCluster => {
                 cfg.storage.redis_cluster.prefix =
-                    cfg.storage.redis_cluster.prefix.replace("{node}", &format!("{}", runtime.node.id()));
+                    cfg.storage.redis_cluster.prefix.replace("{node}", &format!("{}", scx.node.id()));
             }
         }
 
-        log::info!("{} StoragePlugin cfg: {:?}", name, cfg);
+        log::info!("{name} StoragePlugin cfg: {cfg:?}");
 
-        let storage_db = init_db(&cfg.storage).await?;
+        let storage_db = match init_db(&cfg.storage).await {
+            Err(e) => {
+                log::error!("{name} init storage db error, {e}");
+                return Err(e);
+            }
+            Ok(db) => db,
+        };
 
         let stored_session_infos = StoredSessionInfos::new();
 
-        let register = runtime.extends.hook_mgr().await.register();
-        let session_mgr =
-            StorageSessionManager::get_or_init(storage_db.clone(), stored_session_infos.clone());
+        let register = scx.extends.hook_mgr().register();
+        let session_mgr = StorageSessionManager::new(storage_db.clone(), stored_session_infos.clone());
 
         let cfg = Arc::new(cfg);
-        let rebuild_tx = Self::start_local_runtime();
-        Ok(Self { runtime, cfg, storage_db, stored_session_infos, register, session_mgr, rebuild_tx })
+        let rebuild_tx = Self::start_local_runtime(scx.clone());
+        Ok(Self { scx, cfg, storage_db, stored_session_infos, register, session_mgr, rebuild_tx })
     }
 
     async fn load_offline_session_infos(&mut self) -> Result<()> {
@@ -105,77 +108,77 @@ impl StoragePlugin {
             match m {
                 Ok(m) => {
                     let id_key = StoredKey::from(map_stored_key_to_id_bytes(m.name()).to_vec());
-                    log::debug!("map_stored_key: {:?}", id_key);
+                    log::debug!("map_stored_key: {id_key:?}");
                     let basic = match m.get::<_, Basic>(BASIC).await {
                         Err(e) => {
-                            log::warn!("{:?} load offline session basic info error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline session basic info error, {e:?}");
                             if let Err(e) = storage_db.map_remove(m.name()).await {
-                                log::warn!("{:?} remove offline session info error, {:?}", id_key, e);
+                                log::warn!("{id_key:?} remove offline session info error, {e:?}");
                             }
                             continue;
                         }
                         Ok(None) => {
-                            log::warn!("{:?} offline session basic info is None", id_key);
+                            log::warn!("{id_key:?} offline session basic info is None");
                             if let Err(e) = storage_db.map_remove(m.name()).await {
-                                log::warn!("{:?} remove offline session info error, {:?}", id_key, e);
+                                log::warn!("{id_key:?} remove offline session info error, {e:?}");
                             }
                             continue;
                         }
                         Ok(Some(basic)) => basic,
                     };
 
-                    log::debug!("basic: {:?}", basic);
-                    log::debug!("map key: {:?}", id_key);
+                    log::debug!("basic: {basic:?}");
+                    log::debug!("map key: {id_key:?}");
                     let mut s_info = StoredSessionInfo::from(id_key.clone(), basic);
 
                     match m.get::<_, TimestampMillis>(LAST_TIME).await {
                         Ok(Some(last_time)) => {
-                            log::debug!("last_time: {:?}", last_time);
+                            log::debug!("last_time: {last_time:?}");
                             s_info.set_last_time(last_time);
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::warn!("{:?} load offline session last time error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline session last time error, {e:?}");
                         }
                     }
 
                     match m.get::<_, SessionSubMap>(SESSION_SUB_MAP).await {
                         Ok(Some(subs)) => {
-                            log::debug!("subs: {:?}", subs);
+                            log::debug!("subs: {subs:?}");
                             s_info.set_subs(subs);
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::warn!("{:?} load offline session subscription info error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline session subscription info error, {e:?}");
                         }
                     }
 
                     match m.get::<_, DisconnectInfo>(DISCONNECT_INFO).await {
                         Ok(Some(disc_info)) => {
-                            log::debug!("disc_info: {:?}", disc_info);
+                            log::debug!("disc_info: {disc_info:?}");
                             s_info.set_disconnect_info(disc_info);
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::warn!("{:?} load offline session disconnect info error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline session disconnect info error, {e:?}");
                         }
                     }
 
-                    match m.get::<_, Vec<InflightMessage>>(INFLIGHT_MESSAGES).await {
+                    match m.get::<_, Vec<OutInflightMessage>>(INFLIGHT_MESSAGES).await {
                         Ok(Some(inflights)) => {
                             log::debug!("inflights len: {:?}", inflights.len());
                             s_info.inflight_messages = inflights;
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::warn!("{:?} load offline session inflight messages error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline session inflight messages error, {e:?}");
                         }
                     }
 
                     self.stored_session_infos.add(s_info);
                 }
                 Err(e) => {
-                    log::warn!("load offline session info error, {:?}", e);
+                    log::warn!("load offline session info error, {e:?}");
                 }
             }
         }
@@ -186,33 +189,29 @@ impl StoragePlugin {
             match l {
                 Ok(l) => {
                     let id_key = StoredKey::from(list_stored_key_to_id_bytes(l.name()).to_vec());
-                    log::debug!("list_stored_key, id_key: {:?}", id_key);
+                    log::debug!("list_stored_key, id_key: {id_key:?}");
                     match l.all::<OfflineMessageOptionType>().await {
                         Ok(offline_msgs) => {
                             log::debug!("{:?} offline_msgs len: {}", id_key, offline_msgs.len(),);
                             let ok =
                                 self.stored_session_infos.set_offline_messages(id_key.clone(), offline_msgs);
-                            log::debug!(
-                                "{:?} stored_session_infos, set_offline_messages res: {}",
-                                id_key,
-                                ok
-                            );
+                            log::debug!("{id_key:?} stored_session_infos, set_offline_messages res: {ok}");
                             if !ok {
                                 if let Err(e) = storage_db.list_remove(l.name()).await {
-                                    log::warn!("{:?} remove offline messages error, {:?}", id_key, e);
+                                    log::warn!("{id_key:?} remove offline messages error, {e:?}");
                                 }
                             }
                         }
                         Err(e) => {
-                            log::warn!("{:?} load offline messages error, {:?}", id_key, e);
+                            log::warn!("{id_key:?} load offline messages error, {e:?}");
                             if let Err(e) = storage_db.list_remove(l.name()).await {
-                                log::warn!("{:?} remove offline messages error, {:?}", id_key, e);
+                                log::warn!("{id_key:?} remove offline messages error, {e:?}");
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    log::warn!("load offline messages error, {:?}", e);
+                    log::warn!("load offline messages error, {e:?}");
                 }
             }
         }
@@ -227,7 +226,7 @@ impl StoragePlugin {
         Ok(())
     }
 
-    fn start_local_runtime() -> mpsc::Sender<RebuildChanType> {
+    fn start_local_runtime(scx: ServerContext) -> mpsc::Sender<RebuildChanType> {
         let (tx, mut rx) = futures::channel::mpsc::channel::<RebuildChanType>(100_000);
         std::thread::spawn(move || {
             let local_rt = tokio::runtime::Builder::new_current_thread()
@@ -237,52 +236,51 @@ impl StoragePlugin {
             let local_set = tokio::task::LocalSet::new();
 
             local_set.block_on(&local_rt, async {
+                let exec = scx.get_exec("SESSION_REBUILD_EXEC");
                 while let Some(msg) = rx.next().await {
                     match msg {
                         RebuildChanType::Session(session, session_expiry_interval)  => {
                             match SessionState::offline_restart(session.clone(), session_expiry_interval).await {
                                 Err(e) => {
-                                    log::warn!("Rebuild offline session error, {:?}", e);
+                                    log::warn!("Rebuild offline sessions error, {e:?}");
                                 },
-                                Ok((state, msg_tx)) => {
+                                Ok(msg_tx) => {
                                     let mut session_entry =
-                                        Runtime::instance().extends.shared().await.entry(state.id.clone());
+                                        scx.extends.shared().await.entry(session.id.clone());
 
                                     let id = session_entry.id().clone();
                                     let task_fut = async move {
                                         if let Err(e) = session_entry.set(session, msg_tx).await {
-                                            log::warn!("{:?} Rebuild offline session error, {:?}", session_entry.id(), e);
+                                            log::warn!("{:?} Rebuild offline sessions error, {:?}", session_entry.id(), e);
                                         }
                                     };
-                                    let task_exec = &Runtime::instance().exec;
-                                    if let Err(e) = task_exec.spawn(task_fut).await {
-                                        log::warn!("{:?} Rebuild offline session error, {:?}", id, e.to_string());
+                                    if let Err(e) = exec.spawn(task_fut).await {
+                                        log::warn!("{:?} Rebuild offline sessions error, {:?}", id, e.to_string());
                                     }
 
-                                    let completed_count = task_exec.completed_count().await;
+                                    let completed_count = exec.completed_count().await;
                                     if completed_count > 0 && completed_count % 5000 == 0 {
                                         log::info!(
-                                        "{:?} Rebuild offline session, completed_count: {}, active_count: {}, waiting_count: {}, rate: {:?}",
+                                        "{:?} Rebuild offline sessions, completed_count: {}, active_count: {}, waiting_count: {}, rate: {:?}",
                                         id,
-                                        task_exec.completed_count().await, task_exec.active_count(), task_exec.waiting_count(), task_exec.rate().await
+                                        exec.completed_count().await, exec.active_count(), exec.waiting_count(), exec.rate().await
                                     );
                                     }
                                 }
                             }
                         },
                         RebuildChanType::Done(done_tx) => {
-                            let task_exec = &Runtime::instance().exec;
-                            let _ = task_exec.flush().await;
+                            let _ = exec.flush().await;
                             let _ = done_tx.send(());
                             log::info!(
-                                "Rebuild offline session, completed_count: {}, active_count: {}, waiting_count: {}, rate: {:?}",
-                                task_exec.completed_count().await, task_exec.active_count(), task_exec.waiting_count(), task_exec.rate().await
+                                "Rebuild offline sessions, completed_count: {}, active_count: {}, waiting_count: {}, rate: {:?}",
+                                exec.completed_count().await, exec.active_count(), exec.waiting_count(), exec.rate().await
                             );
                         }
                     }
                 }
             });
-            log::info!("Rebuild offline session ends");
+            log::info!("Offline session rebuilding finished");
         });
         tx
     }
@@ -297,6 +295,7 @@ impl Plugin for StoragePlugin {
             .add(
                 Type::BeforeStartup,
                 Box::new(StorageHandler::new(
+                    self.scx.clone(),
                     self.storage_db.clone(),
                     self.cfg.clone(),
                     self.stored_session_infos.clone(),
@@ -330,7 +329,7 @@ impl Plugin for StoragePlugin {
     #[inline]
     async fn start(&mut self) -> Result<()> {
         log::info!("{} start", self.name());
-        *self.runtime.extends.session_mgr_mut().await = Box::new(self.session_mgr);
+        *self.scx.extends.session_mgr_mut().await = Box::new(self.session_mgr.clone());
 
         self.register.start().await;
         Ok(())
@@ -344,54 +343,89 @@ impl Plugin for StoragePlugin {
 
     #[inline]
     async fn attrs(&self) -> serde_json::Value {
-        let max_limit = 100;
-        let mut map_count = 0;
-        {
-            let now = std::time::Instant::now();
-            let mut storage_db = self.storage_db.clone();
-            let iter = storage_db.map_iter().await;
-            if let Ok(mut iter) = iter {
-                while let Some(m) = iter.next().await {
-                    if let Ok(m) = m {
-                        log::debug!("map: {:?}", StoredKey::from(m.name().to_vec()));
-                    }
-                    map_count += 1;
-                    if map_count >= max_limit {
-                        break;
-                    }
-                }
-            }
-            log::debug!("map_iter cost time: {:?}", now.elapsed());
-        }
-
-        let mut list_count = 0;
-        {
-            let now = std::time::Instant::now();
-            let mut storage_db = self.storage_db.clone();
-            let iter = storage_db.list_iter().await;
-            if let Ok(mut iter) = iter {
-                while let Some(l) = iter.next().await {
-                    if let Ok(l) = l {
-                        log::debug!("list: {:?}", StoredKey::from(l.name().to_vec()));
-                    }
-                    list_count += 1;
-                    if list_count >= max_limit {
-                        break;
+        async fn stats(storage_db: &DefaultStorageDB) -> (String, String, String, serde_json::Value) {
+            let max_limit = 1000;
+            let mut session_count = 0;
+            let mut storage_db_map = storage_db.clone();
+            {
+                let now = std::time::Instant::now();
+                let iter = storage_db_map.map_iter().await;
+                if let Ok(mut iter) = iter {
+                    while let Some(m) = iter.next().await {
+                        if let Ok(m) = m {
+                            log::debug!("map: {:?}", StoredKey::from(m.name().to_vec()));
+                        }
+                        session_count += 1;
+                        if session_count >= max_limit {
+                            break;
+                        }
                     }
                 }
+                log::debug!("map_iter cost time: {:?}", now.elapsed());
             }
-            log::debug!("list_iter cost time: {:?}", now.elapsed());
-        }
-        let map_count =
-            if map_count >= max_limit { format!("{}+", map_count) } else { format!("{}", map_count) };
-        let list_count =
-            if list_count >= max_limit { format!("{}+", list_count) } else { format!("{}", list_count) };
 
-        let storage_info = self.storage_db.info().await.unwrap_or_default();
+            let mut offline_session_count = 0;
+            let mut offline_message_count = 0;
+            let mut storage_db_list = storage_db.clone();
+            {
+                let now = std::time::Instant::now();
+                let iter = storage_db_list.list_iter().await;
+                if let Ok(mut iter) = iter {
+                    while let Some(l) = iter.next().await {
+                        if let Ok(mut l) = l {
+                            log::debug!("list: {:?}", StoredKey::from(l.name().to_vec()));
+                            if let Ok(mut l_iter) = l.iter::<OfflineMessageOptionType>().await {
+                                while let Some(msg) = l_iter.next().await {
+                                    if let Ok(Some(_)) = msg {
+                                        offline_message_count += 1;
+                                        if offline_message_count >= max_limit {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        offline_session_count += 1;
+                        if offline_session_count >= max_limit {
+                            break;
+                        }
+                    }
+                }
+                log::debug!("list_iter cost time: {:?}", now.elapsed());
+            }
+            let session_count = if session_count >= max_limit {
+                format!("{session_count}+")
+            } else {
+                format!("{session_count}")
+            };
+            let offline_session_count = if offline_session_count >= max_limit {
+                format!("{offline_session_count}+")
+            } else {
+                format!("{offline_session_count}")
+            };
+            let offline_message_count = if offline_message_count >= max_limit {
+                format!("{offline_message_count}+")
+            } else {
+                format!("{offline_message_count}")
+            };
+
+            let storage_info = storage_db.info().await.unwrap_or_default();
+
+            (session_count, offline_session_count, offline_message_count, storage_info)
+        }
+
+        let (session_count, offline_session_count, offline_message_count, storage_info) =
+            match tokio::time::timeout(Duration::from_secs(1), stats(&self.storage_db)).await {
+                Ok((session_count, offline_session_count, offline_message_count, storage_info)) => {
+                    (session_count, offline_session_count, offline_message_count, storage_info)
+                }
+                Err(_) => ("Elapsed".into(), "Elapsed".into(), "Elapsed".into(), serde_json::Value::Null),
+            };
 
         json!({
-            "session_count": map_count,
-            "offline_messages_count": list_count,
+            "session_count": session_count,
+            "offline_session_count": offline_session_count,
+            "offline_message_count": offline_message_count,
             "storage_info": storage_info
         })
     }
@@ -420,23 +454,30 @@ impl Handler for OfflineMessageHandler {
                     p
                 );
                 let list_stored_key = make_list_stored_key(s.id.to_string());
-                match self.storage_db.list(list_stored_key.as_ref(), None).await {
-                    Ok(offlines_list) => {
-                        let res = offlines_list
-                            .push_limit::<OfflineMessageOptionType>(
-                                &Some((s.id.client_id.clone(), f.clone(), (*p).clone())),
-                                s.listen_cfg().max_mqueue_len,
-                                true,
-                            )
-                            .await;
-                        if let Err(e) = res {
-                            log::warn!("{:?} save offline messages error, {:?}", s.id, e)
+                let storage_db = self.storage_db.clone();
+                let id = s.id.clone();
+                let max_mqueue_len = s.listen_cfg().max_mqueue_len;
+                let p = (*p).clone();
+                let f = f.clone();
+                tokio::spawn(async move {
+                    match storage_db.list(list_stored_key.as_ref(), None).await {
+                        Ok(offlines_list) => {
+                            let res = offlines_list
+                                .push_limit::<OfflineMessageOptionType>(
+                                    &Some((id.client_id.clone(), f, p)),
+                                    max_mqueue_len,
+                                    true,
+                                )
+                                .await;
+                            if let Err(e) = res {
+                                log::warn!("{id:?} save offline messages error, {e}")
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("{id:?} save offline messages error, {e}")
                         }
                     }
-                    Err(e) => {
-                        log::warn!("{:?} save offline messages error, {:?}", s.id, e)
-                    }
-                }
+                });
             }
 
             Parameter::OfflineInflightMessages(s, inflight_messages) => {
@@ -447,20 +488,26 @@ impl Handler for OfflineMessageHandler {
                 );
                 let map_stored_key = make_map_stored_key(s.id.to_string());
                 log::debug!("{:?} map_stored_key: {:?}", s.id, map_stored_key);
-                match self.storage_db.map(map_stored_key.as_ref(), None).await {
-                    Ok(m) => {
-                        if let Err(e) = m.insert(INFLIGHT_MESSAGES, inflight_messages).await {
-                            log::warn!("{:?} save offline inflight messages error, {:?}", s.id, e)
+
+                let storage_db = self.storage_db.clone();
+                let inflight_messages = inflight_messages.clone();
+                let id = s.id.clone();
+                tokio::spawn(async move {
+                    match storage_db.map(map_stored_key.as_ref(), None).await {
+                        Ok(m) => {
+                            if let Err(e) = m.insert(INFLIGHT_MESSAGES, &inflight_messages).await {
+                                log::warn!("{id:?} save offline inflight messages error, {e}")
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("{id:?} save offline inflight messages error, {e}")
                         }
                     }
-                    Err(e) => {
-                        log::warn!("{:?} save offline inflight messages error, {:?}", s.id, e)
-                    }
-                }
+                });
             }
 
             _ => {
-                log::error!("unimplemented, {:?}", param)
+                log::error!("unimplemented, {param:?}")
             }
         }
         (true, acc)
@@ -468,6 +515,7 @@ impl Handler for OfflineMessageHandler {
 }
 
 struct StorageHandler {
+    scx: ServerContext,
     storage_db: DefaultStorageDB,
     cfg: Arc<PluginConfig>,
     stored_session_infos: StoredSessionInfos,
@@ -476,15 +524,16 @@ struct StorageHandler {
 
 impl StorageHandler {
     fn new(
+        scx: ServerContext,
         storage_db: DefaultStorageDB,
         cfg: Arc<PluginConfig>,
         stored_session_infos: StoredSessionInfos,
         rebuild_tx: mpsc::Sender<RebuildChanType>,
     ) -> Self {
-        Self { storage_db, cfg, stored_session_infos, rebuild_tx }
+        Self { scx, storage_db, cfg, stored_session_infos, rebuild_tx }
     }
 
-    //Rebuild offline session.
+    //Rebuild offline sessions.
     async fn rebuild_offline_sessions(&self, rebuild_done_tx: oneshot::Sender<()>) {
         let mut offline_sessions_count = 0;
         for mut entry in self.stored_session_infos.iter_mut() {
@@ -492,18 +541,18 @@ impl StorageHandler {
             if let Some(stored) = storeds.iter_mut().next() {
                 let id = stored.basic.id.clone();
 
-                //get listener config
-                let listen_cfg = if let Some(listen_cfg) =
-                    id.local_addr.and_then(|addr| Runtime::instance().settings.listeners.get(addr.port()))
-                {
-                    listen_cfg
-                } else {
-                    log::warn!("tcp listener config is not found, local addr is {:?}", id.local_addr);
-                    continue;
-                };
+                let listen_cfg =
+                    if let Some(listen_cfg) = self.scx.listen_cfgs.get(&id.lid).map(|c| c.value().clone()) {
+                        listen_cfg
+                    } else {
+                        log::warn!("tcp listener config is not found, local addr is {:?}", id.local_addr);
+                        continue;
+                    };
+
+                log::info!("{id:?} listen_cfg: {listen_cfg:?}");
 
                 //create fitter
-                let fitter = Runtime::instance().extends.fitter_mgr().await.create(
+                let fitter = self.scx.extends.fitter_mgr().await.create(
                     stored.basic.conn_info.clone(),
                     id.clone(),
                     listen_cfg.clone(),
@@ -516,7 +565,7 @@ impl StorageHandler {
                     stored.last_time,
                 )
                 .await;
-                log::debug!("{:?} session_expiry_interval: {:?}", id, session_expiry_interval);
+                log::debug!("{id:?} session_expiry_interval: {session_expiry_interval:?}");
                 if session_expiry_interval <= 0 {
                     log::debug!(
                         "{:?} session is expiry, {:?}, id_key: {:?}, {:?}, {:?}",
@@ -528,11 +577,11 @@ impl StorageHandler {
                     );
                     let storage_db = self.storage_db.clone();
                     if let Err(e) = storage_db.map_remove(make_map_stored_key(stored.id_key.as_ref())).await {
-                        log::warn!("{:?} remove map error, {:?}", id, e);
+                        log::warn!("{id:?} remove map error, {e:?}");
                     }
                     if let Err(e) = storage_db.list_remove(make_list_stored_key(stored.id_key.as_ref())).await
                     {
-                        log::warn!("{:?} remove list error, {:?}", id, e);
+                        log::warn!("{id:?} remove list error, {e:?}");
                     }
                     //session is expiry
                     continue;
@@ -549,6 +598,7 @@ impl StorageHandler {
 
                 let session = match Session::new(
                     id.clone(),
+                    self.scx.clone(),
                     max_mqueue_len,
                     listen_cfg,
                     fitter,
@@ -568,7 +618,7 @@ impl StorageHandler {
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        log::warn!("rebuild session offline message error, create session error, {:?}", e);
+                        log::warn!("rebuild session offline message error, create session error, {e:?}");
                         continue;
                     }
                 };
@@ -576,13 +626,13 @@ impl StorageHandler {
                 let deliver_queue = session.deliver_queue();
                 for item in stored.offline_messages.drain(..) {
                     if let Err((f, p)) = deliver_queue.push(item) {
-                        log::warn!("rebuild session offline message error, deliver queue is full, from: {:?}, publish: {:?}", f, p);
+                        log::warn!("rebuild session offline message error, deliver queue is full, from: {f:?}, publish: {p:?}");
                     }
                 }
 
-                let inflight_win = session.inflight_win();
+                let out_inflight = session.out_inflight();
                 for item in stored.inflight_messages.drain(..) {
-                    inflight_win.write().await.push_back(item);
+                    out_inflight.write().await.push_back(item);
                 }
 
                 if let Err(e) = self
@@ -594,11 +644,11 @@ impl StorageHandler {
                     ))
                     .await
                 {
-                    log::error!("rebuild offline sessions error, {:?}", e);
+                    log::error!("rebuild offline sessions error, {e:?}");
                 }
             }
         }
-        log::info!("offline_sessions_count: {}", offline_sessions_count);
+        log::info!("offline_sessions_count: {offline_sessions_count}");
         let _ = self.rebuild_tx.clone().send(RebuildChanType::Done(rebuild_done_tx)).await;
     }
 }
@@ -618,7 +668,7 @@ impl Handler for StorageHandler {
                 let _ = rebuild_done_rx.await;
             }
             _ => {
-                log::error!("unimplemented, {:?}", param)
+                log::error!("unimplemented, {param:?}")
             }
         }
         (true, acc)

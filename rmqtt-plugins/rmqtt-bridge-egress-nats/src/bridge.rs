@@ -1,17 +1,20 @@
 use std::collections::HashSet;
+use std::convert::From as _;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_nats::{connect_with_options, header::HeaderMap, Client, ConnectOptions, ServerAddr, Subject};
 
-use rmqtt::{
-    anyhow::anyhow, bytestring::ByteString, futures::SinkExt, log, tokio, tokio::sync::mpsc,
-    tokio::sync::RwLock, DashMap,
-};
+use anyhow::anyhow;
+use bytestring::ByteString;
+use futures::SinkExt;
+use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 
 use rmqtt::{
-    broker::topic::{TopicTree, VecToTopic},
-    From, MqttError, NodeId, Publish, QoSEx, Result, Topic,
+    trie::{TopicTree, VecToTopic},
+    types::{DashMap, From, NodeId, Publish, Topic},
+    Result,
 };
 
 use crate::config::{Bridge, Entry, PluginConfig};
@@ -36,17 +39,17 @@ impl Producer {
         entry_idx: usize,
         node_id: NodeId,
     ) -> Result<Self> {
-        log::debug!("entry_idx: {}, node_id: {}", entry_idx, node_id);
+        log::debug!("entry_idx: {entry_idx}, node_id: {node_id}");
 
         let producer_name = if let Some(prefix) = &cfg.producer_name_prefix {
             format!("{}:{}:egress:{}:{}", prefix, cfg.name, node_id, entry_idx)
         } else {
             format!("{}:egress:{}:{}", cfg.name, node_id, entry_idx)
         };
-        log::debug!("producer_name: {}", producer_name);
+        log::debug!("producer_name: {producer_name}");
 
         let topic = cfg_entry.remote.topic.as_str();
-        log::debug!("topic: {}", topic);
+        log::debug!("topic: {topic}");
 
         let producer = Self::build_nats(&cfg, &producer_name).await?;
 
@@ -59,8 +62,12 @@ impl Producer {
 
     #[inline]
     async fn build_nats(cfg: &Bridge, producer_name: &str) -> Result<Client> {
-        let addrs =
-            cfg.servers.as_str().split(',').map(|url| url.parse()).collect::<Result<Vec<ServerAddr>, _>>()?;
+        let addrs = cfg
+            .servers
+            .as_str()
+            .split(',')
+            .map(|url| url.parse())
+            .collect::<std::result::Result<Vec<ServerAddr>, _>>()?;
         let mut opts = ConnectOptions::new();
         opts = opts.name(producer_name);
 
@@ -122,10 +129,10 @@ impl Producer {
             opts = opts.token(token.into());
         }
 
-        log::debug!("ConnectOptions: {:?}", opts);
+        log::debug!("ConnectOptions: {opts:?}");
         let client = connect_with_options(addrs, opts)
             .await
-            .map_err(|e| format!("Failed to connect to NATS, {}", e))?;
+            .map_err(|e| anyhow!(format!("Failed to connect to NATS, {}", e)))?;
         Ok(client)
     }
 
@@ -140,10 +147,10 @@ impl Producer {
             match cmd {
                 Command::Close => {
                     if let Err(e) = producer.flush().await {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                     }
                     if let Err(e) = producer.close().await {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                     }
                     break;
                 }
@@ -164,20 +171,21 @@ impl Producer {
 
                     //Not required to forward
                     if forward_all_publish {
-                        properties.insert("dup", if p.dup() { "true" } else { "false" });
-                        properties.insert("retain", if p.retain() { "true" } else { "false" });
-                        properties.insert("qos", p.qos().value().to_string());
-                        if let Some(packet_id) = p.packet_id() {
+                        properties.insert("dup", if p.dup { "true" } else { "false" });
+                        properties.insert("retain", if p.retain { "true" } else { "false" });
+                        properties.insert("qos", p.qos.value().to_string());
+                        if let Some(packet_id) = p.packet_id {
                             properties.insert("packet_id", packet_id.to_string());
                         }
                     }
 
                     //Must forward
-                    properties.insert("topic", p.topic().as_ref());
+                    properties.insert("topic", p.topic.as_ref());
 
-                    if let Err(e) = jetstream.publish_with_headers(topic.clone(), properties, p.payload).await
+                    if let Err(e) =
+                        jetstream.publish_with_headers(topic.clone(), properties, p.take_payload()).await
                     {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                     }
                 }
             }
@@ -224,7 +232,7 @@ impl BridgeManager {
                 continue;
             }
             if bridge_names.contains(&b_cfg.name as &str) {
-                return Err(MqttError::from(format!("The bridge name already exists! {:?}", b_cfg.name)));
+                return Err(anyhow!(format!("The bridge name already exists! {:?}", b_cfg.name)));
             }
 
             bridge_names.insert(&b_cfg.name);
@@ -246,9 +254,9 @@ impl BridgeManager {
     pub async fn stop(&mut self) {
         for mut entry in &mut self.sinks.iter_mut() {
             let ((bridge_name, entry_idx), producer) = entry.pair_mut();
-            log::debug!("stop bridge_name: {:?}, entry_idx: {:?}", bridge_name, entry_idx,);
+            log::debug!("stop bridge_name: {bridge_name:?}, entry_idx: {entry_idx:?}",);
             if let Err(e) = producer.tx.send(Command::Close).await {
-                log::error!("{:?}", e);
+                log::error!("{e:?}");
             }
         }
         self.sinks.clear();
@@ -264,12 +272,12 @@ impl BridgeManager {
         let topic = Topic::from_str(&p.topic)?;
         for (topic_filter, bridge_infos) in { self.topics.read().await.matches(&topic) }.iter() {
             let topic_filter = topic_filter.to_topic_filter();
-            log::debug!("topic_filter: {:?}", topic_filter);
-            log::debug!("bridge_infos: {:?}", bridge_infos);
+            log::debug!("topic_filter: {topic_filter:?}");
+            log::debug!("bridge_infos: {bridge_infos:?}");
             for (name, entry_idx) in bridge_infos {
                 if let Some(producer) = self.sinks.get(&(name.clone(), *entry_idx)) {
                     if let Err(e) = producer.send(f, p).await {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                     }
                 }
             }

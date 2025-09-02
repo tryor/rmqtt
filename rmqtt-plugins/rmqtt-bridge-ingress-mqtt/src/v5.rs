@@ -2,8 +2,11 @@ use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
+use futures::{channel::mpsc, StreamExt};
 use ntex::connect::rustls::TlsConnector;
 use ntex::connect::Connector;
 use ntex::time;
@@ -16,11 +19,10 @@ use ntex_mqtt::v5::codec::SubscribeAckReason;
 use ntex_mqtt::{self, v5};
 
 use rmqtt::{
-    futures::{channel::mpsc, StreamExt},
-    log,
-    ntex_mqtt::types::MQTT_LEVEL_5,
+    codec::types::MQTT_LEVEL_5,
+    types::{ClientId, NodeId, UserName},
+    Result,
 };
-use rmqtt::{ClientId, MqttError, NodeId, Result, UserName};
 
 use crate::bridge::{
     build_tls_connector, BridgeClient, BridgePublish, Command, CommandMailbox, OnMessageEvent,
@@ -35,15 +37,15 @@ enum MqttConnector {
 impl MqttConnector {
     async fn connect(&self) -> Result<v5::client::Client> {
         Ok(match self {
-            MqttConnector::Tcp(c) => c.connect().await.map_err(|e| MqttError::Anyhow(e.into()))?,
-            MqttConnector::Tls(c) => c.connect().await.map_err(|e| MqttError::Anyhow(e.into()))?,
+            MqttConnector::Tcp(c) => c.connect().await.map_err(|e| anyhow!(e))?,
+            MqttConnector::Tls(c) => c.connect().await.map_err(|e| anyhow!(e))?,
         })
     }
 }
 
 #[derive(Clone)]
 pub struct Client {
-    pub(crate) cfg: Rc<Bridge>,
+    pub(crate) cfg: Arc<Bridge>,
     pub(crate) server_addr: SocketAddr,
     pub(crate) entry_idx: usize,
     pub(crate) client_id: ClientId,
@@ -81,10 +83,10 @@ impl Client {
             format!("{}:{}:ingress:{}:{}:{}", cfg.client_id_prefix, cfg.name, node_id, entry_idx, client_no);
         let username = cfg.username.clone().unwrap_or("undefined".into());
 
-        let server_addr = cfg.server.addr.to_socket_addrs()?.next().ok_or_else(|| MqttError::from("None"))?;
+        let server_addr = cfg.server.addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("None"))?;
 
         let client = Self {
-            cfg: Rc::new(cfg),
+            cfg: Arc::new(cfg),
             server_addr,
             entry_idx,
             client_id: ClientId::from(client_id),
@@ -96,7 +98,7 @@ impl Client {
         };
 
         let mut builder = v5::client::MqttConnector::new(client.cfg.server.addr.clone())
-            .client_id(ByteString::from(client.client_id.as_ref()))
+            .client_id(ByteString::from(client.client_id.to_string()))
             .keep_alive(Seconds(client.cfg.keepalive.as_secs() as u16))
             .handshake_timeout(Seconds(client.cfg.connect_timeout.as_secs() as u16));
 
@@ -130,7 +132,8 @@ impl Client {
 
             ntex::rt::spawn(client.clone().cmd_loop(cmd_rx));
         } else {
-            unreachable!()
+            log::error!("unreachable!(), mqtt_ver: {:?}", client.cfg.mqtt_ver);
+            return Err(anyhow!("unreachable!()"));
         }
 
         Ok(CommandMailbox::new(client.client_id, cmd_tx))
@@ -171,7 +174,7 @@ impl Client {
                             sink.clone(),
                             topic_filter,
                             qos,
-                            ByteString::from(client.client_id.as_ref()),
+                            ByteString::from(client.client_id.to_string()),
                         ));
                     }
 
@@ -219,13 +222,10 @@ impl Client {
                                 | SubscribeAckReason::GrantedQos1
                                 | SubscribeAckReason::GrantedQos2
                         ) {
-                            log::info!("{} Successfully subscribed to {:?}", client_id, topic_filter,);
+                            log::info!("{client_id} Successfully subscribed to {topic_filter:?}",);
                         } else {
                             log::warn!(
-                                "{} Subscribe failure, topic_filter: {:?}, reason: {:?}",
-                                client_id,
-                                topic_filter,
-                                reason
+                                "{client_id} Subscribe failure, topic_filter: {topic_filter:?}, reason: {reason:?}"
                             );
                             time::sleep(Duration::from_secs(5)).await;
                             continue 'subscribe;
@@ -234,11 +234,11 @@ impl Client {
                     break;
                 }
                 Err(SendPacketError::Disconnected) => {
-                    log::info!("{} Subscribe error, Disconnected", client_id);
+                    log::info!("{client_id} Subscribe error, Disconnected");
                     break;
                 }
                 Err(e) => {
-                    log::info!("{} Subscribe error, {:?}", client_id, e);
+                    log::info!("{client_id} Subscribe error, {e:?}");
                     break;
                 }
             }
@@ -282,7 +282,7 @@ impl Client {
             }))
             .await
         {
-            log::error!("Start ev_loop error! {:?}", e);
+            log::error!("Start ev_loop error! {e:?}");
         }
     }
 }
@@ -293,7 +293,7 @@ struct Error;
 impl std::convert::TryFrom<Error> for v5::PublishAck {
     type Error = Error;
 
-    fn try_from(err: Error) -> Result<Self, Self::Error> {
+    fn try_from(err: Error) -> std::result::Result<Self, Self::Error> {
         Err(err)
     }
 }

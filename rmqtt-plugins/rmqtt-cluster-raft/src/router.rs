@@ -4,30 +4,28 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use once_cell::sync::OnceCell;
-use rmqtt_raft::{Error, Mailbox, Result as RaftResult, Store};
+use anyhow::anyhow;
+use async_trait::async_trait;
+use backoff::{future::retry, ExponentialBackoff};
+use rayon::prelude::*;
+use rust_box::task_exec_queue::{SpawnExt, TaskExecQueue};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
-use rmqtt::rust_box::task_exec_queue::SpawnExt;
 use rmqtt::{
-    ahash, anyhow, async_trait::async_trait, bincode, dashmap, log, once_cell, serde_json, timestamp_millis,
-    tokio, tokio::sync::RwLock,
-};
-use rmqtt::{
-    broker::{
-        default::DefaultRouter,
-        types::{
-            AllRelationsMap, ClientId, Id, IsOnline, NodeId, Route, SubRelationsMap, SubscriptionOptions,
-            TimestampMillis, Topic, TopicFilter, TopicName,
-        },
-        Router,
+    context::ServerContext,
+    router::{DefaultRouter, Router},
+    types::{
+        AllRelationsMap, ClientId, Id, IsOnline, NodeId, Route, SubRelationsMap, SubsSearchParams,
+        SubsSearchResult, SubscriptionOptions, TimestampMillis, Topic, TopicFilter, TopicName,
     },
-    stats::Counter,
-    MqttError, Result,
+    utils::{timestamp_millis, Counter},
+    Result,
 };
+use rmqtt_raft::{Error, Mailbox, Result as RaftResult, Store};
+use tokio::task::{block_in_place, spawn_blocking};
 
-use crate::task_exec_queue;
-
-use super::config::{retry, Compression, BACKOFF_STRATEGY};
+use super::config::Compression;
 use super::message::{Message, MessageReply};
 
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
@@ -53,30 +51,43 @@ impl ClientStatus {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ClusterRouter {
-    inner: &'static DefaultRouter,
+    inner: DefaultRouter,
+    add_exec: TaskExecQueue,
+    remove_exec: TaskExecQueue,
+    backoff_strategy: ExponentialBackoff,
     raft_mailbox: Arc<RwLock<Option<Mailbox>>>,
-    client_states: DashMap<ClientId, ClientStatus>,
+    client_states: Arc<DashMap<ClientId, ClientStatus>>,
     pub try_lock_timeout: Duration,
     compression: Option<Compression>,
 }
 
 impl ClusterRouter {
     #[inline]
-    pub(crate) fn get_or_init(try_lock_timeout: Duration, compression: Option<Compression>) -> &'static Self {
-        static INSTANCE: OnceCell<ClusterRouter> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self {
-            inner: DefaultRouter::instance(),
+    pub(crate) fn new(
+        scx: ServerContext,
+        backoff_strategy: ExponentialBackoff,
+        try_lock_timeout: Duration,
+        compression: Option<Compression>,
+    ) -> Self {
+        let add_exec = scx.get_exec("RAFT_ROUTER_ADD_EXEC");
+        let remove_exec = scx.get_exec("RAFT_ROUTER_REMOVE_EXEC");
+        Self {
+            inner: DefaultRouter::new(Some(scx)),
+            add_exec,
+            remove_exec,
+            backoff_strategy,
             raft_mailbox: Arc::new(RwLock::new(None)),
-            client_states: DashMap::default(),
+            client_states: Arc::new(DashMap::default()),
             try_lock_timeout,
             compression,
-        })
+        }
     }
 
     #[inline]
-    pub(crate) fn _inner(&self) -> Box<dyn Router> {
-        Box::new(self.inner)
+    pub(crate) fn _inner(&self) -> &DefaultRouter {
+        &self.inner
     }
 
     #[inline]
@@ -120,18 +131,30 @@ impl ClusterRouter {
 }
 
 #[async_trait]
-impl Router for &'static ClusterRouter {
+impl Router for ClusterRouter {
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
         log::debug!("[Router.add] topic_filter: {:?}, id: {:?}, opts: {:?}", topic_filter, id, opts);
 
-        let msg = Message::Add { topic_filter, id, opts }.encode()?;
-        let mailbox = self.raft_mailbox().await;
-        let _ = async move { mailbox.send_proposal(msg).await.map_err(anyhow::Error::new) }
-            .spawn(task_exec_queue())
-            .result()
-            .await
-            .map_err(|_| MqttError::from("Router::add(..), task execution failure"))??;
+        let mut add_res = None;
+        for _ in 0..3 {
+            let mailbox = self.raft_mailbox().await;
+            let msg = Message::Add { topic_filter, id: id.clone(), opts: opts.clone() }.encode()?;
+            let res = async move { mailbox.send_proposal(msg).await.map_err(anyhow::Error::new) }
+                .spawn(&self.add_exec)
+                .result()
+                .await
+                .map_err(|_| anyhow!("Router::add(..), task execution failure"));
+            add_res = Some(res);
+            match add_res.as_ref() {
+                Some(Ok(Ok(_))) => return Ok(()),
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    continue;
+                }
+            }
+        }
+        let _ = add_res.ok_or_else(|| anyhow!("unreachable!()"))???;
         Ok(())
     }
 
@@ -140,21 +163,23 @@ impl Router for &'static ClusterRouter {
         log::debug!("[Router.remove] topic_filter: {:?}, id: {:?}", topic_filter, id);
         let msg = Message::Remove { topic_filter, id: id.clone() }.encode()?;
         let raft_mailbox = self.raft_mailbox().await;
+        let exec = self.remove_exec.clone();
+        let backoff_strategy = self.backoff_strategy.clone();
         tokio::spawn(async move {
-            if let Err(e) = retry(BACKOFF_STRATEGY.clone(), || async {
+            if let Err(e) = retry(backoff_strategy, || async {
                 let msg = msg.clone();
                 let mailbox = raft_mailbox.clone();
                 let res = async move { mailbox.send_proposal(msg).await }
-                    .spawn(task_exec_queue())
+                    .spawn(&exec)
                     .result()
                     .await
-                    .map_err(|_| MqttError::from("Router::remove(..), task execution failure"))?
-                    .map_err(|e| MqttError::from(e.to_string()))?;
+                    .map_err(|_| anyhow!("Router::remove(..), task execution failure"))?
+                    .map_err(|e| anyhow!(e))?;
                 Ok(res)
             })
             .await
             {
-                log::warn!("[Router.remove] Failed to send Message::Remove, id: {:?}, {:?}", id, e);
+                log::warn!("[Router.remove] Failed to send Message::Remove, id: {id:?}, {e:?}");
             }
         });
         Ok(true)
@@ -179,6 +204,11 @@ impl Router for &'static ClusterRouter {
     #[inline]
     async fn get(&self, topic: &str) -> Result<Vec<Route>> {
         self.inner.get(topic).await
+    }
+
+    #[inline]
+    async fn query_subscriptions(&self, q: &SubsSearchParams) -> Vec<SubsSearchResult> {
+        self.inner.query_subscriptions(q).await
     }
 
     #[inline]
@@ -223,13 +253,13 @@ impl Router for &'static ClusterRouter {
 }
 
 #[async_trait]
-impl Store for &'static ClusterRouter {
+impl Store for ClusterRouter {
     async fn apply(&mut self, message: &[u8]) -> RaftResult<Vec<u8>> {
         log::debug!("apply, message.len: {:?}", message.len());
         let message: Message = bincode::deserialize(message).map_err(|e| Error::Other(e))?;
         match message {
             Message::HandshakeTryLock { id } => {
-                log::debug!("[Router.HandshakeTryLock] id: {:?}", id);
+                log::debug!("[Router.HandshakeTryLock] id: {id:?}");
                 let mut try_lock_ok = false;
                 let mut prev_id = None;
                 self.client_states
@@ -246,10 +276,7 @@ impl Store for &'static ClusterRouter {
                         ClientStatus::new(id.clone(), false, true)
                     });
                 log::debug!(
-                    "[Router.HandshakeTryLock] id: {:?}, try_lock_ok: {}, prev_id: {:?}",
-                    id,
-                    try_lock_ok,
-                    prev_id
+                    "[Router.HandshakeTryLock] id: {id:?}, try_lock_ok: {try_lock_ok}, prev_id: {prev_id:?}"
                 );
                 return if try_lock_ok {
                     Ok(MessageReply::HandshakeTryLock(prev_id).encode().map_err(|_e| Error::Unknown)?)
@@ -260,22 +287,22 @@ impl Store for &'static ClusterRouter {
                 };
             }
             Message::Connected { id } => {
-                log::debug!("[Router.Connected] id: {:?}", id);
+                log::debug!("[Router.Connected] id: {id:?}");
                 let mut reply = None;
                 self.client_states.entry(id.client_id.clone()).and_modify(|status| {
                     if status.id != id && id.create_time < status.id.create_time {
-                        log::info!("[Router.Connected] id not the same, input id: {:?}, current status: {:?}", id, status);
+                        log::info!("[Router.Connected] id not the same, input id: {id:?}, current status: {status:?}");
                         reply = Some(MessageReply::Error("id not the same".into()));
                     } else {
                         if id.create_time > status.id.create_time {
-                            log::info!("[Router.Connected] id.create_time > status.id.create_time, input id: {:?}, current status: {:?}", id, status);
+                            log::info!("[Router.Connected] id.create_time > status.id.create_time, input id: {id:?}, current status: {status:?}");
                         }
                         status.id = id.clone();
                         status.online = true;
                         status.handshaking = false;
                     }
                 }).or_insert_with(|| {
-                    log::debug!("[Router.Connected] id: {:?}, Not found", id);
+                    log::debug!("[Router.Connected] id: {id:?}, Not found");
                     ClientStatus::new(id, true, false)
                 });
                 if let Some(reply) = reply {
@@ -283,27 +310,25 @@ impl Store for &'static ClusterRouter {
                 }
             }
             Message::Disconnected { id } => {
-                log::debug!("[Router.Disconnected] id: {:?}", id,);
+                log::debug!("[Router.Disconnected] id: {id:?}",);
                 if let Some(mut entry) = self.client_states.get_mut(&id.client_id) {
                     let status = entry.value_mut();
                     if status.id != id {
                         log::debug!(
-                            "[Router.Disconnected] id not the same, input id: {:?}, current status: {:?}",
-                            id,
-                            status
+                            "[Router.Disconnected] id not the same, input id: {id:?}, current status: {status:?}"
                         );
                     } else {
                         status.online = false;
                     }
                 } else {
-                    log::info!("[Router.Disconnected] id: {:?}, Not found", id);
+                    log::info!("[Router.Disconnected] id: {id:?}, Not found");
                 }
             }
             Message::SessionTerminated { id } => {
-                log::debug!("[Router.SessionTerminated] id: {:?}", id,);
+                log::debug!("[Router.SessionTerminated] id: {id:?}",);
                 self.client_states.remove_if(&id.client_id, |_, status| {
                     if status.id != id {
-                        log::debug!("[Router.SessionTerminated] id not the same, input id: {:?}, current status: {:?}", id, status);
+                        log::debug!("[Router.SessionTerminated] id not the same, input id: {id:?}, current status: {status:?}");
                         false
                     } else {
                         true
@@ -311,12 +336,12 @@ impl Store for &'static ClusterRouter {
                 });
             }
             Message::Add { topic_filter, id, opts } => {
-                log::debug!("[Router.add] topic_filter: {:?}, id: {:?}, opts: {:?}", topic_filter, id, opts);
-                self.inner.add(topic_filter, id, opts).await.map_err(|e| Error::Other(Box::new(e)))?;
+                log::debug!("[Router.add] topic_filter: {topic_filter:?}, id: {id:?}, opts: {opts:?}");
+                self.inner.add(topic_filter, id, opts).await?;
             }
             Message::Remove { topic_filter, id } => {
-                log::debug!("[Router.remove] topic_filter: {:?}, id: {:?}", topic_filter, id,);
-                self.inner.remove(topic_filter, id).await.map_err(|e| Error::Other(Box::new(e)))?;
+                log::debug!("[Router.remove] topic_filter: {topic_filter:?}, id: {id:?}",);
+                self.inner.remove(topic_filter, id).await?;
             }
             Message::GetClientNodeId { client_id } => {
                 let node_id = self._client_node_id(client_id);
@@ -339,7 +364,7 @@ impl Store for &'static ClusterRouter {
                 return Ok(data);
             }
             _ => {
-                log::error!("unimplemented, query: {:?}", query)
+                log::error!("unimplemented, query: {query:?}")
             }
         }
         Ok(Vec::new())
@@ -348,130 +373,194 @@ impl Store for &'static ClusterRouter {
     async fn snapshot(&self) -> RaftResult<Vec<u8>> {
         log::debug!("create snapshot ...");
         let now = std::time::Instant::now();
-        let relations = &self
-            .inner
-            .relations
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect::<Vec<_>>();
-        let client_states = &self
-            .client_states
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect::<Vec<_>>();
 
-        let topics_count = &self.inner.topics_count;
-        let relations_count = &self.inner.relations_count;
-
-        let snapshot = bincode::serialize(&(relations, client_states, topics_count, relations_count))
-            .map_err(|e| Error::Other(e))?;
-        log::info!(
-            "create snapshot, len: {},  topics_count: {:?}, relations_count: {:?}, cost time: {:?}",
-            snapshot.len(),
-            topics_count,
-            relations_count,
-            now.elapsed()
-        );
-
-        let now = std::time::Instant::now();
-        let compressed = match self.compression {
-            Some(Compression::Zstd) => zstd::encode_all(&*snapshot, 1)?,
-            Some(Compression::Lz4) => {
-                use lz4_flex::block::compress_prepend_size;
-                compress_prepend_size(&snapshot)
-            }
-            Some(Compression::Zlib) => {
-                use flate2::write::ZlibEncoder;
-                let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-                e.write_all(&snapshot)?;
-                e.finish()?
-            }
-            Some(Compression::Snappy) => {
-                use snap::write;
-                let mut wtr = write::FrameEncoder::new(vec![]);
-                wtr.write_all(&snapshot)?;
-                wtr.into_inner().map_err(|e| Error::Anyhow(e.into()))?
-            }
-            None => snapshot,
+        let compress = |compression: Option<Compression>, data: Vec<u8>| -> RaftResult<Vec<u8>> {
+            let compressed = match compression {
+                Some(Compression::Zstd) => zstd::encode_all(&*data, 1)?,
+                Some(Compression::Lz4) => {
+                    use lz4_flex::block::compress_prepend_size;
+                    compress_prepend_size(&data)
+                }
+                Some(Compression::Zlib) => {
+                    use flate2::write::ZlibEncoder;
+                    let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&data)?;
+                    e.finish()?
+                }
+                Some(Compression::Snappy) => {
+                    use snap::write;
+                    let mut wtr = write::FrameEncoder::new(vec![]);
+                    wtr.write_all(&data)?;
+                    wtr.into_inner().map_err(|e| Error::Anyhow(e.into()))?
+                }
+                None => data,
+            };
+            Ok(compressed)
         };
 
-        if self.compression.is_some() {
-            log::info!(
-                "create snapshot, compressed({:?}) len: {}, cost time: {:?}",
-                self.compression,
-                compressed.len(),
-                now.elapsed()
-            );
-        }
+        let encode_with_length_prefix = |data: &[u8], out: &mut Vec<u8>| {
+            let len = data.len();
+            out.extend(&len.to_le_bytes());
+            out.extend(data);
+        };
 
-        Ok(compressed)
+        let compression = self.compression;
+        let relations = self.inner.relations.clone();
+        let client_states = self.client_states.clone();
+        let topics_count = self.inner.topics_count.clone();
+        let relations_count = self.inner.relations_count.clone();
+        let snapshot: Vec<u8> = spawn_blocking(move || {
+            let relations = relations
+                .iter()
+                .par_bridge()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect::<Vec<_>>();
+
+            let client_states = client_states
+                .iter()
+                .par_bridge()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect::<Vec<_>>();
+
+            let (relations_bin, client_states_bin) = rayon::join(
+                || bincode::serialize(&relations).map(|data| compress(compression, data)),
+                || bincode::serialize(&client_states).map(|data| compress(compression, data)),
+            );
+            let relations_bin = relations_bin??;
+            let client_states_bin = client_states_bin??;
+            let topics_count_bin = bincode::serialize(&topics_count.as_ref())?;
+            let relations_count_bin = bincode::serialize(&relations_count.as_ref())?;
+
+            let mut snapshot = Vec::new();
+            encode_with_length_prefix(&relations_bin, &mut snapshot);
+            encode_with_length_prefix(&client_states_bin, &mut snapshot);
+            encode_with_length_prefix(&topics_count_bin, &mut snapshot);
+            encode_with_length_prefix(&relations_count_bin, &mut snapshot);
+
+            Ok(snapshot)
+        })
+        .await
+        .map_err(|e| Error::Anyhow(e.into()))?
+        .map_err(|e: Error| Error::Anyhow(e.into()))?;
+
+        log::info!("create snapshot, len: {}, cost time: {:?}", snapshot.len(), now.elapsed());
+
+        Ok(snapshot)
     }
 
     async fn restore(&mut self, snapshot: &[u8]) -> RaftResult<()> {
         log::info!("restore, snapshot.len: {}", snapshot.len());
         let now = std::time::Instant::now();
-
-        let uncompressed = match self.compression {
-            Some(Compression::Zstd) => Cow::Owned(zstd::decode_all(snapshot)?),
-            Some(Compression::Lz4) => {
-                use lz4_flex::block::decompress_size_prepended;
-                let buf = decompress_size_prepended(snapshot).map_err(|e| Error::Other(Box::new(e)))?;
-                Cow::Owned(buf)
-            }
-            Some(Compression::Zlib) => {
-                use flate2::bufread::ZlibDecoder;
-                let mut z = ZlibDecoder::new(snapshot);
-                let mut buf = Vec::new();
-                z.read_to_end(&mut buf)?;
-                Cow::Owned(buf)
-            }
-            Some(Compression::Snappy) => {
-                let mut buf = Vec::new();
-                snap::read::FrameDecoder::new(snapshot).read_to_end(&mut buf)?;
-                Cow::Owned(buf)
-            }
-            None => Cow::Borrowed(snapshot),
-        };
-
-        if self.compression.is_some() {
-            log::info!(
-                "restore, uncompressed({:?}) len: {}, cost time: {:?}",
-                self.compression,
-                uncompressed.len(),
-                now.elapsed()
-            );
+        let compression = self.compression;
+        fn uncompress(compression: Option<Compression>, data: &[u8]) -> Result<Cow<[u8]>> {
+            let uncompr = match compression {
+                Some(Compression::Zstd) => Cow::Owned(zstd::decode_all(data)?),
+                Some(Compression::Lz4) => {
+                    use lz4_flex::block::decompress_size_prepended;
+                    let buf = decompress_size_prepended(data).map_err(|e| Error::Other(Box::new(e)))?;
+                    Cow::Owned(buf)
+                }
+                Some(Compression::Zlib) => {
+                    use flate2::bufread::ZlibDecoder;
+                    let mut z = ZlibDecoder::new(data);
+                    let mut buf = Vec::new();
+                    z.read_to_end(&mut buf)?;
+                    Cow::Owned(buf)
+                }
+                Some(Compression::Snappy) => {
+                    let mut buf = Vec::new();
+                    snap::read::FrameDecoder::new(data).read_to_end(&mut buf)?;
+                    Cow::Owned(buf)
+                }
+                None => Cow::Borrowed(data),
+            };
+            Ok(uncompr)
         }
 
-        let now = std::time::Instant::now();
-        let (relations, client_states, topics_count, relations_count): (
-            Vec<(TopicFilter, HashMap<ClientId, (Id, SubscriptionOptions)>)>,
-            Vec<(ClientId, ClientStatus)>,
-            Counter,
-            Counter,
-        ) = bincode::deserialize(uncompressed.as_ref()).map_err(|e| Error::Other(e))?;
+        fn decode_with_length_prefix<T: serde::de::DeserializeOwned>(
+            snapshot: &[u8],
+            start: usize,
+            len: usize,
+            uncompress_enable: bool,
+            compression: Option<Compression>,
+        ) -> Result<T> {
+            let slice = &snapshot[start..start + len];
+            if uncompress_enable {
+                let slice = uncompress(compression, slice)?;
+                Ok(bincode::deserialize(slice.as_ref())?)
+            } else {
+                Ok(bincode::deserialize(slice)?)
+            }
+        }
+
+        let read_len = |snapshot: &[u8], start: usize| -> Result<usize> {
+            let slice = &snapshot[start..start + size_of::<usize>()];
+            Ok(usize::from_le_bytes(slice.try_into()?))
+        };
+
+        let res: Result<_> = block_in_place(move || {
+            let relations_len = read_len(snapshot, 0)?;
+            let relations_start = size_of::<usize>();
+
+            let client_states_len = read_len(snapshot, relations_start + relations_len)?;
+            let client_states_start = size_of::<usize>() + relations_start + relations_len;
+
+            //topics_count, relations_count
+            let topics_count_len = read_len(snapshot, client_states_start + client_states_len)?;
+            let topics_count_start = size_of::<usize>() + client_states_start + client_states_len;
+
+            let relations_count_len = read_len(snapshot, topics_count_start + topics_count_len)?;
+            let relations_count_start = size_of::<usize>() + topics_count_start + topics_count_len;
+
+            let (relations, client_states) = rayon::join(
+                || decode_with_length_prefix(snapshot, relations_start, relations_len, true, compression),
+                || {
+                    decode_with_length_prefix(
+                        snapshot,
+                        client_states_start,
+                        client_states_len,
+                        true,
+                        compression,
+                    )
+                },
+            );
+            let relations: Vec<(TopicFilter, HashMap<ClientId, (Id, SubscriptionOptions)>)> = relations?;
+            let client_states: Vec<(ClientId, ClientStatus)> = client_states?;
+            let topics_count: Counter =
+                decode_with_length_prefix(snapshot, topics_count_start, topics_count_len, false, None)?;
+            let relations_count: Counter =
+                decode_with_length_prefix(snapshot, relations_count_start, relations_count_len, false, None)?;
+
+            log::info!("relations: {:?}", relations.len());
+            log::info!("client_states: {:?}", client_states.len());
+            log::info!("topics_count: {topics_count:?}",);
+            log::info!("relations_count: {relations_count:?}");
+
+            Ok((relations, client_states, topics_count, relations_count))
+        });
+
+        let (relations, client_states, topics_count, relations_count) = res?;
 
         self.inner.topics_count.set(&topics_count);
-
         let mut topics = self.inner.topics.write().await;
         self.inner.relations.clear();
         for (topic_filter, relation) in relations {
-            let topic = Topic::from_str(&topic_filter).map_err(|e| Error::Msg(format!("{:?}", e)))?;
+            let topic = Topic::from_str(&topic_filter).map_err(|e| Error::Msg(format!("{e:?}")))?;
             self.inner.relations.insert(topic_filter, relation);
             topics.insert(&topic, ());
         }
-        self.inner.relations_count.set(&relations_count);
 
+        self.inner.relations_count.set(&relations_count);
         self.client_states.clear();
         for (client_id, content) in client_states {
             self.client_states.insert(client_id, content);
         }
 
         log::info!(
-            "restore, topics_count: {:?}, relations_count: {:?}, cost time: {:?}",
-            topics_count,
-            relations_count,
+            "restore, topics_count: {topics_count:?}, relations_count: {relations_count:?}, cost time: {:?}",
             now.elapsed()
         );
+
         Ok(())
     }
 }

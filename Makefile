@@ -1,8 +1,8 @@
 all: release-docker
 
-release-docker:
-	docker build --no-cache -t rmqtt/rmqtt:$$(git describe --tags $$(git rev-list --tags --max-count=1)) ./
-	docker build --no-cache -t rmqtt/rmqtt:latest ./
+# release-docker:
+# 	docker build --no-cache -t rmqtt/rmqtt:$$(git describe --tags $$(git rev-list --tags --max-count=1)) ./
+# 	docker build --no-cache -t rmqtt/rmqtt:latest ./
 
 release-amd64:
 	git checkout $$(git describe --tags $$(git rev-list --tags --max-count=1))

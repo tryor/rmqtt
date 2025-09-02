@@ -2,23 +2,19 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use anyhow::anyhow;
+use bytestring::ByteString;
 use rdkafka::config::{ClientConfig as KafkaClientConfig, RDKafkaLogLevel};
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rust_box::task_exec_queue::{Builder, SpawnExt, TaskExecQueue};
+use tokio::sync::RwLock;
 
-use rmqtt::anyhow::anyhow;
-use rmqtt::bytestring::ByteString;
-use rmqtt::rust_box::task_exec_queue::SpawnExt;
 use rmqtt::{
-    broker::topic::{TopicTree, VecToTopic},
-    timestamp_millis, From, MqttError, NodeId, Publish, QoSEx, Result, Topic,
-};
-use rmqtt::{
-    itoa, log, rand,
-    rust_box::task_exec_queue::{Builder, TaskExecQueue},
-    tokio,
-    tokio::sync::RwLock,
-    DashMap,
+    trie::{TopicTree, VecToTopic},
+    types::{DashMap, From, NodeId, Publish, Topic},
+    utils::timestamp_millis,
+    Result,
 };
 
 use crate::config::{Bridge, Entry, PluginConfig};
@@ -61,7 +57,7 @@ impl Producer {
 
         for (key, val) in &cfg.properties {
             if !key.trim_start().starts_with('#') {
-                log::info!("{}={}", key, val);
+                log::info!("{key}={val}");
                 client_cfg.set(key, val);
             }
         }
@@ -83,22 +79,26 @@ impl Producer {
         headers = headers.insert(Header { key: "from_clientid", value: Some(f.client_id.as_str()) });
         headers = headers.insert(Header { key: "from_username", value: Some(f.username_ref()) });
 
-        headers = headers.insert(Header { key: "dup", value: Some(p.dup().as_str()) });
-        headers = headers.insert(Header { key: "retain", value: Some(p.retain().as_str()) });
+        headers = headers.insert(Header { key: "dup", value: Some(p.dup.as_str()) });
+        headers = headers.insert(Header { key: "retain", value: Some(p.retain.as_str()) });
         headers =
-            headers.insert(Header { key: "qos", value: Some(itoa::Buffer::new().format(p.qos().value())) });
-        if let Some(packet_id) = p.packet_id() {
-            headers = headers
-                .insert(Header { key: "packet_id", value: Some(itoa::Buffer::new().format(packet_id)) });
+            headers.insert(Header { key: "qos", value: Some(itoa::Buffer::new().format(p.qos.value())) });
+        if let Some(packet_id) = p.packet_id {
+            headers = headers.insert(Header {
+                key: "packet_id",
+                value: Some(itoa::Buffer::new().format(packet_id.get())),
+            });
         }
-        headers =
-            headers.insert(Header { key: "ts", value: Some(itoa::Buffer::new().format(p.create_time())) });
+        if let Some(create_time) = p.create_time {
+            headers =
+                headers.insert(Header { key: "ts", value: Some(itoa::Buffer::new().format(create_time)) });
+        }
         headers = headers
             .insert(Header { key: "time", value: Some(itoa::Buffer::new().format(timestamp_millis())) });
-        headers = headers.insert(Header { key: "topic", value: Some(p.topic().as_str()) });
+        headers = headers.insert(Header { key: "topic", value: Some(p.topic.as_str()) });
 
         let topic = self.cfg_entry.remote.make_topic(&p.topic);
-        let payload = p.payload().clone();
+        let payload = p.payload.clone();
         let queue_timeout = self.cfg_entry.remote.queue_timeout;
         let partition = self.cfg_entry.remote.partition;
         let name = self.cfg.name.clone();
@@ -115,10 +115,10 @@ impl Producer {
             let delivery_status = producer.send(frecord, queue_timeout).await;
             match delivery_status {
                 Ok((partition, offset)) => {
-                    log::debug!("{} delivery ok, partition: {}, offset: {}", name, partition, offset);
+                    log::debug!("{name} delivery ok, partition: {partition}, offset: {offset}");
                 }
                 Err((e, msg)) => {
-                    log::error!("{} delivery error: {:?}, message: {:?}", name, e, msg);
+                    log::error!("{name} delivery error: {e:?}, message: {msg:?}");
                 }
             };
         }
@@ -179,7 +179,7 @@ impl BridgeManager {
                 continue;
             }
             if bridge_names.contains(&b_cfg.name as &str) {
-                return Err(MqttError::from(format!("The bridge name already exists! {:?}", b_cfg.name)));
+                return Err(anyhow!(format!("The bridge name already exists! {:?}", b_cfg.name)));
             }
 
             bridge_names.insert(&b_cfg.name);
@@ -210,10 +210,7 @@ impl BridgeManager {
             let ((bridge_name, entry_idx), producers) = entry.pair_mut();
             for (client_no, _producer) in producers.iter_mut().enumerate() {
                 log::debug!(
-                    "stop bridge_name: {:?}, entry_idx: {:?}, client_no: {:?}",
-                    bridge_name,
-                    entry_idx,
-                    client_no
+                    "stop bridge_name: {bridge_name:?}, entry_idx: {entry_idx:?}, client_no: {client_no:?}"
                 );
             }
         }
@@ -231,14 +228,14 @@ impl BridgeManager {
         let rnd = rand::random::<u64>() as usize;
         for (topic_filter, bridge_infos) in { self.topics.read().await.matches(&topic) }.iter() {
             let topic_filter = topic_filter.to_topic_filter();
-            log::debug!("topic_filter: {:?}", topic_filter);
-            log::debug!("bridge_infos: {:?}", bridge_infos);
+            log::debug!("topic_filter: {topic_filter:?}");
+            log::debug!("bridge_infos: {bridge_infos:?}");
             for (name, entry_idx) in bridge_infos {
                 if let Some(producers) = self.sinks.get(&(name.clone(), *entry_idx)) {
                     let client_no = rnd % producers.len();
                     if let Some(producer) = producers.get(client_no) {
                         if let Err(e) = producer.send(&self.exec, f, p).await {
-                            log::warn!("{}", e);
+                            log::warn!("{e}");
                         }
                     }
                 }

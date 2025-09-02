@@ -1,40 +1,43 @@
-use itertools::Itertools;
-use once_cell::sync::OnceCell;
+use anyhow::anyhow;
 use std::time::Duration;
 
-use rmqtt::{async_trait::async_trait, itertools, log, once_cell, serde_json};
+use async_trait::async_trait;
+use itertools::Itertools;
+
+use rmqtt::context::ServerContext;
+use rmqtt::types::{SubsSearchParams, SubsSearchResult};
+use rmqtt::utils::Counter;
 use rmqtt::{
-    broker::{
-        default::DefaultRouter,
-        types::{AllRelationsMap, Id, NodeId, Route, SubRelationsMap, SubscriptionOptions, TopicName},
-        Router,
-    },
     grpc::{GrpcClients, Message, MessageBroadcaster, MessageReply, MessageSender, MessageType},
-    stats::Counter,
-    HashMap, Result, TopicFilter,
+    router::{DefaultRouter, Router},
+    types::{
+        AllRelationsMap, HashMap, Id, NodeId, Route, SubRelationsMap, SubscriptionOptions, TopicFilter,
+        TopicName,
+    },
+    Result,
 };
 
+#[derive(Clone)]
 pub(crate) struct ClusterRouter {
-    inner: &'static DefaultRouter,
+    inner: DefaultRouter,
     grpc_clients: GrpcClients,
     message_type: MessageType,
 }
 
 impl ClusterRouter {
     #[inline]
-    pub(crate) fn get_or_init(grpc_clients: GrpcClients, message_type: MessageType) -> &'static Self {
-        static INSTANCE: OnceCell<ClusterRouter> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self { inner: DefaultRouter::instance(), grpc_clients, message_type })
+    pub(crate) fn new(scx: ServerContext, grpc_clients: GrpcClients, message_type: MessageType) -> Self {
+        Self { inner: DefaultRouter::new(Some(scx)), grpc_clients, message_type }
     }
 
     #[inline]
-    pub(crate) fn _inner(&self) -> &'static DefaultRouter {
-        self.inner
+    pub(crate) fn _inner(&self) -> &DefaultRouter {
+        &self.inner
     }
 }
 
 #[async_trait]
-impl Router for &'static ClusterRouter {
+impl Router for ClusterRouter {
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
         self.inner.add(topic_filter, id, opts).await
@@ -73,9 +76,11 @@ impl Router for &'static ClusterRouter {
                         routes.extend(ress);
                     }
                     Err(e) => {
-                        log::warn!("gets, error: {:?}", e);
+                        log::warn!("gets, error: {e:?}");
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        log::error!("unreachable!(), reply: {reply:?}");
+                    }
                 };
             } else {
                 break;
@@ -99,12 +104,20 @@ impl Router for &'static ClusterRouter {
         .into_iter()
         .map(|(_, replys)| match replys {
             Ok(MessageReply::RoutesGetBy(routes)) => Ok(routes),
-            Ok(_) => unreachable!(),
+            Ok(_) => {
+                log::error!("unreachable!(), replys: {replys:?}");
+                Err(anyhow!("unreachable!()"))
+            }
             Err(e) => Err(e),
         })
         .collect::<Result<Vec<_>>>()?;
         replys.push(routes);
         Ok(replys.into_iter().flatten().unique().collect())
+    }
+
+    #[inline]
+    async fn query_subscriptions(&self, q: &SubsSearchParams) -> Vec<SubsSearchResult> {
+        self.inner.query_subscriptions(q).await
     }
 
     #[inline]

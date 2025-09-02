@@ -1,22 +1,21 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use anyhow::anyhow;
+use bytes::Bytes;
+use itertools::Itertools;
 use pulsar::consumer::{DeadLetterPolicy, InitialPosition};
 use pulsar::ConsumerOptions;
-use serde::de::{self, Deserialize, Deserializer};
-use serde::ser::{Serialize, Serializer};
+use regex::Regex;
+use serde::de::{self, Deserializer};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+use serde_json::{self, json};
 
-use rmqtt::itertools::Itertools;
 use rmqtt::{
-    anyhow,
-    bytes::Bytes,
-    log,
-    regex::Regex,
-    serde_json::{self, json},
-};
-use rmqtt::{
-    settings::{deserialize_duration, deserialize_duration_option},
-    MqttError, QoS, QoSEx, Result, TopicName,
+    types::{QoS, TopicName},
+    utils::{deserialize_duration, deserialize_duration_option},
+    Result,
 };
 
 use crate::bridge::BridgeName;
@@ -86,12 +85,14 @@ pub struct Auth {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AuthName {
     Token,
     OAuth2,
 }
 
 #[derive(Default, Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PayloadFormat {
     #[default]
     Bytes,
@@ -109,7 +110,7 @@ impl PayloadData {
     pub fn bytes(self) -> Result<Bytes> {
         match self {
             PayloadData::Bytes(data) => Ok(data),
-            PayloadData::Json(v) => serde_json::to_vec(&v).map(Bytes::from).map_err(MqttError::from),
+            PayloadData::Json(v) => serde_json::to_vec(&v).map(Bytes::from).map_err(|e| anyhow!(e)),
         }
     }
 
@@ -124,7 +125,7 @@ impl PayloadData {
                         serde_json::Value::Null => None,
                         serde_json::Value::String(s) => Some(Ok(Bytes::from(s))),
                         payload => {
-                            Some(serde_json::to_vec(&payload).map(Bytes::from).map_err(MqttError::from))
+                            Some(serde_json::to_vec(&payload).map(Bytes::from).map_err(|e| anyhow!(e)))
                         }
                     })
                 } else {
@@ -132,7 +133,7 @@ impl PayloadData {
                         serde_json::Value::Null => None,
                         serde_json::Value::String(s) => Some(Ok(Bytes::from(s))),
                         payload => {
-                            Some(serde_json::to_vec(&payload).map(Bytes::from).map_err(MqttError::from))
+                            Some(serde_json::to_vec(&payload).map(Bytes::from).map_err(|e| anyhow!(e)))
                         }
                     }
                 };
@@ -197,7 +198,7 @@ pub struct Remote {
 }
 
 impl Remote {
-    pub fn deserialize_payload_path<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    pub fn deserialize_payload_path<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -214,7 +215,9 @@ impl Remote {
         Ok(payload_path)
     }
 
-    pub fn deserialize_subscription_type<'de, D>(deserializer: D) -> Result<Option<pulsar::SubType>, D::Error>
+    pub fn deserialize_subscription_type<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<pulsar::SubType>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -232,7 +235,7 @@ impl Remote {
     pub fn serialize_subscription_type<S>(
         sub_type: &Option<pulsar::SubType>,
         serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -248,12 +251,12 @@ impl Remote {
 
     pub fn deserialize_dead_letter_policy<'de, D>(
         deserializer: D,
-    ) -> Result<Option<DeadLetterPolicy>, D::Error>
+    ) -> std::result::Result<Option<DeadLetterPolicy>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let json_val: serde_json::Value = serde_json::Value::deserialize(deserializer)?;
-        log::debug!("DeadLetterPolicy json_val: {:?}", json_val);
+        log::debug!("DeadLetterPolicy json_val: {json_val:?}");
         if let Some(obj) = json_val.as_object() {
             let max_redeliver_count =
                 obj.get("max_redeliver_count").and_then(|v| v.as_u64().map(|v| v as usize));
@@ -263,7 +266,7 @@ impl Remote {
             {
                 Ok(Some(DeadLetterPolicy { max_redeliver_count, dead_letter_topic }))
             } else {
-                Err(de::Error::custom(format!("Invalid DeadLetterPolicy, {:?}", json_val)))
+                Err(de::Error::custom(format!("Invalid DeadLetterPolicy, {json_val:?}")))
             }
         } else {
             Ok(None)
@@ -274,7 +277,7 @@ impl Remote {
     pub fn serialize_dead_letter_policy<S>(
         policy: &Option<DeadLetterPolicy>,
         serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -289,12 +292,12 @@ impl Remote {
         .serialize(serializer)
     }
 
-    pub fn deserialize_options<'de, D>(deserializer: D) -> Result<ConsumerOptions, D::Error>
+    pub fn deserialize_options<'de, D>(deserializer: D) -> std::result::Result<ConsumerOptions, D::Error>
     where
         D: Deserializer<'de>,
     {
         let json_val: serde_json::Value = serde_json::Value::deserialize(deserializer)?;
-        log::debug!("ConsumerOptions json_val: {:?}", json_val);
+        log::debug!("ConsumerOptions json_val: {json_val:?}");
         if let Some(obj) = json_val.as_object() {
             let priority_level = obj.get("priority_level").and_then(|v| v.as_i64().map(|v| v as i32));
             let durable = obj.get("durable").and_then(|v| v.as_bool());
@@ -303,7 +306,7 @@ impl Remote {
                 match v.to_lowercase().as_str() {
                     "latest" => Ok(InitialPosition::Latest),
                     "earliest" => Ok(InitialPosition::Earliest),
-                    _ => Err(de::Error::custom(format!("Invalid InitialPosition, {:?}", v))),
+                    _ => Err(de::Error::custom(format!("Invalid InitialPosition, {v:?}"))),
                 }
             });
             let initial_position = match initial_position {
@@ -311,7 +314,7 @@ impl Remote {
                 None => InitialPosition::default(),
                 Some(Err(e)) => return Err(e),
             };
-            log::debug!("ConsumerOptions initial_position: {:?}", initial_position);
+            log::debug!("ConsumerOptions initial_position: {initial_position:?}");
             let metadata = obj
                 .get("metadata")
                 .and_then(|v| {
@@ -336,7 +339,7 @@ impl Remote {
     }
 
     #[inline]
-    pub fn serialize_options<S>(opts: &ConsumerOptions, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize_options<S>(opts: &ConsumerOptions, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -455,10 +458,7 @@ impl Local {
                     topics.push(t);
                 } else {
                     log::warn!(
-                        "No matching topic found in RemoteProperties, placeholder: {}, name: {}, topic: {}",
-                        placeholder,
-                        name,
-                        topic
+                        "No matching topic found in RemoteProperties, placeholder: {placeholder}, name: {name}, topic: {topic}"
                     );
                 }
             }
@@ -470,10 +470,7 @@ impl Local {
                     topics.push(t);
                 } else {
                     log::warn!(
-                        "No matching topic found in RemoteProperties, placeholder: {}, name: {}, topic: {}",
-                        placeholder,
-                        name,
-                        topic
+                        "No matching topic found in RemoteProperties, placeholder: {placeholder}, name: {name}, topic: {topic}"
                     );
                 }
             }
@@ -486,10 +483,7 @@ impl Local {
                     topics.extend(ts);
                 } else {
                     log::warn!(
-                        "No matching topic found in RemotePayload, placeholder: {}, path: {}, topic: {}",
-                        placeholder,
-                        path,
-                        topic
+                        "No matching topic found in RemotePayload, placeholder: {placeholder}, path: {path}, topic: {topic}"
                     );
                 }
             }
@@ -502,10 +496,7 @@ impl Local {
                     topics.extend(ts);
                 } else {
                     log::warn!(
-                        "No matching topic found in RemotePayload, placeholder: {}, path: {}, topic: {}",
-                        placeholder,
-                        path,
-                        topic
+                        "No matching topic found in RemotePayload, placeholder: {placeholder}, path: {path}, topic: {topic}"
                     );
                 }
             }
@@ -551,7 +542,7 @@ impl Local {
                 topics.push(item.name.clone());
             }
         }
-        log::debug!("make_topics topics: {:?}", topics);
+        log::debug!("make_topics topics: {topics:?}");
         topics
     }
 
@@ -571,7 +562,7 @@ impl Local {
     }
 
     #[inline]
-    pub fn deserialize_qos<'de, D>(deserializer: D) -> Result<Option<QoS>, D::Error>
+    pub fn deserialize_qos<'de, D>(deserializer: D) -> std::result::Result<Option<QoS>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -625,7 +616,7 @@ impl Local {
     }
 
     #[inline]
-    pub fn deserialize_topic<'de, D>(deserializer: D) -> Result<Option<LocalTopic>, D::Error>
+    pub fn deserialize_topic<'de, D>(deserializer: D) -> std::result::Result<Option<LocalTopic>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -635,7 +626,7 @@ impl Local {
 
     #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn deserialize_topics<'de, D>(deserializer: D) -> Result<Vec<LocalTopic>, D::Error>
+    pub fn deserialize_topics<'de, D>(deserializer: D) -> std::result::Result<Vec<LocalTopic>, D::Error>
     where
         D: Deserializer<'de>,
     {

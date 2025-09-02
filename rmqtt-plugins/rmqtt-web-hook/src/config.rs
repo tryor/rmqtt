@@ -2,28 +2,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::de::{self, Deserialize, Unexpected};
-use serde::ser::{self, Serialize};
-use serde::Deserializer;
+use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
+use bytestring::ByteString;
+use serde::{
+    de::{self, Unexpected},
+    ser, Deserialize, Deserializer, Serialize,
+};
 
-use rmqtt::{
-    ahash,
-    backoff::{ExponentialBackoff, ExponentialBackoffBuilder},
-    bytestring::ByteString,
-    serde_json, url,
-};
-use rmqtt::{
-    broker::{hook::Type, topic::TopicTree},
-    settings::deserialize_duration,
-    Result, Topic,
-};
+use rmqtt::{hook::Type, trie::TopicTree, types::Topic, utils::deserialize_duration, Result};
 
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
-    #[serde(default = "PluginConfig::worker_threads_default")]
-    pub worker_threads: usize,
     #[serde(default = "PluginConfig::queue_capacity_default")]
     pub queue_capacity: usize,
     #[serde(default = "PluginConfig::concurrency_limit_default")]
@@ -49,9 +40,6 @@ pub struct PluginConfig {
 }
 
 impl PluginConfig {
-    fn worker_threads_default() -> usize {
-        3
-    }
     fn queue_capacity_default() -> usize {
         1_000_000
     }
@@ -145,8 +133,7 @@ impl Rule {
         } else {
             let mut topics = TopicTree::default();
             for topic in topics_cfg.iter() {
-                topics
-                    .insert(&Topic::from_str(topic).map_err(|e| de::Error::custom(format!("{:?}", e)))?, ());
+                topics.insert(&Topic::from_str(topic).map_err(|e| de::Error::custom(format!("{e:?}")))?, ());
             }
             Ok(Some((Arc::new(topics), topics_cfg)))
         }
@@ -168,7 +155,7 @@ impl Url {
 
 impl<'de> Deserialize<'de> for Url {
     #[inline]
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -187,6 +174,7 @@ impl<'de> Deserialize<'de> for Url {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UrlType {
     File,
     Http,

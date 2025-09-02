@@ -1,22 +1,24 @@
 #![deny(unsafe_code)]
-#[macro_use]
-extern crate serde;
 
-#[macro_use]
-extern crate rmqtt_macros;
-
+use std::ops::DerefMut;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use rmqtt::{async_trait::async_trait, log, serde_json, tokio::sync::RwLock};
+use async_trait::async_trait;
+use tokio::sync::RwLock;
+
 use rmqtt::{
-    broker::hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
+    context::ServerContext,
+    hook::{Handler, HookResult, Parameter, Register, ReturnType, Type},
+    macros::Plugin,
     plugin::{PackageInfo, Plugin},
-    register, Publish, Result, Runtime, Session, Topic, TopicFilter, TopicName,
+    register,
+    session::Session,
+    types::{Publish, Topic, TopicFilter, TopicName},
+    Result,
 };
 
-use crate::config::{DestTopicItem, Rule};
-use config::{Action, PluginConfig};
+use config::{Action, DestTopicItem, PluginConfig, Rule};
 
 mod config;
 
@@ -24,20 +26,20 @@ register!(TopicRewritePlugin::new);
 
 #[derive(Plugin)]
 struct TopicRewritePlugin {
-    runtime: &'static Runtime,
+    scx: ServerContext,
     register: Box<dyn Register>,
     cfg: Arc<RwLock<PluginConfig>>,
 }
 
 impl TopicRewritePlugin {
     #[inline]
-    async fn new<N: Into<String>>(runtime: &'static Runtime, name: N) -> Result<Self> {
+    async fn new<N: Into<String>>(scx: ServerContext, name: N) -> Result<Self> {
         let name = name.into();
-        let cfg = runtime.settings.plugins.load_config::<PluginConfig>(&name)?;
+        let cfg = scx.plugins.read_config::<PluginConfig>(&name)?;
         let cfg = Arc::new(RwLock::new(cfg));
         log::info!("{} TopicRewritePlugin cfg: {:?}", name, cfg.read().await);
-        let register = runtime.extends.hook_mgr().await.register();
-        Ok(Self { runtime, register, cfg })
+        let register = scx.extends.hook_mgr().register();
+        Ok(Self { scx, register, cfg })
     }
 }
 
@@ -60,7 +62,7 @@ impl Plugin for TopicRewritePlugin {
 
     #[inline]
     async fn load_config(&mut self) -> Result<()> {
-        let new_cfg = self.runtime.settings.plugins.load_config::<PluginConfig>(self.name())?;
+        let new_cfg = self.scx.plugins.read_config::<PluginConfig>(self.name())?;
         *self.cfg.write().await = new_cfg;
         log::debug!("load_config ok,  {:?}", self.cfg);
         Ok(())
@@ -94,18 +96,9 @@ impl TopicRewriteHandler {
     pub async fn rewrite_publish_topic(&self, s: Option<&Session>, p: &Publish) -> Result<Option<Publish>> {
         match self.rewrite_topic(Action::Publish, s, &p.topic).await? {
             Some(topic) => {
-                log::debug!("new_topic: {}", topic);
-                let new_p = Publish {
-                    dup: p.dup,
-                    retain: p.retain,
-                    qos: p.qos,
-                    topic,
-                    packet_id: p.packet_id,
-                    payload: p.payload.clone(),
-                    properties: p.properties.clone(),
-                    delay_interval: None,
-                    create_time: p.create_time,
-                };
+                log::debug!("new_topic: {topic}");
+                let mut new_p = p.clone();
+                new_p.deref_mut().topic = topic;
                 Ok(Some(new_p))
             }
             None => Ok(None),
@@ -120,7 +113,7 @@ impl TopicRewriteHandler {
     ) -> Result<Option<TopicFilter>> {
         match self.rewrite_topic(Action::Subscribe, s, topic_filter).await? {
             Some(new_tf) => {
-                log::debug!("new_tf: {}", new_tf);
+                log::debug!("new_tf: {new_tf}");
                 Ok(Some(new_tf))
             }
             None => Ok(None),
@@ -155,7 +148,7 @@ impl TopicRewriteHandler {
             .collect::<Vec<_>>()
             .last()
         {
-            log::debug!("rule: {:?}, input topic: {}", r, topic);
+            log::debug!("rule: {r:?}, input topic: {topic}");
             Ok(self.make_new_topic(r, s, topic))
         } else {
             Ok(None)
@@ -174,7 +167,7 @@ impl TopicRewriteHandler {
                 }
             }
         }
-        log::debug!("matcheds: {:?}", matcheds);
+        log::debug!("matcheds: {matcheds:?}");
         let mut new_topic = String::new();
         for item in &r.dest_topic_items {
             match item {
@@ -282,7 +275,7 @@ impl Handler for TopicRewriteHandler {
                 }
             }
             _ => {
-                log::error!("parameter is: {:?}", param);
+                log::error!("parameter is: {param:?}");
             }
         }
         (true, acc)

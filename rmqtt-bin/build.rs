@@ -27,13 +27,11 @@ fn plugins(decoded: &toml::Value) {
             let default_startup = cfg.get("default_startup").and_then(|v| v.as_bool()).unwrap_or(false);
             let immutable = cfg.get("immutable").and_then(|v| v.as_bool()).unwrap_or(false);
             println!(
-                "plugin_id: {}, default_startup: {}, immutable: {}, name: {}",
-                plugin_id, default_startup, immutable, name
+                "plugin_id: {plugin_id}, default_startup: {default_startup}, immutable: {immutable}, name: {name}"
             );
             // Use the extracted data to generate Rust code and add it to the inits vector
             inits.push(format!(
-                "    {}::register(rmqtt::Runtime::instance(), r#\"{}\"#, {} || default_startups.contains(&String::from(r#\"{}\"#)), {}).await.map_err(|e| format!(r#\"Failed to register '{}' plug-in, {{}} \"#, e.to_string()))?;",
-                plugin_id, name, default_startup, name, immutable, name
+                "    {plugin_id}::register_named(_scx, r#\"{name}\"#, {default_startup} || _default_startups.contains(&String::from(r#\"{name}\"#)), {immutable}).await.map_err(|e| anyhow::anyhow!(format!(r#\"Failed to register '{name}' plug-in, {{}} \"#, e.to_string())))?;"
             ));
         }
     }
@@ -44,7 +42,7 @@ fn plugins(decoded: &toml::Value) {
 
     plugin_rs.write_all(b"#[allow(clippy::all)]\n").unwrap();
     plugin_rs
-        .write_all(b"pub(crate) async fn registers(default_startups: Vec<String>) -> rmqtt::Result<()>{\n")
+        .write_all(b"pub(crate) async fn registers(_scx: &rmqtt::context::ServerContext, _default_startups: Vec<String>) -> rmqtt::Result<()>{\n")
         .unwrap();
     plugin_rs.write_all(inits.join("\n").as_bytes()).unwrap();
     plugin_rs.write_all(b"\n    Ok(())\n}").unwrap();

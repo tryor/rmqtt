@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::convert::From as _;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,23 +12,27 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 
-use rmqtt::anyhow::anyhow;
-use rmqtt::bytestring::ByteString;
-use rmqtt::futures::channel::mpsc;
-use rmqtt::futures::SinkExt;
-use rmqtt::{
-    broker::topic::{TopicTree, VecToTopic},
-    rand, ClientId, From, MqttError, NodeId, Publish, PublishProperties, Result, Topic,
-};
-use rmqtt::{log, rustls, tokio, tokio::sync::RwLock, DashMap};
+use anyhow::anyhow;
+use bytestring::ByteString;
+use futures::channel::mpsc;
+use futures::SinkExt;
+use tokio::sync::RwLock;
 
-use rmqtt::ntex_mqtt::types::{MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
+use rmqtt::{
+    trie::{TopicTree, VecToTopic},
+    types::{ClientId, DashMap, From, NodeId, Publish, Topic},
+    Result,
+};
+
+use rmqtt::codec::types::{MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5};
+use rmqtt::codec::v5::PublishProperties;
 
 use crate::config::{Bridge, Entry, PluginConfig};
 use crate::v4::Client as ClientV4;
 use crate::v5::Client as ClientV5;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     Connect,
     Publish(BridgePublish),
@@ -91,7 +96,7 @@ impl BridgeManager {
 
     pub async fn start(&mut self) {
         while let Err(e) = self._start().await {
-            log::error!("start bridge-egress-mqtt error, {:?}", e);
+            log::error!("start bridge-egress-mqtt error, {e:?}");
             self.stop().await;
             tokio::time::sleep(Duration::from_millis(3000)).await;
         }
@@ -106,7 +111,7 @@ impl BridgeManager {
                 continue;
             }
             if bridge_names.contains(&b_cfg.name as &str) {
-                return Err(MqttError::from(format!("The bridge name already exists! {:?}", b_cfg.name)));
+                return Err(anyhow!(format!("The bridge name already exists! {:?}", b_cfg.name)));
             }
 
             bridge_names.insert(&b_cfg.name);
@@ -146,18 +151,11 @@ impl BridgeManager {
             let ((bridge_name, entry_idx), mailboxs) = entry.pair_mut();
             for (client_no, mailbox) in mailboxs.iter_mut().enumerate() {
                 log::debug!(
-                    "stop bridge_name: {:?}, entry_idx: {:?}, client_no: {:?}",
-                    bridge_name,
-                    entry_idx,
-                    client_no
+                    "stop bridge_name: {bridge_name:?}, entry_idx: {entry_idx:?}, client_no: {client_no:?}"
                 );
                 if let Err(e) = mailbox.stop().await {
                     log::error!(
-                    "stop BridgeMqttIngressPlugin error, bridge_name: {}, entry_idx: {}, client_no: {}, {:?}",
-                    bridge_name,
-                    entry_idx,
-                    client_no,
-                    e
+                    "stop BridgeMqttIngressPlugin error, bridge_name: {bridge_name}, entry_idx: {entry_idx}, client_no: {client_no}, {e:?}"
                 );
                 }
             }
@@ -175,8 +173,8 @@ impl BridgeManager {
         let rnd = rand::random::<u64>() as usize;
         for (topic_filter, bridge_infos) in { self.topics.read().await.matches(&topic) }.iter() {
             let topic_filter = topic_filter.to_topic_filter();
-            log::debug!("topic_filter: {:?}", topic_filter);
-            log::debug!("bridge_infos: {:?}", bridge_infos);
+            log::debug!("topic_filter: {topic_filter:?}");
+            log::debug!("bridge_infos: {bridge_infos:?}");
             for (name, entry_idx, mqtt_ver) in bridge_infos {
                 if let Some(mailboxs) = self.sinks.get(&(name.clone(), *entry_idx)) {
                     let client_no = rnd % mailboxs.len();
@@ -193,7 +191,7 @@ impl BridgeManager {
                                     .send(Command::Publish(BridgePublish::V3(self.to_v3_publish(entry, p))))
                                     .await
                                 {
-                                    log::warn!("{}", e);
+                                    log::warn!("{e}");
                                 }
                             }
                             MQTT_LEVEL_5 => {
@@ -201,7 +199,7 @@ impl BridgeManager {
                                     .send(Command::Publish(BridgePublish::V5(self.to_v5_publish(entry, p))))
                                     .await
                                 {
-                                    log::warn!("{}", e);
+                                    log::warn!("{e}");
                                 }
                             }
                             MQTT_LEVEL_31 => {
@@ -239,7 +237,7 @@ impl BridgeManager {
             topic: cfg_entry.remote.make_topic(&p.topic),
             packet_id: None,
             payload: ntex::util::Bytes::from(p.payload.to_vec()), //@TODO ...
-            properties: to_properties(&p.properties),
+            properties: p.properties.as_ref().map(to_properties).unwrap_or_default(),
         }
     }
 }
@@ -249,17 +247,22 @@ fn to_properties(props: &PublishProperties) -> ntex_mqtt::v5::codec::PublishProp
     let user_properties: ntex_mqtt::v5::codec::UserProperties = props
         .user_properties
         .iter()
-        .map(|(k, v)| (ntex::util::ByteString::from(k.as_ref()), ntex::util::ByteString::from(v.as_ref())))
+        .map(|(k, v)| {
+            (ntex::util::ByteString::from(k.to_string()), ntex::util::ByteString::from(v.to_string()))
+        })
         .collect();
     ntex_mqtt::v5::codec::PublishProperties {
         topic_alias: props.topic_alias,
         correlation_data: props.correlation_data.as_ref().map(|data| ntex::util::Bytes::from(data.to_vec())),
         message_expiry_interval: props.message_expiry_interval,
-        content_type: props.content_type.as_ref().map(|data| ntex::util::ByteString::from(data.as_ref())),
+        content_type: props.content_type.as_ref().map(|data| ntex::util::ByteString::from(data.to_string())),
         user_properties,
-        is_utf8_payload: props.is_utf8_payload.unwrap_or_default(),
-        response_topic: props.response_topic.as_ref().map(|data| ntex::util::ByteString::from(data.as_ref())),
-        subscription_ids: props.subscription_ids.clone().unwrap_or_default(),
+        is_utf8_payload: props.is_utf8_payload,
+        response_topic: props
+            .response_topic
+            .as_ref()
+            .map(|data| ntex::util::ByteString::from(data.to_string())),
+        subscription_ids: props.subscription_ids.clone(),
     }
 }
 
@@ -270,7 +273,7 @@ pub(crate) fn build_tls_connector(cfg: &super::config::Bridge) -> Result<TlsConn
         root_store.add_parsable_certificates(
             CertificateDer::pem_file_iter(c)
                 .map_err(|e| anyhow!(e))?
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| anyhow!(e))?,
         );
     }
@@ -279,10 +282,10 @@ pub(crate) fn build_tls_connector(cfg: &super::config::Bridge) -> Result<TlsConn
     let config = if let (Some(client_key), Some(client_cert)) = (&cfg.client_key, &cfg.client_cert) {
         let c_certs = CertificateDer::pem_file_iter(client_cert)
             .map_err(|e| anyhow!(e))?
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| anyhow!(e))?;
         let c_key = rustls::pki_types::PrivateKeyDer::from_pem_file(client_key).map_err(|e| anyhow!(e))?;
-        config.with_client_auth_cert(c_certs, c_key).map_err(|e| MqttError::Anyhow(e.into()))?
+        config.with_client_auth_cert(c_certs, c_key).map_err(|e| anyhow!(e))?
     } else {
         config.with_no_client_auth()
     };

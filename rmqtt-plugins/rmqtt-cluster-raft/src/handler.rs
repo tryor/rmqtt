@@ -1,26 +1,42 @@
+use std::sync::Arc;
+
+use anyhow::anyhow;
+use async_trait::async_trait;
+use backoff::{future::retry, ExponentialBackoff};
+use rust_box::task_exec_queue::{SpawnExt, TaskExecQueue};
+
+use rmqtt::context::ServerContext;
+use rmqtt::{
+    grpc::{Message as GrpcMessage, MessageReply},
+    hook::{Handler, HookResult, Parameter, ReturnType},
+    shared::Shared,
+    types::Id,
+};
 use rmqtt_raft::Mailbox;
 
-use rmqtt::broker::Shared;
-use rmqtt::rust_box::task_exec_queue::SpawnExt;
-use rmqtt::{async_trait::async_trait, log, tokio, MqttError};
-use rmqtt::{
-    broker::hook::{Handler, HookResult, Parameter, ReturnType},
-    grpc::{Message as GrpcMessage, MessageReply},
-    Id, Runtime,
-};
-
-use super::config::{retry, BACKOFF_STRATEGY};
+use super::config::PluginConfig;
 use super::message::{Message, RaftGrpcMessage, RaftGrpcMessageReply};
-use super::{hook_message_dropped, shared::ClusterShared, task_exec_queue};
+use super::{hook_message_dropped, shared::ClusterShared};
 
 pub(crate) struct HookHandler {
-    shared: &'static ClusterShared,
+    scx: ServerContext,
+    exec: TaskExecQueue,
+    backoff_strategy: ExponentialBackoff,
+    shared: ClusterShared,
     raft_mailbox: Mailbox,
 }
 
 impl HookHandler {
-    pub(crate) fn new(shared: &'static ClusterShared, raft_mailbox: Mailbox) -> Self {
-        Self { shared, raft_mailbox }
+    pub(crate) fn new(
+        scx: ServerContext,
+        cfg: Arc<PluginConfig>,
+        backoff_strategy: ExponentialBackoff,
+        shared: ClusterShared,
+        raft_mailbox: Mailbox,
+    ) -> Self {
+        let exec =
+            scx.get_exec(("RAFT_DISCONNECTED_EXEC", cfg.task_exec_queue_workers, cfg.task_exec_queue_max));
+        Self { scx, exec, backoff_strategy, shared, raft_mailbox }
     }
 }
 
@@ -35,31 +51,32 @@ impl Handler for HookHandler {
                     let msg = Message::Disconnected { id: s.id.clone() }.encode();
                     match msg {
                         Err(e) => {
-                            log::warn!("HookHandler, Message::Disconnected, message encode error, {:?}", e);
+                            log::warn!("HookHandler, Message::Disconnected, message encode error, {e:?}");
                         }
                         Ok(msg) => {
                             let raft_mailbox = self.raft_mailbox.clone();
+                            let exec = self.exec.clone();
+                            let backoff_strategy = self.backoff_strategy.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = retry(BACKOFF_STRATEGY.clone(), || async {
+                                if let Err(e) = retry(backoff_strategy, || async {
                                     let msg = msg.clone();
                                     let mailbox = raft_mailbox.clone();
                                     let res = async move { mailbox.send_proposal(msg).await }
-                                        .spawn(task_exec_queue())
+                                        .spawn(&exec)
                                         .result()
                                         .await
                                         .map_err(|_| {
-                                            MqttError::from(
+                                             anyhow!(
                                                 "Handler::hook(Message::Disconnected), task execution failure",
                                             )
                                         })?
-                                        .map_err(|e| MqttError::from(e.to_string()))?;
+                                        .map_err(|e|  anyhow!(e.to_string()))?;
                                     Ok(res)
                                 })
                                     .await
                                 {
                                     log::warn!(
-                                        "HookHandler, Message::Disconnected, raft mailbox send error, {:?}",
-                                        e
+                                        "HookHandler, Message::Disconnected, raft mailbox send error, {e:?}"
                                     );
                                 }
                             });
@@ -72,31 +89,32 @@ impl Handler for HookHandler {
                 let msg = Message::SessionTerminated { id: s.id.clone() }.encode();
                 match msg {
                     Err(e) => {
-                        log::warn!("HookHandler, Message::SessionTerminated, message encode error, {:?}", e);
+                        log::warn!("HookHandler, Message::SessionTerminated, message encode error, {e:?}");
                     }
                     Ok(msg) => {
                         let raft_mailbox = self.raft_mailbox.clone();
+                        let exec = self.exec.clone();
+                        let backoff_strategy = self.backoff_strategy.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = retry(BACKOFF_STRATEGY.clone(), || async {
+                            if let Err(e) = retry(backoff_strategy, || async {
                                 let msg = msg.clone();
                                 let mailbox = raft_mailbox.clone();
                                 let res = async move { mailbox.send_proposal(msg).await }
-                                    .spawn(task_exec_queue())
+                                    .spawn(&exec)
                                     .result()
                                     .await
                                     .map_err(|_| {
-                                        MqttError::from(
+                                         anyhow!(
                                             "Handler::hook(Message::SessionTerminated), task execution failure",
                                         )
                                     })?
-                                    .map_err(|e| MqttError::from(e.to_string()))?;
+                                    .map_err(|e|  anyhow!(e.to_string()))?;
                                 Ok(res)
                             })
                                 .await
                             {
                                 log::warn!(
-                                    "HookHandler, Message::SessionTerminated, raft mailbox send error, {:?}",
-                                    e
+                                    "HookHandler, Message::SessionTerminated, raft mailbox send error, {e:?}"
                                 );
                             }
                         });
@@ -105,7 +123,7 @@ impl Handler for HookHandler {
             }
 
             Parameter::GrpcMessageReceived(typ, msg) => {
-                log::debug!("GrpcMessageReceived, type: {}, msg: {:?}", typ, msg);
+                log::debug!("GrpcMessageReceived, type: {typ}, msg: {msg:?}");
                 if self.shared.message_type != *typ {
                     return (true, acc);
                 }
@@ -114,7 +132,7 @@ impl Handler for HookHandler {
                         if let Err(droppeds) =
                             self.shared.forwards_to(from.clone(), publish, sub_rels.clone()).await
                         {
-                            hook_message_dropped(droppeds).await;
+                            hook_message_dropped(&self.scx, droppeds).await;
                         }
                         return (false, acc);
                     }
@@ -127,11 +145,10 @@ impl Handler for HookHandler {
                         return (false, Some(new_acc));
                     }
                     GrpcMessage::GetRetains(topic_filter) => {
-                        log::debug!("[GrpcMessage::GetRetains] topic_filter: {:?}", topic_filter);
-                        unreachable!()
+                        log::error!("unreachable!(), GrpcMessage::GetRetains({topic_filter})");
                     }
                     GrpcMessage::SubscriptionsGet(clientid) => {
-                        let id = Id::from(Runtime::instance().node.id(), clientid.clone());
+                        let id = Id::from(self.scx.node.id(), clientid.clone());
                         let entry = self.shared.inner().entry(id);
                         let new_acc = HookResult::GrpcMessageReply(Ok(MessageReply::SubscriptionsGet(
                             entry.subscriptions().await,
@@ -141,14 +158,13 @@ impl Handler for HookHandler {
                     GrpcMessage::Data(data) => {
                         let new_acc = match RaftGrpcMessage::decode(data) {
                             Err(e) => {
-                                log::error!("Message::decode, error: {:?}", e);
+                                log::error!("Message::decode, error: {e:?}");
                                 HookResult::GrpcMessageReply(Ok(MessageReply::Error(e.to_string())))
                             }
-                            Ok(RaftGrpcMessage::GetRaftStatus) => {
-                                let raft_mailbox = self.raft_mailbox.clone();
-                                match raft_mailbox.status().await {
+                            Ok(RaftGrpcMessage::GetNodeHealthStatus) => {
+                                match self.shared.health_status().await {
                                     Ok(status) => {
-                                        match RaftGrpcMessageReply::GetRaftStatus(status).encode() {
+                                        match RaftGrpcMessageReply::GetNodeHealthStatus(status).encode() {
                                             Ok(ress) => {
                                                 HookResult::GrpcMessageReply(Ok(MessageReply::Data(ress)))
                                             }
@@ -166,12 +182,12 @@ impl Handler for HookHandler {
                         return (false, Some(new_acc));
                     }
                     _ => {
-                        log::error!("unimplemented, {:?}", param)
+                        log::error!("unimplemented, {param:?}")
                     }
                 }
             }
             _ => {
-                log::error!("unimplemented, {:?}", param)
+                log::error!("unimplemented, {param:?}")
             }
         }
         (true, acc)

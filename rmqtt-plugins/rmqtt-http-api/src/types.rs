@@ -1,20 +1,25 @@
-use serde::de::{self, Deserialize};
-use serde::ser::{self, Serialize};
 use std::time::Duration;
 
-use rmqtt::chrono::LocalResult;
-use rmqtt::node::{BrokerInfo, NodeInfo, NodeStatus};
-use rmqtt::plugin::PluginInfo;
-use rmqtt::settings::{deserialize_datetime_option, serialize_datetime_option};
-use rmqtt::{anyhow, bincode, chrono, serde_json, HashMap, MqttError, QoS};
-use rmqtt::{metrics::Metrics, stats::Stats};
-use rmqtt::{ClientId, NodeId, Timestamp, TopicFilter, TopicName, UserName};
-use rmqtt::{PublishProperties, Result};
+use anyhow::anyhow;
+use serde::{de, ser, Deserialize, Serialize};
+
+use rmqtt::types::NodeHealthStatus;
+use rmqtt::{
+    codec::v5::PublishProperties,
+    metrics::Metrics,
+    node::{BrokerInfo, NodeInfo, NodeStatus},
+    plugin::PluginInfo,
+    stats::Stats,
+    types::{ClientId, HashMap, NodeId, QoS, Timestamp, TopicFilter, TopicName, UserName},
+    utils::{deserialize_datetime_option, format_timestamp, serialize_datetime_option},
+    Result,
+};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message<'a> {
     BrokerInfo,
     NodeInfo,
+    NodeHealthStatus,
     StatsInfo,
     MetricsInfo,
     ClientSearch(Box<ClientSearchParams>),
@@ -32,11 +37,11 @@ pub enum Message<'a> {
 impl Message<'_> {
     #[inline]
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+        bincode::serialize(self).map_err(anyhow::Error::new)
     }
     #[inline]
-    pub fn decode(data: &[u8]) -> Result<Message> {
-        Ok(bincode::deserialize::<Message>(data).map_err(anyhow::Error::new)?)
+    pub fn decode(data: &[u8]) -> Result<Message<'_>> {
+        bincode::deserialize::<Message>(data).map_err(anyhow::Error::new)
     }
 }
 
@@ -44,6 +49,7 @@ impl Message<'_> {
 pub enum MessageReply {
     BrokerInfo(BrokerInfo),
     NodeInfo(NodeInfo),
+    NodeHealthStatus(NodeHealthStatus),
     StatsInfo(NodeStatus, Box<Stats>),
     MetricsInfo(Box<Metrics>),
     ClientSearch(Vec<ClientSearchResult>),
@@ -61,11 +67,11 @@ pub enum MessageReply {
 impl MessageReply {
     #[inline]
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+        bincode::serialize(self).map_err(anyhow::Error::new)
     }
     #[inline]
     pub fn decode(data: &[u8]) -> Result<MessageReply> {
-        Ok(bincode::deserialize::<MessageReply>(data).map_err(anyhow::Error::new)?)
+        bincode::deserialize::<MessageReply>(data).map_err(anyhow::Error::new)
     }
 }
 
@@ -137,7 +143,7 @@ pub struct ClientSearchResult {
     pub created_at: Timestamp,
     pub subscriptions_cnt: usize,
     pub max_subscriptions: usize,
-    pub extra_attrs: usize,
+    // pub extra_attrs: usize,
     #[serde(
         default,
         serialize_with = "ClientSearchResult::serialize_last_will",
@@ -200,7 +206,7 @@ impl ClientSearchResult {
             "created_at": format_timestamp(self.created_at),
             "subscriptions_cnt": self.subscriptions_cnt,
             "max_subscriptions": self.max_subscriptions,
-            "extra_attrs": self.extra_attrs,
+            // "extra_attrs": self.extra_attrs,
             "last_will": self.last_will,
 
             "inflight": self.inflight,
@@ -296,14 +302,14 @@ impl SubscribeParams {
             topics.push(topic.clone());
         }
         if topics.is_empty() {
-            return Err(MqttError::Msg("topics or topic is empty".into()));
+            return Err(anyhow!("topics or topic is empty"));
         }
         Ok(topics)
     }
 
     #[inline]
     pub fn qos(&self) -> Result<QoS> {
-        Ok(QoS::try_from(self.qos).map_err(|e| anyhow::Error::msg(e.to_string()))?)
+        QoS::try_from(self.qos).map_err(|e| anyhow!(e))
     }
 }
 
@@ -320,16 +326,16 @@ pub enum PrometheusDataType {
     Sum,
 }
 
-#[inline]
-fn format_timestamp(t: i64) -> String {
-    if t <= 0 {
-        "".into()
-    } else {
-        use chrono::TimeZone;
-        if let LocalResult::Single(t) = chrono::Local.timestamp_opt(t, 0) {
-            t.format("%Y-%m-%d %H:%M:%S").to_string()
-        } else {
-            "".into()
-        }
-    }
-}
+// #[inline]
+// fn format_timestamp(t: i64) -> String {
+//     if t <= 0 {
+//         "".into()
+//     } else {
+//         use chrono::TimeZone;
+//         if let LocalResult::Single(t) = chrono::Local.timestamp_opt(t, 0) {
+//             t.format("%Y-%m-%d %H:%M:%S").to_string()
+//         } else {
+//             "".into()
+//         }
+//     }
+// }

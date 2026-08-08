@@ -1,3 +1,10 @@
+//! Egress bridge to remote MQTT brokers.
+//!
+//! Forwards local MQTT publish messages to remote MQTT brokers (v3.1.1 or v5).
+//! Manages client connections, topic matching via a trie, and message translation
+//! between local and remote MQTT protocol versions.
+
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::From as _;
 use std::str::FromStr;
@@ -31,6 +38,7 @@ use crate::config::{Bridge, Entry, PluginConfig};
 use crate::v4::Client as ClientV4;
 use crate::v5::Client as ClientV5;
 
+/// Commands for controlling a bridge client connection.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
@@ -39,6 +47,7 @@ pub enum Command {
     Close,
 }
 
+/// Mailbox for sending commands to a bridge client.
 #[derive(Clone)]
 pub struct CommandMailbox {
     pub(crate) cfg: Arc<Bridge>,
@@ -47,28 +56,33 @@ pub struct CommandMailbox {
 }
 
 impl CommandMailbox {
+    /// Creates a new `CommandMailbox` with bridge config and channel sender.
     pub(crate) fn new(cfg: Arc<Bridge>, client_id: ClientId, cmd_tx: mpsc::Sender<Command>) -> Self {
         CommandMailbox { cfg, client_id, cmd_tx }
     }
 
+    /// Sends a command to the bridge client.
     #[inline]
     pub(crate) async fn send(&self, cmd: Command) -> Result<()> {
         self.cmd_tx.clone().send(cmd).await.map_err(|e| anyhow!(e))?;
         Ok(())
     }
 
+    /// Sends a `Close` command to stop the bridge client.
     #[inline]
     pub(crate) async fn stop(&mut self) -> Result<()> {
         self.send(Command::Close).await
     }
 }
 
+/// A publish message variant for MQTT v3 or v5.
 #[derive(Debug)]
 pub enum BridgePublish {
     V3(PublishV3),
     V5(PublishV5),
 }
 
+/// A named bridge instance identifier.
 pub(crate) type BridgeName = ByteString;
 type SourceKey = (BridgeName, EntryIndex);
 
@@ -76,6 +90,11 @@ type EntryIndex = usize;
 
 type MqttVer = u8;
 
+/// Manages bridge client connections and message routing.
+///
+/// Maintains a topic trie for matching inbound MQTT topics to remote bridge
+/// entries, manages client mailboxes for each bridge instance, and handles
+/// message translation between MQTT versions.
 #[derive(Clone)]
 pub(crate) struct BridgeManager {
     node_id: NodeId,
@@ -85,6 +104,7 @@ pub(crate) struct BridgeManager {
 }
 
 impl BridgeManager {
+    /// Creates a new `BridgeManager` with the given node ID and configuration.
     pub fn new(node_id: NodeId, cfg: Arc<RwLock<PluginConfig>>) -> Self {
         Self {
             node_id,
@@ -94,9 +114,10 @@ impl BridgeManager {
         }
     }
 
+    /// Starts all bridge entries with automatic retry on failure.
     pub async fn start(&mut self) {
         while let Err(e) = self._start().await {
-            log::error!("start bridge-egress-mqtt error, {e:?}");
+            log::error!("start bridge-egress-mqtt error, {e}");
             self.stop().await;
             tokio::time::sleep(Duration::from_millis(3000)).await;
         }
@@ -146,6 +167,7 @@ impl BridgeManager {
         Ok(())
     }
 
+    /// Stops all bridge clients and clears the sink map.
     pub async fn stop(&mut self) {
         for mut entry in &mut self.sinks.iter_mut() {
             let ((bridge_name, entry_idx), mailboxs) = entry.pair_mut();
@@ -155,7 +177,7 @@ impl BridgeManager {
                 );
                 if let Err(e) = mailbox.stop().await {
                     log::error!(
-                    "stop BridgeMqttIngressPlugin error, bridge_name: {bridge_name}, entry_idx: {entry_idx}, client_no: {client_no}, {e:?}"
+                    "stop BridgeMqttIngressPlugin error, bridge_name: {bridge_name}, entry_idx: {entry_idx}, client_no: {client_no}, {e}"
                 );
                 }
             }
@@ -163,13 +185,19 @@ impl BridgeManager {
         self.sinks.clear();
     }
 
+    /// Returns a reference to the internal mailbox (client sink) map.
     pub(crate) fn sinks(&self) -> &DashMap<SourceKey, Vec<CommandMailbox>> {
         &self.sinks
     }
 
+    /// Routes an MQTT publish message to matching remote bridge clients.
+    ///
+    /// Matches the publish topic against the topic trie, selects a client
+    /// via random distribution, applies topic skip-levels, and translates
+    /// the message to the target MQTT version (v3 or v5).
     #[inline]
     pub(crate) async fn send(&self, _f: &From, p: &Publish) -> Result<()> {
-        let topic = Topic::from_str(&p.topic)?;
+        let topic: Topic = Topic::from_str(&p.topic)?;
         let rnd = rand::random::<u64>() as usize;
         for (topic_filter, bridge_infos) in { self.topics.read().await.matches(&topic) }.iter() {
             let topic_filter = topic_filter.to_topic_filter();
@@ -179,16 +207,29 @@ impl BridgeManager {
                 if let Some(mailboxs) = self.sinks.get(&(name.clone(), *entry_idx)) {
                     let client_no = rnd % mailboxs.len();
                     if let Some(mailbox) = mailboxs.get(client_no) {
-                        let entry = if let Some(entry) = mailbox.cfg.entries.get(*entry_idx) {
+                        let entry: &Entry = if let Some(entry) = mailbox.cfg.entries.get(*entry_idx) {
                             entry
                         } else {
                             log::error!("unreachable!(), entry_idx: {}", *entry_idx);
                             continue;
                         };
+                        let new_local_topic: Cow<str> = if entry.remote.skip_levels > 0 {
+                            Cow::Owned(topic.to_string_skip(entry.remote.skip_levels))
+                        } else {
+                            Cow::Borrowed(p.topic.as_ref())
+                        };
+                        log::debug!(
+                            "new_local_topic: {new_local_topic}, skip_levels: {}",
+                            entry.remote.skip_levels
+                        );
                         match *mqtt_ver {
                             MQTT_LEVEL_311 => {
                                 if let Err(e) = mailbox
-                                    .send(Command::Publish(BridgePublish::V3(self.to_v3_publish(entry, p))))
+                                    .send(Command::Publish(BridgePublish::V3(self.to_v3_publish(
+                                        entry,
+                                        p,
+                                        new_local_topic.as_ref(),
+                                    ))))
                                     .await
                                 {
                                     log::warn!("{e}");
@@ -196,7 +237,11 @@ impl BridgeManager {
                             }
                             MQTT_LEVEL_5 => {
                                 if let Err(e) = mailbox
-                                    .send(Command::Publish(BridgePublish::V5(self.to_v5_publish(entry, p))))
+                                    .send(Command::Publish(BridgePublish::V5(self.to_v5_publish(
+                                        entry,
+                                        p,
+                                        new_local_topic.as_ref(),
+                                    ))))
                                     .await
                                 {
                                     log::warn!("{e}");
@@ -217,24 +262,24 @@ impl BridgeManager {
     }
 
     #[inline]
-    fn to_v3_publish(&self, cfg_entry: &Entry, p: &Publish) -> PublishV3 {
+    fn to_v3_publish(&self, cfg_entry: &Entry, p: &Publish, new_local_topic: &str) -> PublishV3 {
         PublishV3 {
             dup: false,
             retain: cfg_entry.remote.make_retain(p.retain),
             qos: cfg_entry.remote.make_qos(p.qos),
-            topic: cfg_entry.remote.make_topic(&p.topic),
+            topic: cfg_entry.remote.make_topic(new_local_topic),
             packet_id: None,
             payload: ntex::util::Bytes::from(p.payload.to_vec()), //@TODO ...
         }
     }
 
     #[inline]
-    fn to_v5_publish(&self, cfg_entry: &Entry, p: &Publish) -> PublishV5 {
+    fn to_v5_publish(&self, cfg_entry: &Entry, p: &Publish, new_local_topic: &str) -> PublishV5 {
         PublishV5 {
             dup: false,
             retain: cfg_entry.remote.make_retain(p.retain),
             qos: cfg_entry.remote.make_qos(p.qos),
-            topic: cfg_entry.remote.make_topic(&p.topic),
+            topic: cfg_entry.remote.make_topic(new_local_topic),
             packet_id: None,
             payload: ntex::util::Bytes::from(p.payload.to_vec()), //@TODO ...
             properties: p.properties.as_ref().map(to_properties).unwrap_or_default(),
@@ -266,6 +311,10 @@ fn to_properties(props: &PublishProperties) -> ntex_mqtt::v5::codec::PublishProp
     }
 }
 
+/// Builds a TLS connector from bridge configuration.
+///
+/// Loads system root certificates, optionally adds a custom root CA,
+/// and configures client certificate authentication if provided.
 pub(crate) fn build_tls_connector(cfg: &super::config::Bridge) -> Result<TlsConnector<String>> {
     let mut root_store = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.into() };
 

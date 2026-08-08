@@ -1,3 +1,16 @@
+//! JWT-based authentication plugin for RMQTT.
+//!
+//! Authenticates MQTT clients using JSON Web Tokens (JWT).
+//! Supports token validation, expiry checking, and claim-based
+//! authorization for publish/subscribe operations.
+//!
+//! # Features
+//!
+//! - Configurable JWT secret/key for token verification.
+//! - Support for standard JWT claims (iss, sub, exp, etc.).
+//! - Custom claim extraction for ACL decisions.
+//! - Username extraction from JWT claims.
+//!
 #![deny(unsafe_code)]
 
 use std::borrow::Cow;
@@ -20,7 +33,7 @@ use rmqtt::{
     macros::Plugin,
     plugin::{PackageInfo, Plugin},
     register,
-    types::{AuthResult, ConnectInfo, Disconnect, Message, PublishAclResult, Reason},
+    types::{AuthResult, ConnectInfo, Disconnect, Message, Reason},
     Result,
 };
 
@@ -45,7 +58,7 @@ impl AuthJwtPlugin {
         let name = name.into();
         let mut cfg = scx.plugins.read_config::<PluginConfig>(&name)?;
         cfg.init_decoding_key()?;
-        log::info!("{} AuthJwtPlugin cfg: {:?}", name, cfg);
+        log::info!("{name} AuthJwtPlugin cfg: {cfg:?}");
         let cfg = Arc::new(RwLock::new(cfg));
         let register = scx.extends.hook_mgr().register();
         Ok(Self { scx, register, cfg })
@@ -356,8 +369,10 @@ impl Handler for AuthHandler {
 
             Parameter::MessagePublishCheckAcl(session, publish) => {
                 log::debug!("MessagePublishCheckAcl auth-jwt");
-                if let Some(HookResult::PublishAclResult(PublishAclResult::Rejected(_))) = &acc {
-                    return (false, acc);
+                if let Some(HookResult::PublishAclResult(acl_res)) = &acc {
+                    if acl_res.is_rejected() {
+                        return (false, acc);
+                    }
                 }
 
                 if let Some(auth_info) = &session.auth_info {

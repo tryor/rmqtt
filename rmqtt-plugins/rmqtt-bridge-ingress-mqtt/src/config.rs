@@ -1,3 +1,9 @@
+//! Configuration types for the MQTT ingress bridge plugin.
+//!
+//! Defines bridge connection parameters (server, TLS, credentials, keepalive),
+//! MQTT protocol version, per-version settings (v3/v5), and routing entries
+//! mapping remote topics to local MQTT topics (including `${remote.topic}` pattern).
+
 use anyhow::anyhow;
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -18,7 +24,7 @@ use rmqtt::codec::types::{Protocol, MQTT_LEVEL_31, MQTT_LEVEL_311, MQTT_LEVEL_5}
 
 use rmqtt::{
     types::TopicName,
-    utils::{deserialize_duration, to_duration, Bytesize},
+    utils::{deserialize_duration, deserialize_expand_env_vars_option, to_duration, Bytesize},
     Result,
 };
 
@@ -44,9 +50,9 @@ pub struct Bridge {
     // #Client key file
     pub client_key: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_expand_env_vars_option")]
     pub username: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_expand_env_vars_option")]
     pub password: Option<String>,
 
     #[serde(default = "Bridge::concurrent_client_limit_default")]

@@ -1,10 +1,10 @@
 use std::num::NonZeroU16;
 
+use crate::cert::CertInfo;
+use crate::types::{packet_type, Protocol, QoS};
 use bytes::Bytes;
 use bytestring::ByteString;
 use serde::{Deserialize, Serialize};
-
-use crate::types::{packet_type, Protocol, QoS};
 
 prim_enum! {
     /// Connect Return Code
@@ -42,6 +42,7 @@ impl From<ConnectAckReason> for u8 {
 }
 
 impl ConnectAckReason {
+    /// Returns a human-readable description of the reason code
     pub fn reason(self) -> &'static str {
         match self {
             ConnectAckReason::ConnectionAccepted => "Connection Accepted",
@@ -87,6 +88,8 @@ pub struct Connect {
     pub username: Option<ByteString>,
     /// password can be used by the Server for authentication and authorization.
     pub password: Option<Bytes>,
+    /// certificate information
+    pub cert: Option<CertInfo>,
 }
 
 impl Connect {
@@ -199,6 +202,7 @@ impl From<Publish> for Packet {
 }
 
 impl Packet {
+    /// Returns the MQTT packet type byte for this packet
     pub fn packet_type(&self) -> u8 {
         match self {
             Packet::Connect(_) => packet_type::CONNECT,

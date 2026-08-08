@@ -1,3 +1,21 @@
+//! ACL (Access Control List) plugin for RMQTT.
+//!
+//! Provides rule-based publish/subscribe authorization using
+//! configurable allow/deny rules with topic pattern matching.
+//!
+//! # Rule Evaluation
+//!
+//! Rules are evaluated in order. The first matching rule determines
+//! the authorization decision. If no rules match, the default action
+//! (allow/deny) applies.
+//!
+//! Each rule specifies:
+//! - `action`: `allow` or `deny`
+//! - `username`: Optional client username match
+//! - `clientid`: Optional client ID match
+//! - `topic`: Topic filter for the rule
+//! - `action`: `publish` or `subscribe` (or both)
+//!
 #![deny(unsafe_code)]
 
 use std::str::FromStr;
@@ -23,6 +41,8 @@ mod config;
 
 register!(AclPlugin::new);
 
+const CACHE_KEY: &str = "$SYS/ACL-CACHE-MAP";
+
 #[derive(Plugin)]
 struct AclPlugin {
     scx: ServerContext,
@@ -35,7 +55,7 @@ impl AclPlugin {
     async fn new<N: Into<String>>(scx: ServerContext, name: N) -> Result<Self> {
         let name = name.into();
         let cfg = scx.plugins.read_config_default::<PluginConfig>(&name);
-        log::info!("{} AclPlugin cfg: {:?}", name, cfg);
+        log::info!("{name} AclPlugin cfg: {cfg:?}");
         let cfg = Arc::new(RwLock::new(cfg?));
         let register = scx.extends.hook_mgr().register();
         Ok(Self { scx, register, cfg })
@@ -50,6 +70,7 @@ impl Plugin for AclPlugin {
         let cfg = &self.cfg;
         let priority = cfg.read().await.priority;
         self.register.add_priority(Type::ClientConnected, priority, Box::new(AclHandler::new(cfg))).await;
+        self.register.add_priority(Type::ClientDisconnected, priority, Box::new(AclHandler::new(cfg))).await;
         self.register.add_priority(Type::ClientAuthenticate, priority, Box::new(AclHandler::new(cfg))).await;
         self.register
             .add_priority(Type::ClientSubscribeCheckAcl, priority, Box::new(AclHandler::new(cfg)))
@@ -106,6 +127,8 @@ impl Handler for AclHandler {
                 let cfg = self.cfg.clone();
                 let client_id = session.id.client_id.clone();
                 let username = session.id.username.clone();
+                let extra_attrs = session.extra_attrs.clone();
+
                 let build_placeholders = async move {
                     for rule in cfg.read().await.rules() {
                         for ph_tf in &rule.topics.placeholders {
@@ -115,10 +138,16 @@ impl Handler for AclHandler {
                             } else {
                                 tf = tf.replace(PH_U, "");
                             }
-                            if let Err(e) = rule.add_topic_filter(&tf).await {
+                            if let Err(e) = rule.add_topic_filter(&tf, client_id.clone()).await {
                                 log::error!(
-                                    "acl config error, build_placeholders, add topic filter error, {e:?}"
+                                    "acl config error, build_placeholders, add topic filter error, {e}"
                                 );
+                            }
+                            log::debug!("topic filter: {tf}");
+                            if let Some(caches) =
+                                extra_attrs.write().await.get_default_mut(CACHE_KEY.into(), Vec::default)
+                            {
+                                caches.push(tf);
                             }
                         }
 
@@ -129,6 +158,7 @@ impl Handler for AclHandler {
                             } else {
                                 t = t.replace(PH_U, "");
                             }
+                            log::info!("eq topic: {t}");
                             rule.add_topic_to_eqs(t);
                         }
 
@@ -137,9 +167,23 @@ impl Handler for AclHandler {
                         log::debug!("rule.control: {:?}", rule.control);
                         log::debug!("rule.topics.eqs: {:?}", rule.topics.eqs);
                         log::debug!("rule.topics.tree: {:?}", rule.topics.tree.read().await.list(100));
+                        log::debug!("rule.topics.placeholders: {:?}", rule.topics.placeholders);
                     }
                 };
                 tokio::spawn(build_placeholders);
+            }
+
+            Parameter::ClientDisconnected(session, _reason) => {
+                if let Some(topic_filters) = session.extra_attrs.read().await.get::<Vec<String>>(CACHE_KEY) {
+                    let client_id = session.id.client_id.clone();
+                    for topic_filter in topic_filters {
+                        for rule in self.cfg.read().await.rules() {
+                            if let Err(e) = rule.remove_topic(topic_filter.as_str(), &client_id).await {
+                                log::error!("remove topic filter error, {e}");
+                            }
+                        }
+                    }
+                };
             }
 
             Parameter::ClientAuthenticate(connect_info) => {
@@ -196,7 +240,7 @@ impl Handler for AclHandler {
                     if !hit {
                         continue;
                     }
-                    if !rule.topics.is_match(&topic, topic_filter).await {
+                    if !rule.topics.is_match(&topic, topic_filter, &session.id.client_id).await {
                         continue;
                     }
                     log::debug!(
@@ -231,9 +275,12 @@ impl Handler for AclHandler {
             }
 
             Parameter::MessagePublishCheckAcl(session, publish) => {
-                if let Some(HookResult::PublishAclResult(PublishAclResult::Rejected(_))) = &acc {
-                    return (false, acc);
+                if let Some(HookResult::PublishAclResult(acl_res)) = &acc {
+                    if acl_res.is_rejected() {
+                        return (false, acc);
+                    }
                 }
+
                 let topic_str = &publish.topic;
                 let topic = Topic::from_str(topic_str).unwrap_or_else(|_| Topic::from(Vec::new()));
                 let disconnect_if_pub_rejected = self.cfg.read().await.disconnect_if_pub_rejected;
@@ -248,7 +295,7 @@ impl Handler for AclHandler {
                     if !hit {
                         continue;
                     }
-                    if !rule.topics.is_match(&topic, topic_str).await {
+                    if !rule.topics.is_match(&topic, topic_str, &session.id.client_id).await {
                         continue;
                     }
                     log::debug!(
@@ -258,20 +305,22 @@ impl Handler for AclHandler {
                         topic_str
                     );
                     return if allow {
-                        (false, Some(HookResult::PublishAclResult(PublishAclResult::Allow)))
+                        (false, Some(HookResult::PublishAclResult(PublishAclResult::allow())))
                     } else {
                         (
                             false,
-                            Some(HookResult::PublishAclResult(PublishAclResult::Rejected(
+                            Some(HookResult::PublishAclResult(PublishAclResult::rejected(
                                 disconnect_if_pub_rejected,
+                                None,
                             ))),
                         )
                     };
                 }
                 return (
                     false,
-                    Some(HookResult::PublishAclResult(PublishAclResult::Rejected(
+                    Some(HookResult::PublishAclResult(PublishAclResult::rejected(
                         disconnect_if_pub_rejected,
+                        None,
                     ))),
                 );
             }

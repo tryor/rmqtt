@@ -1,13 +1,12 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2025/03/18/Rust-1.85.1/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.85.0%2B-blue" /></a>
+[![Rust Version](https://img.shields.io/badge/rust-1.89.0%2B-blue)](https://blog.rust-lang.org/2025/08/07/Rust-1.89.0/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rmqtt/rmqtt)
-[![crates.io page](https://img.shields.io/crates/v/rmqtt.svg)](https://crates.io/crates/rmqtt)
-[![docs.rs page](https://docs.rs/rmqtt/badge.svg)](https://docs.rs/rmqtt/latest/rmqtt/)
+[![crates.io](https://img.shields.io/crates/v/rmqtt.svg)](https://crates.io/crates/rmqtt)
+[![docs.rs](https://docs.rs/rmqtt/badge.svg)](https://docs.rs/rmqtt/latest/rmqtt/)
 
-
-English | [简体中文](./README-CN.md)
+[**English**](README.md) | [简体中文](README-CN.md)
 
 *RMQTT* broker is a fully open source, highly scalable, highly available distributed MQTT messaging broker for IoT, M2M
 and mobile applications that can handle millions of concurrent clients on a single service node.
@@ -16,11 +15,11 @@ and mobile applications that can handle millions of concurrent clients on a sing
 
 - 100% Rust safe code;
 - Based on [tokio](https://crates.io/crates/tokio);
-- MQTT v3.1, v3.1.1 and v5.0 protocols support;
-    - QoS0, QoS1, QoS2 message support;
-    - Offline message support;
+- [MQTT v3.1, v3.1.1 and v5.0 protocols support](./docs/en_US/mqtt-protocol.md);
+    - [QoS0, QoS1, QoS2 message support](./docs/en_US/mqtt-protocol.md#41-qos-levels);
+    - [Offline message support](./docs/en_US/offline-message.md);
     - [Retained message support](./docs/en_US/retainer.md);
-    - Last Will message support;
+    - [Last Will message support](./docs/en_US/mqtt-protocol.md#6-retained-and-will-messages);
 - [Distributed cluster](./docs/en_US/cluster-raft.md);
 - [Built-in AUTH/ACL](./docs/en_US/acl.md);
 - [HTTP AUTH/ACL](./docs/en_US/auth-http.md);
@@ -30,17 +29,19 @@ and mobile applications that can handle millions of concurrent clients on a sing
 - [$SYS System Topics](./docs/en_US/sys-topic.md);
 - [Store session information](./docs/en_US/store-session.md);
 - [Store unexpired messages](./docs/en_US/store-message.md);
-- [MQTT Bridging - Ingress Mode](./docs/en_US/bridge-ingress-mqtt.md)
-- [MQTT Bridging - Egress Mode](./docs/en_US/bridge-egress-mqtt.md)
-- [Apache Kafka Bridging - Ingress Mode](./docs/en_US/bridge-ingress-kafka.md)
-- [Apache Kafka Bridging - Egress Mode](./docs/en_US/bridge-egress-kafka.md)
-- [Apache Pulsar Bridging - Ingress Mode](./docs/en_US/bridge-ingress-pulsar.md)
-- [Apache Pulsar Bridging - Egress Mode](./docs/en_US/bridge-egress-pulsar.md)
-- [NATS Bridging - Egress Mode](./docs/en_US/bridge-egress-nats.md)
-- [Reductstore Bridging - Egress Mode](./docs/en_US/bridge-egress-reductstore.md)
-- [Topic Rewrite](./docs/en_US/topic-rewrite.md)
-- [Auto Subscription](./docs/en_US/auto-subscription.md)
-- Shared subscription($share/{Group}/{TopicFilter});
+- [MQTT Bridging - Ingress Mode](./docs/en_US/bridge-ingress-mqtt.md);
+- [MQTT Bridging - Egress Mode](./docs/en_US/bridge-egress-mqtt.md);
+- [Apache Kafka Bridging - Ingress Mode](./docs/en_US/bridge-ingress-kafka.md);
+- [Apache Kafka Bridging - Egress Mode](./docs/en_US/bridge-egress-kafka.md);
+- [Apache Pulsar Bridging - Ingress Mode](./docs/en_US/bridge-ingress-pulsar.md);
+- [Apache Pulsar Bridging - Egress Mode](./docs/en_US/bridge-egress-pulsar.md);
+- [NATS Bridging - Ingress Mode](./docs/en_US/bridge-ingress-nats.md);
+- [NATS Bridging - Egress Mode](./docs/en_US/bridge-egress-nats.md);
+- [Reductstore Bridging - Egress Mode](./docs/en_US/bridge-egress-reductstore.md);
+- [Topic Rewrite](./docs/en_US/topic-rewrite.md);
+- [Auto Subscription](./docs/en_US/auto-subscription.md);
+- [P2P Messaging](./docs/en_US/p2p-messaging.md);
+- [Shared subscription($share/{Group}/{TopicFilter})](./docs/en_US/shared-subscription.md);
 - Exclusive subscription($exclusive/{TopicFilter});
 - Limit subscription($limit/{LimitQuantity}/{TopicFilter});
 - Delayed publish($delayed/{DelayInterval}/{TopicName});
@@ -48,6 +49,7 @@ and mobile applications that can handle millions of concurrent clients on a sing
 - TLS support;
 - WebSocket support;
 - WebSocket-TLS support;
+- MQTT over QUIC support;
 - Built-in extensible components;
 - Extensible plug-in support;
 - Metrics & Stats;
@@ -83,6 +85,31 @@ docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060
 
 Node IDs: 1, 2, 3; Node IP Addrs: 172.17.0.3, 172.17.0.4, 172.17.0.5
 
+#### Create a single node by docker-compose
+
+```yaml
+# docker-compose.yaml
+version: '3'
+
+services:
+  rmqtt:
+    container_name: rmqtt
+    image: rmqtt/rmqtt:latest
+    volumes:
+      - /etc/localtime:/etc/localtime
+      - /app/rmqtt-single/etc/:/app/rmqtt/etc
+      - /app/rmqtt-single/log:/var/log/rmqtt
+    ports:
+      - "1883:1883"
+      - "8080:8080"
+      - "8883:8883"
+      - "11883:11883"
+      - "6060:6060"
+    restart: always
+    command: -f ./etc/rmqtt.toml --id 1
+    privileged: true
+```
+
 #### Create a static cluster by docker-compose
 
 1. [Download docker-compose configuration template](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template-v0.7.zip)
@@ -114,29 +141,48 @@ In addition to running as a standalone MQTT Broker/Server, rmqtt also provides a
 
 ```toml
 [dependencies]
-rmqtt = "0.15"
+rmqtt = "0.21"
 ```
 
 For more details about using rmqtt in library mode, please refer to the [RMQTT Library Documentation](./rmqtt/README.md).
 
-## Experience
+## Plugin System
 
-[//]: # (- MQTT Broker: 47.103.110.134:1883)
+RMQTT has 26 built-in plugins across 6 categories:
 
-[//]: # (- Account:)
+| Category | Plugins |
+|----------|---------|
+| **Auth** | ACL, HTTP Auth, JWT Auth |
+| **Storage** | Retainer, Message Store, Session Store |
+| **Cluster** | Raft, Broadcast |
+| **Bridge** | MQTT (in/out), Kafka (in/out), Pulsar (in/out), NATS (in/out), ReductStore (out), Bridge Origin |
+| **API** | HTTP API, WebHook, Sys Topic |
+| **Utility** | Counter, Auto Subscription, Topic Rewrite, P2P Messaging, Shared Subscription |
 
-[//]: # (- HTTP APIs: http://47.103.110.134:6080/api/v1/)
+[Plugin Development Guide →](docs/en_US/development/plugin-development.md)
+
+## Documentation
+
+| Resource | Description |
+|----------|-------------|
+| [Architecture Overview](docs/en_US/architecture/overview.md) | System architecture, module design, data flow |
+| [Configuration Guide](./rmqtt-conf/README.md) | All configuration options with defaults |
+| [HTTP API Reference](docs/en_US/reference/http-api.md) | 36 REST API endpoints |
+| [Contributing Guide](CONTRIBUTING.md) | How to contribute code |
+| [Changelog](CHANGELOG.md) | Release history |
+| [Developer Guide](docs/en_US/development/getting-started.md) | Build, test, development workflow |
+| [Testing Guide](docs/en_US/development/testing.md) | Unit tests, integration tests, interoperability |
+| Sub-crate docs | [rmqtt](./rmqtt/README.md), [rmqtt-bin](./rmqtt-bin/README.md), [rmqtt-codec](./rmqtt-codec/README.md), [rmqtt-net](./rmqtt-net/README.md), [rmqtt-conf](./rmqtt-conf/README.md), [rmqtt-utils](./rmqtt-utils/README.md), [rmqtt-macros](./rmqtt-macros/README.md), [rmqtt-test](./rmqtt-test/README.md) |
 
 ## Test
 
-### Functional Testing
+### Interoperability Testing
 
 #### paho.mqtt.testing(MQTT V3.1.1) [client_test.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test.py)
 
 * client_test.py Test.test_retained_messages          [OK]
 * client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.will_message_test               [OK]
-* client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.test_offline_message_queueing   [OK]
 * client_test.py Test.test_overlapping_subscriptions  [OK]
 * client_test.py Test.test_keepalive                  [OK]
@@ -179,19 +225,23 @@ For more details about using rmqtt in library mode, please refer to the [RMQTT L
   * You need to modify the `rmqtt-acl.toml` configuration and add the following line at the first line: ["deny", "all", "subscribe", ["test/nosubscribe"]]
 
 
-### Benchmark Testing
+### Integration Test Harness
 
-#### environment
-| Item        | Content                                   |                                                              |
-|-------------|-------------------------------------------|--------------------------------------------------------------|
-| System      | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                                  |
+The `rmqtt-test` crate provides a custom test harness with functional, stress, and chaos suites beyond paho. See [Test Report](docs/en_US/testing-report.md) for details.
+
+### Benchmark
+
+#### Environment
+| Item        | Content                                   |                                                                 |
+|-------------|-------------------------------------------|-----------------------------------------------------------------|
+| System      | x86_64 GNU/Linux                          | Rocky Linux 9.2 (Blue Onyx)                                     |
 | CPU         | Intel(R) Xeon(R) CPU E5-2696 v3 @ 2.30GHz | 72(CPU(s)) = 18(Core(s)) * 2(Thread(s) per core) * 2(Socket(s)) |
-| Memory      | DDR3/2333                                 | 128G                                                         |
-| Disk        |                                           | 2T                                                           |
-| Container   | podman                                    | v4.4.1                                                       |
-| MQTT Bench  | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                       |
-| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.3.0                                                       |
-| Other       | MQTT Bench and MQTT Broker coexistence    |                                                              |
+| Memory      | DDR3/2333                                 | 128G                                                            |
+| Disk        |                                           | 2T                                                              |
+| Container   | podman                                    | v4.4.1                                                          |
+| MQTT Bench  | docker.io/rmqtt/rmqtt-bench:latest        | v0.1.3                                                          |
+| MQTT Broker | docker.io/rmqtt/rmqtt:latest              | v0.3.0                                                          |
+| Other       | MQTT Bench and MQTT Broker coexistence    |                                                                 |
 
 #### Connection Concurrency Performance
 | Item                  | Single Node       | Raft Cluster Mode |
@@ -208,3 +258,14 @@ For more details about using rmqtt in library mode, please refer to the [RMQTT L
 
 [For detailed benchmark test results and information, see documentation.](./docs/en_US/benchmark-testing.md)
 
+---
+
+## Credits
+
+- Starting from version 0.15, the MQTT encoding and decoding implementation is partially inspired by and derived from ntex-mqtt.
+
+- For versions 0.13 and earlier, this project relied on maintained forked versions of the ntex and ntex-mqtt crates as dependencies.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.

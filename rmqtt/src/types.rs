@@ -1,5 +1,13 @@
-//! Some commonly used type definitions
+//! Common type definitions for the RMQTT broker.
+//!
+//! This module defines core data types shared across the broker:
+//! - Connection and session identifiers (`Id`, `ConnectInfo`, `From`)
+//! - MQTT packet wrappers (`Publish`, `Packet`, `Subscribe`, `Unsubscribe`)
+//! - Subscription and ACL result types (`SubscribeReturn`, `PublishAclResult`)
+//! - Protocol-specific type abstractions (`ConnectAckReason`, `SubscriptionOptions`)
+//! - Convenience type aliases for DashMap, HashMap, and common patterns
 
+use std::any::Any;
 use std::convert::From as _f;
 use std::fmt;
 use std::fmt::Display;
@@ -11,21 +19,6 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
-use base64::prelude::{Engine, BASE64_STANDARD};
-use bitflags::bitflags;
-use bytes::Bytes;
-use bytestring::ByteString;
-use futures::StreamExt;
-use get_size::GetSize;
-use itertools::Itertools;
-use serde::de::{self, Deserializer};
-use serde::ser::{SerializeStruct, Serializer};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{oneshot, RwLock};
-
 use crate::acl::AuthInfo;
 use crate::codec::types::MQTT_LEVEL_5;
 use crate::codec::v3::{
@@ -33,9 +26,9 @@ use crate::codec::v3::{
 };
 use crate::codec::v5::{
     Connect as ConnectV5, ConnectAckReason as ConnectAckReasonV5, DisconnectReasonCode,
-    LastWill as LastWillV5, PublishAck, PublishAck2, PublishAck2Reason, PublishAckReason, PublishProperties,
-    RetainHandling, SubscribeAckReason, SubscriptionOptions as SubscriptionOptionsV5, ToReasonCode,
-    UserProperties, UserProperty,
+    LastWill as LastWillV5, PublishAck as PublishAckV5, PublishAck2, PublishAck2Reason, PublishAckReason,
+    PublishProperties, RetainHandling, SubscribeAckReason, SubscriptionOptions as SubscriptionOptionsV5,
+    ToReasonCode, UserProperties, UserProperty,
 };
 use crate::fitter::Fitter;
 use crate::net::MqttError;
@@ -43,6 +36,21 @@ use crate::net::{v3, v5, Builder};
 use crate::queue::{Queue, Sender};
 use crate::utils::{self, timestamp_millis};
 use crate::{codec, Error, Result};
+use anyhow::anyhow;
+use base64::prelude::{Engine, BASE64_STANDARD};
+use bitflags::bitflags;
+use bytes::Bytes;
+use bytestring::ByteString;
+use futures::StreamExt;
+use get_size2::GetSize;
+use itertools::Itertools;
+use rmqtt_codec::cert::CertInfo;
+use serde::de::{self, Deserializer};
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{oneshot, RwLock};
 
 use crate::context::ServerContext;
 use crate::inflight::{OutInflight, OutInflightMessage};
@@ -62,10 +70,10 @@ pub type UserName = ByteString;
 pub type Superuser = bool;
 pub type Password = bytes::Bytes;
 pub type PacketId = u16;
-///topic name or topic filter
+/// Topic name or topic filter represented as a byte string.
 pub type TopicName = ByteString;
 pub type Topic = crate::topic::Topic;
-///topic filter
+/// Topic filter represented as a byte string.
 pub type TopicFilter = ByteString;
 pub type SharedGroup = ByteString;
 pub type LimitSubsCount = Option<usize>;
@@ -90,7 +98,8 @@ pub type QoS = rmqtt_codec::types::QoS;
 pub type PublishReceiveTime = TimestampMillis;
 pub type Subscriptions = Vec<(TopicFilter, SubscriptionOptions)>;
 pub type TopicFilters = Vec<TopicFilter>;
-pub type SubscriptionClientIds = Option<Vec<(ClientId, Option<(TopicFilter, SharedGroup)>)>>;
+pub type ForwardedRecipients = Vec<(ClientId, Option<(TopicFilter, SharedGroup)>)>;
+pub type ForwardedCount = usize;
 pub type SubscriptionIdentifier = NonZeroU32;
 
 pub type HookSubscribeResult = Vec<Option<TopicFilter>>;
@@ -99,7 +108,7 @@ pub type HookUnsubscribeResult = Vec<Option<TopicFilter>>;
 pub type MessageSender = Sender<(From, Publish)>;
 pub type MessageQueue = Queue<(From, Publish)>;
 pub type MessageQueueType = Arc<MessageQueue>;
-pub type OutInflightType = Arc<RwLock<OutInflight>>; //@TODO 考虑去掉 RwLock
+pub type OutInflightType = Arc<RwLock<OutInflight>>; //@TODO Consider removing RwLock wrapper
 
 pub type ConnectInfoType = Arc<ConnectInfo>;
 pub type FitterType = Arc<dyn Fitter>;
@@ -108,6 +117,10 @@ pub type ListenerId = u16;
 
 pub(crate) const UNDEFINED: &str = "undefined";
 
+/// A sender for delivering messages to a specific MQTT session.
+///
+/// Wraps an unbounded MPSC sender with optional debug statistics tracking.
+/// When the `debug` feature is enabled, each send increments a session channel counter.
 #[derive(Clone)]
 pub struct SessionTx {
     #[cfg(feature = "debug")]
@@ -148,6 +161,10 @@ impl SessionTx {
     }
 }
 
+/// MQTT connection information for a client session.
+///
+/// Encapsulates the client identifier and protocol-specific CONNECT packet,
+/// supporting both MQTT v3.1.1 (`V3`) and v5.0 (`V5`) variants.
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum ConnectInfo {
     V3(Id, Box<ConnectV3>),
@@ -218,7 +235,7 @@ impl ConnectInfo {
     }
 
     #[inline]
-    pub fn to_hook_body(&self) -> serde_json::Value {
+    pub fn to_hook_body(&self, user_properties: bool) -> serde_json::Value {
         match self {
             ConnectInfo::V3(id, c) => {
                 json!({
@@ -232,7 +249,7 @@ impl ConnectInfo {
                 })
             }
             ConnectInfo::V5(id, c) => {
-                json!({
+                let mut body = json!({
                     "node": id.node(),
                     "ipaddress": id.remote_addr,
                     "clientid": id.client_id,
@@ -240,7 +257,16 @@ impl ConnectInfo {
                     "keepalive": c.keep_alive,
                     "proto_ver": MQTT_LEVEL_5,
                     "clean_start": c.clean_start,
-                })
+                });
+                if user_properties && !c.user_properties.is_empty() {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert(
+                            "user_properties".into(),
+                            json!(serialize_user_properties(&c.user_properties)),
+                        );
+                    }
+                }
+                body
             }
         }
     }
@@ -319,8 +345,20 @@ impl ConnectInfo {
             None
         }
     }
+
+    #[inline]
+    pub fn cert(&self) -> Option<&CertInfo> {
+        match self {
+            ConnectInfo::V3(_, connect) => connect.cert.as_ref(),
+            ConnectInfo::V5(_, connect) => connect.cert.as_ref(),
+        }
+    }
 }
 
+/// A disconnect request from a client.
+///
+/// Supports MQTT v3.1.1 (no reason code), v5.0 (with reason code and properties),
+/// and a fallback `Other` variant for custom disconnect reasons.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Disconnect {
     V3,
@@ -350,12 +388,49 @@ impl Disconnect {
 
 pub type SubscribeAclResult = SubscribeReturn;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PublishAclResult {
-    Allow,
-    Rejected(IsDisconnect),
+/// Result of a publish ACL check.
+///
+/// Wraps a `PublishResult` indicating whether the publish operation was
+/// allowed or rejected, and whether the connection should be terminated.
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
+pub struct PublishAclResult(pub PublishResult);
+
+impl PublishAclResult {
+    #[inline]
+    pub fn pub_res(self) -> PublishResult {
+        self.0
+    }
+
+    #[inline]
+    pub fn allow() -> Self {
+        PublishAclResult(PublishResult::reason_code(PublishAckReason::Success, None, false))
+    }
+
+    #[inline]
+    pub fn rejected(disconnect: IsDisconnect, reason_string: Option<ByteString>) -> Self {
+        PublishAclResult(PublishResult::reason_code(
+            PublishAckReason::NotAuthorized,
+            Some(reason_string.unwrap_or_else(|| "PublishRefused".into())),
+            disconnect,
+        ))
+    }
+
+    #[inline]
+    pub fn is_allow(&self) -> bool {
+        matches!(self.0.reason_code, PublishAckReason::Success)
+    }
+
+    #[inline]
+    pub fn is_rejected(&self) -> bool {
+        !self.is_allow()
+    }
 }
 
+/// Authentication result for a connection attempt.
+///
+/// Indicates whether the client was authenticated (`Allow` with optional superuser
+/// and ACL rules), or the reason for rejection (`NotFound`, `BadUsernameOrPassword`,
+/// `NotAuthorized`).
 #[derive(Debug, Clone)]
 pub enum AuthResult {
     Allow(Superuser, Option<AuthInfo>),
@@ -365,6 +440,10 @@ pub enum AuthResult {
     NotAuthorized,
 }
 
+/// Result of checking whether a publish message has expired.
+///
+/// Returns either `Expiry` (message has expired) or `Remaining` with the
+/// remaining expiry interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageExpiryCheckResult {
     Expiry,
@@ -471,6 +550,7 @@ pub fn parse_topic_filter(
     let (topic, shared_group, limit_subs) = if shared_subscription || limit_subscription {
         let levels = topic_filter.splitn(3, '/').collect::<Vec<_>>();
         match (levels.first(), levels.get(1), levels.get(2)) {
+            #[cfg(feature = "shared-subscription")]
             (Some(&"$share"), group, tf) => match (shared_subscription, group, tf) {
                 (true, Some(group), Some(tf)) => {
                     let tf = TopicFilter::from(*tf);
@@ -483,6 +563,10 @@ pub fn parse_topic_filter(
                     return Err(anyhow!(format!("Shared subscription is not enabled, {:?}", topic_filter)));
                 }
             },
+            #[cfg(not(feature = "shared-subscription"))]
+            (Some(&"$share"), _, _) => {
+                return Err(anyhow!(format!("Shared subscription is not enabled, {:?}", topic_filter)));
+            }
             (Some(&"$limit"), limit, tf) => match (limit_subscription, limit, tf) {
                 (true, Some(limit), Some(tf)) => {
                     let tf = TopicFilter::from(*tf);
@@ -515,6 +599,10 @@ pub fn parse_topic_filter(
     Ok((topic, shared_group, limit_subs))
 }
 
+/// Subscription options for an MQTT topic filter.
+///
+/// Supports both MQTT v3.1.1 (`V3`) and v5.0 (`V5`) subscription option variants,
+/// including QoS, shared groups, and subscription identifiers.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum SubscriptionOptions {
     V3(SubOptionsV3),
@@ -602,12 +690,14 @@ impl SubscriptionOptions {
     }
 
     #[inline]
-    #[cfg(feature = "shared-subscription")]
     pub fn has_shared_group(&self) -> bool {
+        #[cfg(feature = "shared-subscription")]
         match self {
             SubscriptionOptions::V3(opts) => opts.shared_group.is_some(),
             SubscriptionOptions::V5(opts) => opts.shared_group.is_some(),
         }
+        #[cfg(not(feature = "shared-subscription"))]
+        false
     }
 
     #[inline]
@@ -671,6 +761,10 @@ impl SubscriptionOptions {
     }
 }
 
+/// MQTT v3.1.1 subscription options.
+///
+/// Contains the QoS level, optional shared subscription group (feature-gated),
+/// and optional subscription limit (feature-gated).
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct SubOptionsV3 {
     #[serde(
@@ -691,7 +785,7 @@ impl SubOptionsV3 {
         let mut obj = json!({
             "qos": self.qos.value(),
         });
-        #[cfg(any(feature = "limit-subscription", feature = "shared-subscription"))]
+        #[cfg(any(feature = "shared-subscription", feature = "limit-subscription"))]
         if let Some(obj) = obj.as_object_mut() {
             #[cfg(feature = "shared-subscription")]
             if let Some(g) = &self.shared_group {
@@ -706,6 +800,10 @@ impl SubOptionsV3 {
     }
 }
 
+/// MQTT v5.0 subscription options.
+///
+/// Extends v3 options with No Local, Retain As Published, Retain Handling,
+/// and an optional subscription identifier per the MQTT v5.0 spec.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct SubOptionsV5 {
     #[serde(
@@ -824,6 +922,7 @@ impl std::convert::From<(&SubscriptionOptionsV5, Option<SharedGroup>, LimitSubsC
     }
 }
 
+/// A subscription request with topic filter and options.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Subscribe {
     pub topic_filter: TopicFilter,
@@ -865,6 +964,10 @@ impl Subscribe {
     }
 }
 
+/// Result of a subscribe operation.
+///
+/// Contains the ack reason code and, in case of re-subscription,
+/// the previous subscription options.
 #[derive(Clone, Debug)]
 pub struct SubscribeReturn {
     pub ack_reason: SubscribeAckReason,
@@ -924,6 +1027,7 @@ impl SubscribeReturn {
 //     pub topic_filter: (ByteString, SubscriptionOptionsV5),
 // }
 
+/// MQTT CONNACK reason code, wrapping both v3.1.1 and v5.0 variants.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ConnectAckReason {
     V3(ConnectAckReasonV3),
@@ -973,9 +1077,11 @@ impl ConnectAckReason {
     }
 }
 
+/// An unsubscribe request with topic filter and optional shared group.
 #[derive(Clone, Debug)]
 pub struct Unsubscribe {
     pub topic_filter: TopicFilter,
+    #[cfg(feature = "shared-subscription")]
     pub shared_group: Option<SharedGroup>,
 }
 
@@ -986,14 +1092,25 @@ impl Unsubscribe {
         shared_subscription: bool,
         limit_subscription: bool,
     ) -> Result<Self> {
-        let (topic_filter, shared_group, _) =
+        let (topic_filter, _shared_group, _) =
             parse_topic_filter(topic_filter, shared_subscription, limit_subscription)?;
-        Ok(Unsubscribe { topic_filter, shared_group })
+        Ok(Unsubscribe {
+            topic_filter,
+            #[cfg(feature = "shared-subscription")]
+            shared_group: _shared_group,
+        })
     }
 
     #[inline]
     pub fn is_shared(&self) -> bool {
-        self.shared_group.is_some()
+        #[cfg(feature = "shared-subscription")]
+        {
+            self.shared_group.is_some()
+        }
+        #[cfg(not(feature = "shared-subscription"))]
+        {
+            false
+        }
     }
 }
 
@@ -1003,6 +1120,10 @@ impl Unsubscribe {
 //     V5(UnsubscribeAckV5),
 // }
 
+/// A reference to a client's Last Will and Testament message.
+///
+/// Wraps either an MQTT v3.1.1 or v5.0 last will message, providing
+/// a unified interface for accessing will properties.
 #[derive(Clone)]
 pub enum LastWill<'a> {
     V3(&'a LastWillV3),
@@ -1044,6 +1165,15 @@ impl LastWill<'_> {
         match self {
             LastWill::V3(_) => None,
             LastWill::V5(lw) => lw.will_delay_interval_sec.map(|i| Duration::from_secs(i as u64)),
+        }
+    }
+
+    /// Whether the Will Message is to be Retained when it is published.
+    #[inline]
+    pub fn retain(&self) -> bool {
+        match self {
+            LastWill::V3(lw) => lw.retain,
+            LastWill::V5(lw) => lw.retain,
         }
     }
 
@@ -1345,14 +1475,22 @@ where
     }
 
     #[inline]
-    pub(crate) async fn send_publish_ack(&mut self, packet_id: NonZeroU16) -> Result<()> {
+    pub(crate) async fn send_publish_ack(
+        &mut self,
+        packet_id: NonZeroU16,
+        pubres: PublishResult,
+    ) -> Result<()> {
         match self {
             Sink::V3(s) => {
                 s.send_publish_ack(packet_id).await?;
             }
             Sink::V5(s) => {
-                let ack =
-                    PublishAck { packet_id, reason_code: PublishAckReason::Success, ..Default::default() };
+                let ack = PublishAckV5 {
+                    packet_id,
+                    reason_code: pubres.reason_code,
+                    properties: pubres.properties,
+                    reason_string: pubres.reason_string,
+                };
                 s.send_publish_ack(ack).await?;
             }
         }
@@ -1360,14 +1498,22 @@ where
     }
 
     #[inline]
-    pub(crate) async fn send_publish_received(&mut self, packet_id: NonZeroU16) -> Result<()> {
+    pub(crate) async fn send_publish_received(
+        &mut self,
+        packet_id: NonZeroU16,
+        pubres: PublishResult,
+    ) -> Result<()> {
         match self {
             Sink::V3(s) => {
                 s.send_publish_received(packet_id).await?;
             }
             Sink::V5(s) => {
-                let ack =
-                    PublishAck { packet_id, reason_code: PublishAckReason::Success, ..Default::default() };
+                let ack = PublishAckV5 {
+                    packet_id,
+                    reason_code: pubres.reason_code,
+                    properties: pubres.properties,
+                    reason_string: pubres.reason_string,
+                };
                 s.send_publish_received(ack).await?;
             }
         }
@@ -1409,6 +1555,51 @@ where
     }
 }
 
+/// Result of processing a PUBLISH packet.
+///
+/// Contains the reason code, optional reason string, user properties,
+/// and whether the connection should be disconnected.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PublishResult {
+    pub reason_code: PublishAckReason,
+    pub properties: UserProperties,
+    pub reason_string: Option<ByteString>,
+    pub disconnect: IsDisconnect,
+}
+
+impl PublishResult {
+    #[inline]
+    pub fn success() -> PublishResult {
+        PublishResult { reason_code: PublishAckReason::Success, ..Default::default() }
+    }
+
+    #[inline]
+    pub fn reason_code(
+        reason_code: PublishAckReason,
+        reason_string: Option<ByteString>,
+        disconnect: IsDisconnect,
+    ) -> PublishResult {
+        PublishResult { reason_code, reason_string, disconnect, ..Default::default() }
+    }
+
+    #[inline]
+    pub fn is_success(&self) -> bool {
+        matches!(self.reason_code, PublishAckReason::Success)
+    }
+}
+
+impl Default for PublishResult {
+    fn default() -> Self {
+        Self {
+            reason_code: PublishAckReason::Success,
+            properties: UserProperties::default(),
+            reason_string: None,
+            disconnect: false,
+        }
+    }
+}
+
+/// A decoded MQTT packet from either protocol version.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Packet {
@@ -1416,6 +1607,7 @@ pub enum Packet {
     V5(codec::v5::Packet),
 }
 
+/// Origin type of a message, used for routing and tracing.
 #[derive(GetSize, Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum FromType {
     Custom,
@@ -1445,6 +1637,7 @@ impl std::fmt::Display for FromType {
     }
 }
 
+/// Identifies the origin of a message, including type and client identity.
 #[derive(GetSize, Clone, Deserialize, Serialize)]
 pub struct From {
     typ: FromType,
@@ -1519,10 +1712,14 @@ impl std::fmt::Debug for From {
 
 pub type To = Id;
 
+/// Unique client identifier within the cluster.
+///
+/// Combines node ID, listener ID, addresses, client ID, username,
+/// and creation timestamp into a single identity object.
 #[derive(Clone)]
 pub struct Id(Arc<_Id>);
 
-impl get_size::GetSize for Id {
+impl get_size2::GetSize for Id {
     fn get_heap_size(&self) -> usize {
         self.0.get_heap_size()
     }
@@ -1697,6 +1894,7 @@ impl<'de> Deserialize<'de> for Id {
     }
 }
 
+/// Internal identifier fields stored behind an `Arc` in `Id`.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, GetSize, Deserialize, Serialize)]
 pub struct _Id {
     pub node_id: NodeId,
@@ -1735,6 +1933,7 @@ fn get_option_addr_size_helper(s: &Option<SocketAddr>) -> usize {
     }
 }
 
+/// A retained message with its origin and publish data.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Retain {
     pub msg_id: Option<MsgID>,
@@ -1744,6 +1943,7 @@ pub struct Retain {
 
 pub type MsgID = usize;
 
+/// A persisted message in storage with expiry tracking.
 #[derive(Debug, Clone, Deserialize, Serialize, GetSize)]
 pub struct StoredMessage {
     pub msg_id: MsgID,
@@ -1784,15 +1984,19 @@ impl StoredMessage {
 
     #[inline]
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(&self)?)
+        Ok(postcard::to_stdvec(&self)?)
     }
 
     #[inline]
     pub fn decode(data: &[u8]) -> Result<Self> {
-        Ok(bincode::deserialize(data)?)
+        Ok(postcard::from_bytes(data)?)
     }
 }
 
+/// An internal message sent between broker components.
+///
+/// Variants cover message forwarding, inflight re-delivery, session kicks,
+/// connection close notifications, subscription changes, and state transfer.
 #[derive(Debug)]
 pub enum Message {
     Forward(From, Publish),
@@ -1806,6 +2010,7 @@ pub enum Message {
     SessionStateTransfer(OfflineInfo, CleanStart),
 }
 
+/// Status information for an MQTT session.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionStatus {
     pub id: Id,
@@ -1813,6 +2018,7 @@ pub struct SessionStatus {
     pub handshaking: bool,
 }
 
+/// Parameters for searching subscriptions.
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
 pub struct SubsSearchParams {
     #[serde(default)]
@@ -1821,10 +2027,12 @@ pub struct SubsSearchParams {
     pub topic: Option<String>,
     //value is 0,1,2
     pub qos: Option<u8>,
+    #[cfg(feature = "shared-subscription")]
     pub share: Option<SharedGroup>,
     pub _match_topic: Option<String>,
 }
 
+/// A single subscription search result entry.
 #[derive(Deserialize, Serialize, Debug, Default)]
 pub struct SubsSearchResult {
     pub node_id: NodeId,
@@ -1847,13 +2055,20 @@ impl SubsSearchResult {
     }
 }
 
+/// A route mapping a node ID to a topic filter.
 #[derive(Deserialize, Serialize, Debug, Default, PartialEq, Eq, Hash, Clone)]
 pub struct Route {
     pub node_id: NodeId,
     pub topic: TopicFilter,
 }
 
+/// Thread-safe subscription map for a session.
+///
+/// Wraps a `HashMap<TopicFilter, SubscriptionOptions>` behind `Arc<RwLock>`
+/// for concurrent access.
 pub type SessionSubMap = HashMap<TopicFilter, SubscriptionOptions>;
+
+/// Thread-safe session subscription storage behind `Arc<RwLock>`.
 #[derive(Clone)]
 pub struct SessionSubs {
     subs: Arc<RwLock<SessionSubMap>>,
@@ -1981,7 +2196,7 @@ impl SessionSubs {
         {
             let subs = self.subs.read().await;
             #[allow(unused_variables)]
-            for (_, opts) in subs.iter() {
+            for opts in subs.values() {
                 #[cfg(feature = "stats")]
                 scx.stats.subscriptions.dec();
                 #[cfg(feature = "shared-subscription")]
@@ -2024,150 +2239,70 @@ impl SessionSubs {
     }
 }
 
-// pub struct ExtraData<K, T> {
-//     attrs: Arc<parking_lot::RwLock<HashMap<K, T>>>,
-// }
-//
-// impl<K, T> Deref for ExtraData<K, T> {
-//     type Target = Arc<parking_lot::RwLock<HashMap<K, T>>>;
-//     #[inline]
-//     fn deref(&self) -> &Self::Target {
-//         &self.attrs
-//     }
-// }
-//
-// impl<K, T> Serialize for ExtraData<K, T>
-// where
-//     K: serde::Serialize,
-//     T: serde::Serialize,
-// {
-//     #[inline]
-//     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-//     where
-//         S: Serializer,
-//     {
-//         self.attrs.read().deref().serialize(serializer)
-//     }
-// }
-//
-// impl<'de, K, T> Deserialize<'de> for ExtraData<K, T>
-// where
-//     K: Eq + Hash,
-//     K: serde::de::DeserializeOwned,
-//     T: serde::de::DeserializeOwned,
-// {
-//     #[inline]
-//     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-//     where
-//         D: Deserializer<'de>,
-//     {
-//         let v = HashMap::deserialize(deserializer)?;
-//         Ok(Self { attrs: Arc::new(parking_lot::RwLock::new(v)) })
-//     }
-// }
-//
-// impl<K, T> Default for ExtraData<K, T>
-// where
-//     K: Eq + Hash,
-// {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
-// impl<K, T> ExtraData<K, T>
-// where
-//     K: Eq + Hash,
-// {
-//     #[inline]
-//     pub fn new() -> Self {
-//         Self { attrs: Arc::new(parking_lot::RwLock::new(HashMap::default())) }
-//     }
-//
-//     #[inline]
-//     pub fn len(&self) -> usize {
-//         self.attrs.read().len()
-//     }
-//
-//     #[inline]
-//     pub fn is_empty(&self) -> bool {
-//         self.attrs.read().is_empty()
-//     }
-//
-//     #[inline]
-//     pub fn clear(&self) {
-//         self.attrs.write().clear()
-//     }
-//
-//     #[inline]
-//     pub fn insert(&self, key: K, value: T) {
-//         self.attrs.write().insert(key, value);
-//     }
-// }
-//
-// pub struct ExtraAttrs {
-//     attrs: HashMap<String, Box<dyn Any + Sync + Send>>,
-// }
-//
-// impl Default for ExtraAttrs {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
-//
-// impl ExtraAttrs {
-//     #[inline]
-//     pub fn new() -> Self {
-//         Self { attrs: HashMap::default() }
-//     }
-//
-//     #[inline]
-//     pub fn len(&self) -> usize {
-//         self.attrs.len()
-//     }
-//
-//     #[inline]
-//     pub fn is_empty(&self) -> bool {
-//         self.attrs.is_empty()
-//     }
-//
-//     #[inline]
-//     pub fn clear(&mut self) {
-//         self.attrs.clear()
-//     }
-//
-//     #[inline]
-//     pub fn insert<T: Any + Sync + Send>(&mut self, key: String, value: T) {
-//         self.attrs.insert(key, Box::new(value));
-//     }
-//
-//     #[inline]
-//     pub fn get<T: Any + Sync + Send>(&self, key: &str) -> Option<&T> {
-//         self.attrs.get(key).and_then(|v| v.downcast_ref::<T>())
-//     }
-//
-//     #[inline]
-//     pub fn get_mut<T: Any + Sync + Send>(&mut self, key: &str) -> Option<&mut T> {
-//         self.attrs.get_mut(key).and_then(|v| v.downcast_mut::<T>())
-//     }
-//
-//     #[inline]
-//     pub fn get_default_mut<T: Any + Sync + Send, F: Fn() -> T>(
-//         &mut self,
-//         key: String,
-//         def_fn: F,
-//     ) -> Option<&mut T> {
-//         self.attrs.entry(key).or_insert_with(|| Box::new(def_fn())).downcast_mut::<T>()
-//     }
-//
-//     #[inline]
-//     pub fn serialize_key<S, T>(&self, key: &str, serializer: S) -> Result<S::Ok, S::Error>
-//     where
-//         T: Any + Sync + Send + serde::ser::Serialize,
-//         S: Serializer,
-//     {
-//         self.get::<T>(key).serialize(serializer)
-//     }
-// }
+pub struct ExtraAttrs {
+    attrs: HashMap<ByteString, Box<dyn Any + Sync + Send>>,
+}
+
+impl Default for ExtraAttrs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtraAttrs {
+    #[inline]
+    pub fn new() -> Self {
+        Self { attrs: HashMap::default() }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.attrs.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.attrs.is_empty()
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.attrs.clear()
+    }
+
+    #[inline]
+    pub fn insert<T: Any + Sync + Send>(&mut self, key: ByteString, value: T) {
+        self.attrs.insert(key, Box::new(value));
+    }
+
+    #[inline]
+    pub fn get<T: Any + Sync + Send>(&self, key: &str) -> Option<&T> {
+        self.attrs.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+
+    #[inline]
+    pub fn get_mut<T: Any + Sync + Send>(&mut self, key: &str) -> Option<&mut T> {
+        self.attrs.get_mut(key).and_then(|v| v.downcast_mut::<T>())
+    }
+
+    #[inline]
+    pub fn get_default_mut<T: Any + Sync + Send, F: Fn() -> T>(
+        &mut self,
+        key: ByteString,
+        def_fn: F,
+    ) -> Option<&mut T> {
+        self.attrs.entry(key).or_insert_with(|| Box::new(def_fn())).downcast_mut::<T>()
+    }
+
+    #[inline]
+    pub fn serialize_key<S, T>(&self, key: &str, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        T: Any + Sync + Send + serde::ser::Serialize,
+        S: serde::ser::Serializer,
+    {
+        self.get::<T>(key).serialize(serializer)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TimedValue<V>(V, Option<Instant>);
@@ -2191,6 +2326,23 @@ impl<V> TimedValue<V> {
 
     pub fn is_expired(&self) -> bool {
         self.1.map(|e| Instant::now() >= e).unwrap_or(false)
+    }
+
+    /// Returns the absolute deadline, if set.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.1
+    }
+
+    /// Returns the remaining duration until expiry, if set and not yet expired.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.1.and_then(|d| {
+            let now = Instant::now();
+            if d > now {
+                Some(d.duration_since(now))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -2259,9 +2411,8 @@ pub enum Reason {
     SessionExpiration,
     SubscribeFailed(Option<ByteString>),
     UnsubscribeFailed(Option<ByteString>),
-    PublishFailed(ByteString),
+    PublishResult(PublishResult),
     SubscribeRefused,
-    PublishRefused,
     DelayedPublishRefused,
     MessageExpiration,
     MessageQueueFull,
@@ -2291,6 +2442,84 @@ impl Reason {
     #[inline]
     pub fn is_kicked_by_admin(&self) -> bool {
         matches!(self, Reason::ConnectKicked(true))
+    }
+}
+
+impl std::convert::From<Reason> for PublishResult {
+    fn from(reason: Reason) -> Self {
+        use PublishAckReason::*;
+        use Reason::*;
+
+        match reason {
+            PublishResult(r) => r, // 已经是 PublishResult，直接返回
+
+            MessageQueueFull => Self {
+                reason_code: QuotaExceeded,
+                properties: UserProperties::default(),
+                reason_string: Some("Message queue full".into()),
+                disconnect: false,
+            },
+
+            InflightWindowFull => Self {
+                reason_code: QuotaExceeded,
+                properties: UserProperties::default(),
+                reason_string: Some("Inflight window full".into()),
+                disconnect: false,
+            },
+
+            SubscribeRefused | DelayedPublishRefused => Self {
+                reason_code: ImplementationSpecificError,
+                properties: UserProperties::default(),
+                reason_string: Some("Publish refused".into()),
+                disconnect: false,
+            },
+
+            MessageExpiration => Self {
+                reason_code: UnspecifiedError,
+                properties: UserProperties::default(),
+                reason_string: Some("Message expired".into()),
+                disconnect: true,
+            },
+
+            ProtocolError(msg) => Self {
+                reason_code: UnspecifiedError,
+                properties: UserProperties::default(),
+                reason_string: Some(format!("Protocol error: {msg}").into()),
+                disconnect: true,
+            },
+
+            Error(msg) => Self {
+                reason_code: ImplementationSpecificError,
+                properties: UserProperties::default(),
+                reason_string: Some(msg),
+                disconnect: true,
+            },
+
+            MqttError(_) => Self {
+                reason_code: UnspecifiedError,
+                properties: UserProperties::default(),
+                reason_string: Some("MQTT internal error".into()),
+                disconnect: true,
+            },
+
+            ConnectDisconnect(_)
+            | ConnectReadWriteTimeout
+            | ConnectReadWriteError
+            | ConnectRemoteClose
+            | ConnectKeepaliveTimeout
+            | ConnectKicked(_)
+            | HandshakeRateExceeded
+            | SessionExpiration
+            | SubscribeFailed(_)
+            | UnsubscribeFailed(_)
+            | Reasons(_)
+            | Unknown => Self {
+                reason_code: UnspecifiedError,
+                properties: UserProperties::default(),
+                reason_string: Some("Connection or session related error".into()),
+                disconnect: true,
+            },
+        }
     }
 }
 
@@ -2346,11 +2575,10 @@ impl ToReasonCode for Reason {
             Reason::SubscribeFailed(_) => DisconnectReasonCode::UnspecifiedError,
             Reason::UnsubscribeFailed(_) => DisconnectReasonCode::UnspecifiedError,
             Reason::SubscribeRefused => DisconnectReasonCode::NotAuthorized,
-            Reason::PublishRefused => DisconnectReasonCode::NotAuthorized,
+            Reason::PublishResult(pubres) => pubres.reason_code.to_reason_code(),
             Reason::DelayedPublishRefused => DisconnectReasonCode::NotAuthorized,
             Reason::MessageExpiration => DisconnectReasonCode::MessageRateTooHigh,
             Reason::MessageQueueFull => DisconnectReasonCode::QuotaExceeded,
-            Reason::PublishFailed(_) => DisconnectReasonCode::PacketTooLarge,
             Reason::InflightWindowFull => DisconnectReasonCode::ReceiveMaximumExceeded,
             Reason::ProtocolError(_) => DisconnectReasonCode::ProtocolError,
             Reason::Error(_) => DisconnectReasonCode::UnspecifiedError,
@@ -2420,8 +2648,13 @@ impl Display for Reason {
             Reason::SubscribeRefused => {
                 "SubscribeRefused" //subscribe refused
             }
-            Reason::PublishRefused => {
-                "PublishRefused" //publish refused
+            Reason::PublishResult(pubres) => {
+                if let Some(rs) = pubres.reason_string.as_ref() {
+                    let s: &str = rs.as_ref();
+                    s
+                } else {
+                    &format!("{:?}", pubres.reason_code)
+                }
             }
             Reason::DelayedPublishRefused => {
                 "DelayedPublishRefused" //delayed publish refused
@@ -2432,7 +2665,6 @@ impl Display for Reason {
             Reason::MessageQueueFull => {
                 "MessageQueueFull" //message deliver queue is full
             }
-            Reason::PublishFailed(r) => return write!(f, "PublishFailed({r})"),
             Reason::InflightWindowFull => "Inflight window is full",
             Reason::Error(r) => r,
             Reason::MqttError(e) => &e.to_string(),
@@ -2708,6 +2940,28 @@ impl Default for NodeHealthStatus {
     }
 }
 
+#[inline]
+pub fn serialize_user_properties(props: &UserProperties) -> HashMap<&str, Value> {
+    let mut map: HashMap<&str, Vec<&str>> = HashMap::default();
+
+    for (k, v) in props {
+        map.entry(k.as_ref()).or_default().push(v.as_ref());
+    }
+
+    let mut result = HashMap::default();
+    for (key, values) in map {
+        if values.len() == 1 {
+            result.insert(key, serde_json::Value::String(values[0].to_string()));
+        } else {
+            let array: Vec<serde_json::Value> =
+                values.iter().map(|v| serde_json::Value::String(v.to_string())).collect();
+            result.insert(key, serde_json::Value::Array(array));
+        }
+    }
+
+    result
+}
+
 #[test]
 fn test_reason() {
     assert!(Reason::ConnectKicked(false).is_kicked(false));
@@ -2719,10 +2973,6 @@ fn test_reason() {
     assert!(!Reason::ConnectDisconnect(None).is_kicked(false));
     assert!(!Reason::ConnectDisconnect(None).is_kicked_by_admin());
 
-    let reasons = Reason::Reasons(vec![
-        Reason::PublishRefused,
-        Reason::ConnectKicked(false),
-        Reason::MessageExpiration,
-    ]);
-    assert_eq!(reasons.to_string(), "PublishRefused,Kicked,MessageExpiration");
+    let reasons = Reason::Reasons(vec![Reason::ConnectKicked(false), Reason::MessageExpiration]);
+    assert_eq!(reasons.to_string(), "Kicked,MessageExpiration");
 }

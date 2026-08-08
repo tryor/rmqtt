@@ -38,6 +38,7 @@ use scopeguard::defer;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+use crate::codec::error::DecodeError;
 use crate::codec::v3::{Connect as ConnectV3, ConnectAckReason as ConnectAckReasonV3};
 use crate::context::ServerContext;
 use crate::net::v3;
@@ -50,6 +51,16 @@ use crate::types::{
 use crate::utils::timestamp_millis;
 use crate::{Error, Result};
 
+/// Processes a new MQTT v3.1.1 connection through its full lifecycle.
+///
+/// Performs the protocol handshake, sets up session state, and enters
+/// the main message processing loop. Handles connection refusal with
+/// appropriate CONNACK codes on failure.
+///
+/// # Arguments
+/// * `scx` - Server context for accessing shared state
+/// * `sink` - MQTT v3.1.1 stream for I/O operations
+/// * `lid` - Listener port identifier
 pub(crate) async fn process<Io>(
     scx: ServerContext,
     mut sink: v3::MqttStream<Io>,
@@ -68,6 +79,9 @@ where
             Ok(c) => c,
             Err((ack_code, e)) => {
                 refused_ack_v3(&scx, &mut sink, None, ack_code, e.to_string()).await?;
+                if let Err(e) = sink.close().await {
+                    log::info!("{lid} close io error, {e}");
+                }
                 return Err(e);
             }
         };
@@ -77,6 +91,17 @@ where
     state.run(Sink::V3(sink), keep_alive).await;
 
     Ok(())
+}
+
+#[inline]
+/// Returns true when the error chain contains `DecodeError::InvalidClientId`,
+/// i.e. the client sent a zero-length ClientId while CleanSession was 0
+/// (MQTT-3.1.3-6). Such connections must be rejected with CONNACK return
+/// code 0x02 (Identifier Rejected) instead of a generic ServiceUnavailable.
+fn invalid_client_id(e: &Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<DecodeError>().is_some_and(|de| matches!(de, DecodeError::InvalidClientId))
+    })
 }
 
 #[inline]
@@ -95,10 +120,15 @@ where
         ));
     }
 
-    let mut c = sink
-        .recv_connect(sink.cfg.handshake_timeout)
-        .await
-        .map_err(|e| (ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e))?;
+    let mut c = sink.recv_connect(sink.cfg.handshake_timeout).await.map_err(|e| {
+        if invalid_client_id(&e) {
+            // [MQTT-3.1.3-6] An empty ClientId with CleanSession = 0 must be
+            // rejected with CONNACK return code 0x02 (Identifier Rejected).
+            (ConnectAckReason::V3(ConnectAckReasonV3::IdentifierRejected), e)
+        } else {
+            (ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e)
+        }
+    })?;
 
     log::debug!(
         "new Connection: local_addr: {:?}, remote_addr: {:?}, listen_cfg: {:?}",
@@ -152,9 +182,9 @@ where
                 .map_err(|e| (ConnectAckReason::V3(ConnectAckReasonV3::ServiceUnavailable), e))?;
             Ok((state, keep_alive))
         }
-        Ok(Err(e)) => {
-            log::info!("{id:?} Connection Refused, handshake error, reason: {e:?}");
-            Err(e)
+        Ok(Err((ack_code, e))) => {
+            log::info!("{id:?} Connection Refused, handshake error, reason: {ack_code:?}, {e}");
+            Err((ack_code, e))
         }
         Err(e) => {
             #[cfg(feature = "metrics")]

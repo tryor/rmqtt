@@ -54,6 +54,7 @@ use scopeguard::defer;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+use crate::codec::error::DecodeError;
 use crate::codec::v5::{Connect as ConnectV5, ConnectAck, ConnectAckReason as ConnectAckReasonV5};
 use crate::context::ServerContext;
 use crate::net::v5;
@@ -65,6 +66,17 @@ use crate::types::{
 use crate::utils::timestamp_millis;
 use crate::{Error, Result};
 
+/// Processes a new MQTT v5.0 connection through its full lifecycle.
+///
+/// Performs the protocol handshake with MQTT v5 features (session expiry,
+/// topic aliases, reason codes), sets up session state, and enters
+/// the main message processing loop. Handles connection refusal with
+/// appropriate CONNACK codes on failure.
+///
+/// # Arguments
+/// * `scx` - Server context for accessing shared state
+/// * `sink` - MQTT v5.0 stream for I/O operations
+/// * `lid` - Listener port identifier
 pub(crate) async fn process<Io>(
     scx: ServerContext,
     mut sink: v5::MqttStream<Io>,
@@ -83,6 +95,9 @@ where
             Ok(c) => c,
             Err((ack_code, e)) => {
                 refused_ack(&scx, &mut sink, None, ack_code, e.to_string()).await?;
+                if let Err(e) = sink.close().await {
+                    log::info!("{lid} close io error, {e}");
+                }
                 return Err(e);
             }
         };
@@ -92,6 +107,17 @@ where
     state.run(Sink::V5(sink), keep_alive).await;
 
     Ok(())
+}
+
+#[inline]
+/// Returns true when the error chain contains `DecodeError::InvalidClientId`,
+/// i.e. the client sent a zero-length ClientId while CleanStart was 0
+/// (MQTT-3.1.3-8). Such connections must be rejected with CONNACK 0x85
+/// (Client Identifier not valid) instead of a generic ServerUnavailable.
+fn invalid_client_id(e: &Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<DecodeError>().is_some_and(|de| matches!(de, DecodeError::InvalidClientId))
+    })
 }
 
 #[inline]
@@ -110,10 +136,15 @@ where
         ));
     }
 
-    let mut c = sink
-        .recv_connect(sink.cfg.handshake_timeout)
-        .await
-        .map_err(|e| (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e))?;
+    let mut c = sink.recv_connect(sink.cfg.handshake_timeout).await.map_err(|e| {
+        if invalid_client_id(&e) {
+            // [MQTT-3.1.3-8] An empty ClientId with CleanStart = 0 must be
+            // rejected with CONNACK reason 0x85 (Client Identifier not valid).
+            (ConnectAckReason::V5(ConnectAckReasonV5::ClientIdentifierNotValid), e)
+        } else {
+            (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e)
+        }
+    })?;
 
     log::debug!(
         "new Connection: local_addr: {:?}, remote_addr: {:?}, listen_cfg: {:?}",
@@ -159,9 +190,9 @@ where
                 .map_err(|e| (ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e))?;
             Ok((state, keep_alive))
         }
-        Ok(Err(e)) => {
-            log::info!("{id:?} Connection Refused, handshake error, reason: {e:?}");
-            Err(e)
+        Ok(Err((ack_code, e))) => {
+            log::info!("{id:?} Connection Refused, handshake error, reason: {ack_code:?}, {e}");
+            Err((ack_code, e))
         }
         Err(e) => {
             #[cfg(feature = "metrics")]
@@ -208,6 +239,29 @@ async fn _handshake(
             ConnectAckReason::V5(ConnectAckReasonV5::BadAuthenticationMethod),
             anyhow!("extended Auth is not supported"),
         ));
+    }
+
+    //[MQTT-3.2.2-13] A Server that advertises `Retain Available = 0` in its
+    //CONNACK (retained messages not supported) MUST NOT accept a CONNECT whose
+    //Will Message has `Will Retain = 1`; the connection is rejected with
+    //CONNACK reason 0x9A (Retain not supported).
+    if connect_info.last_will().is_some_and(|lw| lw.retain()) {
+        let retain_available = {
+            #[cfg(feature = "retain")]
+            {
+                scx.extends.retain().await.enable()
+            }
+            #[cfg(not(feature = "retain"))]
+            {
+                false
+            }
+        };
+        if !retain_available {
+            return Err((
+                ConnectAckReason::V5(ConnectAckReasonV5::RetainNotSupported),
+                anyhow!("will retain is not supported by the server"),
+            ));
+        }
     }
 
     let entry = scx.extends.shared().await.entry(id.clone());
@@ -366,7 +420,7 @@ async fn _handshake(
     let shared_subscription_available = {
         #[cfg(feature = "shared-subscription")]
         {
-            state.scx.extends.shared_subscription().await.is_supported(state.listen_cfg())
+            state.scx.extends.shared_subscription().await.is_supported()
         }
         #[cfg(not(feature = "shared-subscription"))]
         {

@@ -1,3 +1,9 @@
+//! Configuration types for the ACL plugin.
+//!
+//! Defines [`PluginConfig`], [`Rule`], [`Access`], [`User`], [`Control`],
+//! and [`Topics`] used to control publish/subscribe access based on client
+//! identity, IP address, protocol version, and topic filters.
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -8,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use tokio::sync::RwLock;
 
+use rmqtt::trie::{VecToString, VecToTopic};
 use rmqtt::{
     hook::Priority,
     trie::TopicTree,
@@ -17,16 +24,22 @@ use rmqtt::{
 
 type DashSet<V> = dashmap::DashSet<V, ahash::RandomState>;
 
+/// Placeholder for client ID in topic filters.
 pub const PH_C: &str = "%c";
+/// Placeholder for username in topic filters.
 pub const PH_U: &str = "%u";
 
+/// Top-level configuration for the ACL plugin.
+///
+/// Controls access rules, hook priority, and behavior when a publish
+/// is rejected.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginConfig {
-    ///Disconnect if publishing is rejected
+    /// Disconnect the client if a publish is rejected by ACL rules.
     #[serde(default = "PluginConfig::disconnect_if_pub_rejected_default")]
     pub disconnect_if_pub_rejected: bool,
 
-    ///Hook priority
+    /// Hook execution priority.
     #[serde(default = "PluginConfig::priority_default")]
     pub priority: Priority,
 
@@ -62,14 +75,14 @@ impl PluginConfig {
                 match rules {
                     Some(Ok(rules)) => rules,
                     Some(Err(e)) => {
-                        log::error!("{e:?}");
+                        log::error!("{e}");
                         Default::default()
                     }
                     None => Default::default(),
                 }
             }
             Err(e) => {
-                log::error!("{e:?}");
+                log::error!("{e}");
                 Default::default()
             }
         };
@@ -77,6 +90,7 @@ impl PluginConfig {
         josn_rules
     }
 
+    /// Returns the parsed ACL rule list.
     #[inline]
     pub fn rules(&self) -> &Vec<Rule> {
         let (_rules, _) = &self.rules;
@@ -95,6 +109,8 @@ impl PluginConfig {
         rules.serialize(s)
     }
 
+    /// Deserializes ACL rules from a `serde_json::Value`, returning both the parsed
+    /// `Vec<Rule>` and the original JSON value for re-serialization.
     #[inline]
     pub fn deserialize_rules<'de, D>(
         deserializer: D,
@@ -106,6 +122,7 @@ impl PluginConfig {
         Self::parse_rules(json_rules).map_err(de::Error::custom)
     }
 
+    /// Serializes the configuration to a JSON value.
     #[inline]
     pub fn to_json(&self) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(self)?)
@@ -124,6 +141,8 @@ impl PluginConfig {
     }
 }
 
+/// A single ACL rule specifying access permission, matching users, MQTT
+/// operation control, and topic filters.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub access: Access,
@@ -133,18 +152,46 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Adds a topic filter with the given client ID to this rule's topic tree.
     #[inline]
-    pub async fn add_topic_filter(&self, topic_filter: &str) -> Result<()> {
+    pub async fn add_topic_filter(&self, topic_filter: &str, clientid: ClientId) -> Result<()> {
         let t = Topic::from_str(topic_filter)?;
-        self.topics.tree.write().await.insert(&t, ());
+        self.topics.tree.write().await.insert(&t, Some(clientid));
         Ok(())
     }
 
+    /// Removes all topic entries matching the given topic string for the
+    /// specified client ID.
+    #[inline]
+    pub async fn remove_topic(&self, topic: &str, clientid: &str) -> Result<()> {
+        let mut topics = Vec::new();
+        {
+            let t = Topic::from_str(topic)?;
+            for (topic_levels, clientids) in self.topics.tree.read().await.matches(&t).iter() {
+                for cid in clientids.iter().copied().flatten() {
+                    if *cid == clientid {
+                        topics.push(topic_levels.to_topic());
+                    }
+                }
+            }
+        }
+        let clientid = Some(ClientId::from(clientid));
+        for topic in topics {
+            self.topics.tree.write().await.remove(&topic, &clientid);
+        }
+        Ok(())
+    }
+
+    /// Adds a topic string to the exact-match set.
     #[inline]
     pub fn add_topic_to_eqs(&self, topic: String) {
         self.topics.eqs.insert(topic);
     }
 
+    /// Checks whether all user conditions in this rule are satisfied by the
+    /// given client `id`.
+    ///
+    /// Returns `(all_users_hit, superuser)`.
     #[inline]
     pub fn hit(
         &self,
@@ -190,12 +237,17 @@ impl std::convert::TryFrom<&serde_json::Value> for Rule {
     }
 }
 
+/// Whether the rule allows or denies access.
 #[derive(Debug, Clone, Copy)]
 pub enum Access {
     Allow,
     Deny,
 }
 
+/// A client matching criterion used in ACL rules.
+///
+/// Can match by username (optionally with password and superuser flag),
+/// client ID, IP address, MQTT protocol version, or match all clients.
 #[derive(Debug, Clone)]
 pub enum User {
     Username(UserName, Option<Password>, Superuser),
@@ -206,6 +258,9 @@ pub enum User {
 }
 
 impl User {
+    /// Checks whether this user criterion matches the given client `id`.
+    ///
+    /// Returns `(matched, superuser)`.
     #[inline]
     pub fn hit(
         &self,
@@ -247,6 +302,7 @@ impl User {
     }
 }
 
+/// The MQTT operation(s) an ACL rule applies to.
 #[derive(Debug, Clone, Copy)]
 pub enum Control {
     ///ALL
@@ -261,25 +317,51 @@ pub enum Control {
     Pubsub,
 }
 
+/// Topic filters associated with an ACL rule.
+///
+/// Supports exact-match topics (`eqs`), topic-tree matching (`tree`),
+/// and placeholder substitution for `%u` (username) and `%c` (client ID).
 #[derive(Debug, Clone)]
 pub struct Topics {
     pub all: bool,
     pub eqs: Arc<DashSet<String>>,
     pub eq_placeholders: Vec<String>,
     //"sensor/%u/ctrl", "sensor/%c/ctrl"
-    pub tree: Arc<RwLock<TopicTree<()>>>,
+    pub tree: Arc<RwLock<TopicTree<Option<ClientId>>>>,
     pub placeholders: Vec<String>, //"sensor/%u/ctrl", "sensor/%c/ctrl"
 }
 
 impl Topics {
-    pub async fn is_match(&self, topic_filter: &Topic, topic_filter_str: &str) -> bool {
+    /// Checks whether the given `topic_filter` string matches any topic in
+    /// this rule, optionally scoped to a specific `client_id`.
+    pub async fn is_match(&self, topic_filter: &Topic, topic_filter_str: &str, client_id: &str) -> bool {
         if self.all {
             return true;
         }
+
         if self.eqs.contains(topic_filter_str) {
             return true;
         }
-        self.tree.read().await.is_match(topic_filter)
+
+        {
+            let tree = self.tree.read().await;
+            let matcheds = tree.matches(topic_filter);
+            for (topic, values) in matcheds.iter() {
+                log::debug!("topic: {:?}, topic_filter_str: {topic_filter_str}", topic.to_string());
+                log::debug!("values: {values:?}");
+                for cid in values {
+                    log::debug!("cid: {cid:?}, client_id: {client_id:?}");
+                    if let Some(cid) = cid {
+                        if cid == client_id {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -390,7 +472,7 @@ impl std::convert::TryFrom<Option<&serde_json::Value>> for Topics {
                             if topic.contains(PH_U) || topic.contains(PH_C) {
                                 placeholders.push(topic.clone());
                             } else {
-                                tree.insert(&Topic::from_str(topic.as_str())?, ());
+                                tree.insert(&Topic::from_str(topic.as_str())?, None);
                             }
                         }
                         Value::Object(eq_map) => match eq_map.get("eq") {

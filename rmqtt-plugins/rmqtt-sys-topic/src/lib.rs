@@ -1,3 +1,16 @@
+//! System topic plugin for RMQTT.
+//!
+//! Publishes broker system status and metrics to `$SYS/` topics.
+//! Clients can subscribe to these topics to monitor broker health,
+//! statistics, and configuration.
+//!
+//! # Features
+//!
+//! - Publishes broker version, uptime, and node status.
+//! - Exposes connection, session, and subscription counts.
+//! - Periodic updates at configurable intervals.
+//! - Cluster-aware aggregated metrics.
+//!
 #![deny(unsafe_code)]
 
 use std::convert::From as _;
@@ -151,7 +164,7 @@ impl SystemTopicHandler {
 #[async_trait]
 impl Handler for SystemTopicHandler {
     async fn hook(&self, param: &Parameter, acc: Option<HookResult>) -> ReturnType {
-        log::debug!("param: {:?}, acc: {:?}", param, acc);
+        log::debug!("param: {param:?}, acc: {acc:?}");
         let now = chrono::Local::now();
         let now_time = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         if let Some((topic, payload)) = match param {
@@ -185,7 +198,7 @@ impl Handler for SystemTopicHandler {
                 let mut body = session
                     .connect_info()
                     .await
-                    .map(|connect_info| connect_info.to_hook_body())
+                    .map(|connect_info| connect_info.to_hook_body(true))
                     .unwrap_or_default();
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert(
@@ -306,11 +319,11 @@ async fn sys_publish(
             if let Err(e) =
                 SessionState::forwards(&scx, from, p, storage_available, Some(message_expiry_interval)).await
             {
-                log::warn!("{e:?}");
+                log::warn!("{e}");
             }
         }
         Err(e) => {
-            log::error!("{e:?}");
+            log::error!("{e}");
         }
     }
 }

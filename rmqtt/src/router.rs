@@ -57,55 +57,67 @@ use crate::utils::Counter;
 use crate::Result;
 
 #[async_trait]
+/// Defines the message routing contract for topic-based subscription management.
+///
+/// Provides operations for adding/removing subscriptions, matching topics
+/// against subscriptions, querying subscription state, and aggregating
+/// routing metadata across cluster nodes. Implementations must be `Send + Sync`.
 pub trait Router: Sync + Send {
-    /// Id add with topic filter
+    /// Add a subscription by client ID with the given topic filter.
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()>;
 
-    /// Remove with id topic filter
+    /// Remove a subscription by client ID with the given topic filter.
     async fn remove(&self, topic_filter: &str, id: Id) -> Result<bool>;
 
-    /// Match with id and topic
+    /// Match subscriptions for a given client ID and topic name.
+    ///
+    /// Returns a map of matching subscription relations, grouped by node ID.
     async fn matches(&self, id: Id, topic: &TopicName) -> Result<SubRelationsMap>;
 
-    ///Check online or offline
+    /// Check whether a client is currently connected to the given node.
     async fn is_online(&self, node_id: NodeId, client_id: &str) -> bool;
 
-    /// Gets by limit
+    /// Get a limited number of unique routes (node ID + topic filter pairs).
     async fn gets(&self, limit: usize) -> Vec<Route>;
 
-    /// Get by topic
+    /// Get all routes matching the given topic.
     async fn get(&self, topic: &str) -> Result<Vec<Route>>;
 
-    ///query subscriptions
+    /// Query subscription relations matching the given search parameters.
     async fn query_subscriptions(&self, q: &SubsSearchParams) -> Vec<SubsSearchResult>;
 
-    /// Topics tree
+    /// Return the number of unique topic filters stored in the topic tree.
     async fn topics_tree(&self) -> usize;
 
-    ///Return number of subscribed topics
+    /// Return the atomic counter tracking the number of subscribed topics.
     fn topics(&self) -> Counter;
 
-    ///Returns the number of Subscription relationship
+    /// Return the atomic counter tracking the number of subscription relations.
     fn routes(&self) -> Counter;
 
-    /// merge Topics with another
+    /// Merge topic counters from another node for cluster-wide aggregation.
     fn merge_topics(&self, topics_map: &HashMap<NodeId, Counter>) -> Counter;
 
-    /// merge routes with another
+    /// Merge route counters from another node for cluster-wide aggregation.
     fn merge_routes(&self, routes_map: &HashMap<NodeId, Counter>) -> Counter;
 
-    ///get topic tree
+    /// List topic filter strings up to the given limit.
     async fn list_topics(&self, top: usize) -> Vec<String>;
 
-    ///get subscription relations
+    /// List subscription relations as JSON values, up to the given limit.
     async fn list_relations(&self, top: usize) -> Vec<serde_json::Value>;
 
-    ///all relations
+    /// Return a reference to the full subscription relations map.
     fn relations(&self) -> &AllRelationsMap;
 }
 
 #[allow(clippy::type_complexity)]
 #[derive(Clone)]
+/// Default implementation of the [`Router`] trait.
+///
+/// Stores subscriptions in a thread-safe trie ([`TopicTree`]) backed by `Arc<RwLock>`, with
+/// subscription relations held in a `DashMap`. Tracks topic and relation counts via atomic
+/// [`Counter`] instances. Supports both individual and shared-subscription routing.
 pub struct DefaultRouter {
     scx: Option<ServerContext>,
     pub topics: Arc<RwLock<TopicTree<()>>>,
@@ -224,8 +236,13 @@ impl DefaultRouter {
             for (group, mut s_subs) in groups.drain() {
                 log::debug!("group: {group}, s_subs: {s_subs:?}");
                 let group_cids = s_subs.iter().map(|(_, cid, _, _, _)| cid.clone()).collect();
-                if let Some((idx, is_online)) =
-                    self.context().extends.shared_subscription().await.choice(self.context(), &s_subs).await
+                if let Some((idx, is_online)) = self
+                    .context()
+                    .extends
+                    .shared_subscription()
+                    .await
+                    .choice(self.context(), &group, &this_id, topic_name, &s_subs)
+                    .await
                 {
                     let (node_id, client_id, opts, _, _) = s_subs.remove(idx);
                     collector_map.entry(node_id).or_default().add(
@@ -267,11 +284,7 @@ impl DefaultRouter {
 
         #[cfg(feature = "shared-subscription")]
         match (&q.share, opts.shared_group()) {
-            (Some(q_group), Some(group)) => {
-                if q_group != group {
-                    return false;
-                }
-            }
+            (Some(q_group), Some(group)) if q_group != group => return false,
             (Some(_), None) => return false,
             _ => {}
         }
@@ -419,7 +432,7 @@ impl DefaultRouter {
 impl Router for DefaultRouter {
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
-        log::debug!("{:?} add, topic_filter: {:?}", id, topic_filter);
+        log::debug!("{id:?} add, topic_filter: {topic_filter:?}");
         let topic = Topic::from_str(topic_filter)?;
         //add to topic tree
         self.topics.write().await.insert(&topic, ());
@@ -441,7 +454,7 @@ impl Router for DefaultRouter {
 
     #[inline]
     async fn remove(&self, topic_filter: &str, id: Id) -> Result<bool> {
-        log::debug!("{:?} remove, topic_filter: {:?}", id, topic_filter);
+        log::debug!("{id:?} remove, topic_filter: {topic_filter:?}");
         //Remove subscription relationship from local
         let res = if let Some(mut rels) = self.relations.get_mut(topic_filter) {
             let remove_enable = rels.value().get(&id.client_id).map(|(s_id, _)| {
@@ -465,7 +478,7 @@ impl Router for DefaultRouter {
             None
         };
 
-        log::debug!("{:?} remove, topic_filter: {:?}, res: {:?}", id, topic_filter, res);
+        log::debug!("{id:?} remove, topic_filter: {topic_filter:?}, res: {res:?}");
 
         let remove_ok = if let Some((is_empty, remove_ok)) = res {
             if is_empty {

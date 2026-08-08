@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use systemstat::Platform;
 
+use crate::context::CircuitBreakerConfig;
 use crate::context::ServerContext;
 #[cfg(feature = "grpc")]
 use crate::grpc::{GrpcClient, GrpcServer};
@@ -39,6 +40,19 @@ const RUSTC_VERSION: &str = env!("RUSTC_VERSION");
 
 const RUSTC_BUILD_TIME: &str = env!("RUSTC_BUILD_TIME");
 
+/// Represents a single RMQTT broker node.
+///
+/// Tracks identity, runtime metadata, and system resource utilization
+/// for health monitoring and cluster coordination.
+///
+/// # Busy Detection
+///
+/// A node is considered "busy" when either:
+/// - System load average (1-min) exceeds `max_busy_loadavg`
+/// - CPU load exceeds `max_busy_cpuloadavg`
+///
+/// Busy state is cached with a configurable update interval to
+/// avoid excessive system calls on the hot path.
 #[derive(Debug)]
 pub struct Node {
     pub id: NodeId,
@@ -90,8 +104,9 @@ impl Node {
         connect_timeout: Duration,
         client_concurrency_limit: usize,
         _batch_size: usize,
+        cb_config: &CircuitBreakerConfig,
     ) -> crate::Result<GrpcClient> {
-        GrpcClient::new(remote_addr, connect_timeout, client_concurrency_limit).await
+        GrpcClient::new(remote_addr, connect_timeout, client_concurrency_limit, cb_config).await
     }
 
     #[cfg(feature = "grpc")]
@@ -104,7 +119,7 @@ impl Node {
     ) {
         tokio::spawn(async move {
             if let Err(e) = GrpcServer::new(scx).listen_and_serve(server_addr, reuseaddr, reuseport).await {
-                log::error!("listen and serve failure, {e:?}, laddr: {server_addr:?}");
+                log::error!("listen and serve failure, {e}, laddr: {server_addr:?}");
             }
         });
     }
@@ -129,11 +144,21 @@ impl Node {
     }
 
     #[inline]
+    pub fn version() -> String {
+        format!("rmqtt/{VERSION}-{RUSTC_BUILD_TIME}")
+    }
+
+    #[inline]
+    pub fn rustc_version() -> String {
+        RUSTC_VERSION.to_string()
+    }
+
+    #[inline]
     pub async fn broker_info(&self, scx: &ServerContext) -> BrokerInfo {
         let node_id = self.id;
         BrokerInfo {
-            version: format!("rmqtt/{VERSION}-{RUSTC_BUILD_TIME}"),
-            rustc_version: RUSTC_VERSION.to_string(),
+            version: Self::version(),
+            rustc_version: Self::rustc_version(),
             uptime: self.uptime(),
             sysdescr: "RMQTT Broker".into(),
             node_status: self.status(scx).await,
@@ -178,8 +203,8 @@ impl Node {
             node_id,
             node_name: self.name(scx, node_id).await, //Runtime::instance().extends.shared().await.node_name(node_id),
             uptime: self.uptime(),
-            version: format!("rmqtt/{VERSION}-{RUSTC_BUILD_TIME}"),
-            rustc_version: RUSTC_VERSION.to_string(),
+            version: Self::version(),
+            rustc_version: Self::rustc_version(),
         }
     }
 
@@ -230,20 +255,17 @@ impl Node {
             .map(|cpuload_aggr| {
                 let aggregate1 =
                     cpuload_aggr.user + cpuload_aggr.nice + cpuload_aggr.system + cpuload_aggr.interrupt;
-                let aggregate2 = aggregate1 + cpuload_aggr.idle;
-                if aggregate2 <= 0.0 {
-                    1.0
-                } else {
-                    aggregate2
-                };
-                aggregate1 / aggregate2 * 10_000.0
+                aggregate1 * 100.0
             })
             .unwrap_or_default();
-
         self.cpuload.store(cpuload as i64, Ordering::SeqCst);
     }
 }
 
+/// Broker-level metadata exposed via the management API.
+///
+/// Includes version information, uptime, node identity, and
+/// current operational status.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BrokerInfo {
     pub version: String,
@@ -271,6 +293,10 @@ impl BrokerInfo {
     }
 }
 
+/// Detailed per-node system resource information.
+///
+/// Captures CPU load averages, memory and disk usage, connection
+/// counts, and runtime metadata for cluster monitoring.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NodeInfo {
     pub connections: isize,
@@ -348,6 +374,11 @@ impl NodeInfo {
     }
 }
 
+/// Operational status of a broker node.
+///
+/// - `Running(usize)` — Active with an associated count (e.g., connected clients).
+/// - `Stop` — Node has been stopped.
+/// - `Error(String)` — Node encountered a fault condition.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeStatus {
@@ -379,6 +410,9 @@ impl Default for NodeStatus {
     }
 }
 
+/// Convert a duration in seconds to a human-readable uptime string.
+///
+/// Returns a formatted string like `"2 days 5 hours, 30 minutes, 15 seconds"`.
 #[inline]
 pub fn to_uptime(uptime: i64) -> String {
     let uptime_secs = uptime % 60;

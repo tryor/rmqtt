@@ -1,3 +1,9 @@
+//! MQTT protocol stream dispatcher and version-specific stream implementations.
+//!
+//! Provides protocol version negotiation ([`Dispatcher::mqtt`]) and version-specific
+//! MQTT v3.1.1/v5.0 stream types ([`v3::MqttStream`], [`v5::MqttStream`]) with send/recv
+//! methods for all MQTT packet types.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,14 +14,14 @@ use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
+use crate::error::MqttError;
+use crate::{Builder, Result};
+use rmqtt_codec::cert::CertInfo;
 use rmqtt_codec::error::{DecodeError, SendPacketError};
 use rmqtt_codec::v3::Codec as CodecV3;
 use rmqtt_codec::v5::Codec as CodecV5;
 use rmqtt_codec::version::{ProtocolVersion, VersionCodec};
 use rmqtt_codec::{MqttCodec, MqttPacket};
-
-use crate::error::MqttError;
-use crate::{Builder, Result};
 
 /// MQTT protocol dispatcher handling version negotiation
 ///
@@ -27,6 +33,8 @@ pub struct Dispatcher<Io> {
     pub remote_addr: SocketAddr,
     /// Shared configuration builder
     pub cfg: Arc<Builder>,
+
+    pub cert_info: Option<CertInfo>,
 }
 
 impl<Io> Dispatcher<Io>
@@ -34,20 +42,33 @@ where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
     /// Creates a new Dispatcher instance
-    pub(crate) fn new(io: Io, remote_addr: SocketAddr, cfg: Arc<Builder>) -> Self {
-        Dispatcher { io: Framed::new(io, MqttCodec::Version(VersionCodec)), remote_addr, cfg }
+    pub(crate) fn new(
+        io: Io,
+        remote_addr: SocketAddr,
+        cert_info: Option<CertInfo>,
+        cfg: Arc<Builder>,
+    ) -> Self {
+        Dispatcher { io: Framed::new(io, MqttCodec::Version(VersionCodec)), remote_addr, cfg, cert_info }
     }
 
     /// Negotiates protocol version and returns appropriate stream
     #[inline]
     pub async fn mqtt(mut self) -> Result<MqttStream<Io>> {
         Ok(match self.probe_version().await? {
-            ProtocolVersion::MQTT3 => {
-                MqttStream::V3(v3::MqttStream { io: self.io, remote_addr: self.remote_addr, cfg: self.cfg })
-            }
-            ProtocolVersion::MQTT5 => {
-                MqttStream::V5(v5::MqttStream { io: self.io, remote_addr: self.remote_addr, cfg: self.cfg })
-            }
+            ProtocolVersion::MQTT3 => MqttStream::V3(v3::MqttStream {
+                io: self.io,
+                remote_addr: self.remote_addr,
+                cfg: self.cfg,
+                #[cfg(feature = "tls")]
+                cert_info: self.cert_info,
+            }),
+            ProtocolVersion::MQTT5 => MqttStream::V5(v5::MqttStream {
+                io: self.io,
+                remote_addr: self.remote_addr,
+                cfg: self.cfg,
+                #[cfg(feature = "tls")]
+                cert_info: self.cert_info,
+            }),
         })
     }
 
@@ -91,13 +112,14 @@ pub mod v3 {
     use tokio::io::{AsyncRead, AsyncWrite};
     use tokio_util::codec::Framed;
 
+    use crate::error::MqttError;
+    use crate::{Builder, Error, Result};
+    #[cfg(feature = "tls")]
+    use rmqtt_codec::cert::CertInfo;
     use rmqtt_codec::error::DecodeError;
     use rmqtt_codec::types::Publish;
     use rmqtt_codec::v3::{Connect, ConnectAckReason, Packet as PacketV3, Packet};
     use rmqtt_codec::{MqttCodec, MqttPacket};
-
-    use crate::error::MqttError;
-    use crate::{Builder, Error, Result};
 
     /// MQTT v3.1.1 protocol stream implementation
     pub struct MqttStream<Io> {
@@ -107,6 +129,9 @@ pub mod v3 {
         pub remote_addr: SocketAddr,
         /// Shared configuration builder
         pub cfg: Arc<Builder>,
+        #[cfg(feature = "tls")]
+        /// TLS certificate information (if available)
+        pub cert_info: Option<CertInfo>,
     }
 
     /// # Examples
@@ -125,6 +150,7 @@ pub mod v3 {
     ///     io: Framed::new(stream, MqttCodec::V3(Default::default())),
     ///     remote_addr: addr,
     ///     cfg: Arc::new(Builder::default()),
+    ///     cert_info: None,
     /// };
     ///
     /// // Send a PING request
@@ -251,7 +277,28 @@ pub mod v3 {
         #[inline]
         pub async fn recv_connect(&mut self, tm: Duration) -> Result<Box<Connect>> {
             let connect = match self.recv(tm).await {
-                Ok(Some(Packet::Connect(connect))) => connect,
+                #[allow(unused_mut)]
+                Ok(Some(Packet::Connect(mut connect))) => {
+                    #[cfg(feature = "tls")]
+                    {
+                        // Subject DN takes precedence over CN when both
+                        // flags are set: full DN includes O/OU/CN and is
+                        // self-namespacing across CAs.
+                        if let Some(cert) = &self.cert_info {
+                            if self.cfg.cert_subject_dn_as_username && !cert.subject.is_empty() {
+                                connect.username = Some(cert.subject.clone().into());
+                            } else if self.cfg.cert_cn_as_username {
+                                if let Some(cn) = &cert.common_name {
+                                    connect.username = Some(cn.clone().into());
+                                }
+                            }
+                        }
+                        if self.cfg.collect_cert_info {
+                            connect.cert = self.cert_info.clone();
+                        }
+                    }
+                    connect
+                }
                 Err(e) => {
                     return Err(e);
                 }
@@ -292,13 +339,14 @@ pub mod v5 {
     use tokio::io::{AsyncRead, AsyncWrite};
     use tokio_util::codec::Framed;
 
+    use crate::error::MqttError;
+    use crate::{Builder, Error, Result};
+    #[cfg(feature = "tls")]
+    use rmqtt_codec::cert::CertInfo;
     use rmqtt_codec::error::DecodeError;
     use rmqtt_codec::types::Publish;
     use rmqtt_codec::v5::{Auth, Connect, Disconnect, Packet as PacketV5, Packet};
     use rmqtt_codec::{MqttCodec, MqttPacket};
-
-    use crate::error::MqttError;
-    use crate::{Builder, Error, Result};
 
     /// MQTT v5.0 protocol stream implementation
     pub struct MqttStream<Io> {
@@ -308,6 +356,9 @@ pub mod v5 {
         pub remote_addr: SocketAddr,
         /// Shared configuration builder
         pub cfg: Arc<Builder>,
+        #[cfg(feature = "tls")]
+        /// TLS certificate information (if available)
+        pub cert_info: Option<CertInfo>,
     }
 
     /// # Examples
@@ -327,6 +378,7 @@ pub mod v5 {
     ///     io: Framed::new(stream, MqttCodec::V5(Default::default())),
     ///     remote_addr: addr,
     ///     cfg: Arc::new(Builder::default()),
+    ///     cert_info: None
     /// };
     ///
     /// // Send authentication packet
@@ -452,7 +504,28 @@ pub mod v5 {
         #[inline]
         pub async fn recv_connect(&mut self, tm: Duration) -> Result<Box<Connect>> {
             let connect = match self.recv(tm).await {
-                Ok(Some(Packet::Connect(connect))) => connect,
+                #[allow(unused_mut)]
+                Ok(Some(Packet::Connect(mut connect))) => {
+                    #[cfg(feature = "tls")]
+                    {
+                        // Subject DN takes precedence over CN when both
+                        // flags are set: full DN includes O/OU/CN and is
+                        // self-namespacing across CAs.
+                        if let Some(cert) = &self.cert_info {
+                            if self.cfg.cert_subject_dn_as_username && !cert.subject.is_empty() {
+                                connect.username = Some(cert.subject.clone().into());
+                            } else if self.cfg.cert_cn_as_username {
+                                if let Some(cn) = &cert.common_name {
+                                    connect.username = Some(cn.clone().into());
+                                }
+                            }
+                        }
+                        if self.cfg.collect_cert_info {
+                            connect.cert = self.cert_info.clone();
+                        }
+                    }
+                    connect
+                }
                 Err(e) => {
                     return Err(e);
                 }

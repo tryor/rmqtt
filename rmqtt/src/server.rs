@@ -181,7 +181,7 @@ impl MqttServer {
     pub fn start(self) {
         tokio::spawn(async move {
             if let Err(e) = self.run().await {
-                log::error!("Failed to start the MQTT server! {e}");
+                eprintln!("Failed to start the MQTT server! {e}");
                 std::process::exit(1);
             }
         });
@@ -207,6 +207,8 @@ impl MqttServer {
                     #[cfg(feature = "tls")]
                     #[cfg(feature = "ws")]
                     ListenerType::WSS => listen_wss(self.scx.clone(), l, *lid).boxed(),
+                    #[cfg(feature = "quic")]
+                    ListenerType::QUIC => listen_quic(self.scx.clone(), l, *lid).boxed(),
                 })
                 .collect_vec(),
         )
@@ -230,7 +232,7 @@ async fn listen_tcp(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     let stream = match accept.tcp() {
                         Ok(s) => s,
                         Err(e) => {
-                            log::warn!("TCP accept error: {e:?}");
+                            log::warn!("TCP accept error: {e}");
                             return;
                         }
                     };
@@ -238,22 +240,22 @@ async fn listen_tcp(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     match stream.mqtt().await {
                         Ok(MqttStream::V3(s)) => {
                             if let Err(e) = v3::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv3 processing error: {e:?}");
+                                log::info!("MQTTv3 processing error: {e}");
                             }
                         }
                         Ok(MqttStream::V5(s)) => {
                             if let Err(e) = v5::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv5 processing error: {e:?}");
+                                log::info!("MQTTv5 processing error: {e}");
                             }
                         }
                         Err(e) => {
-                            log::info!("MQTT version detection failed: {e:?}");
+                            log::info!("MQTT version detection failed: {e}");
                         }
                     }
                 });
             }
             Err(e) => {
-                log::info!("TCP listener error: {e:?}");
+                log::info!("TCP listener error: {e}");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
@@ -276,7 +278,7 @@ async fn listen_tls(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     let stream = match accept.tls().await {
                         Ok(s) => s,
                         Err(e) => {
-                            log::warn!("TLS accept error: {e:?}");
+                            log::warn!("TLS accept error: {e}");
                             return;
                         }
                     };
@@ -284,22 +286,22 @@ async fn listen_tls(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     match stream.mqtt().await {
                         Ok(MqttStream::V3(s)) => {
                             if let Err(e) = v3::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv3/TLS processing error: {e:?}");
+                                log::info!("MQTTv3/TLS processing error: {e}");
                             }
                         }
                         Ok(MqttStream::V5(s)) => {
                             if let Err(e) = v5::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv5/TLS processing error: {e:?}");
+                                log::info!("MQTTv5/TLS processing error: {e}");
                             }
                         }
                         Err(e) => {
-                            log::info!("MQTT/TLS version detection failed: {e:?}");
+                            log::info!("MQTT/TLS version detection failed: {e}");
                         }
                     }
                 });
             }
             Err(e) => {
-                log::info!("TLS listener error: {e:?}");
+                log::info!("TLS listener error: {e}");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
@@ -322,7 +324,7 @@ async fn listen_ws(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     let stream = match accept.ws().await {
                         Ok(s) => s,
                         Err(e) => {
-                            log::warn!("WebSocket accept error: {e:?}");
+                            log::warn!("WebSocket accept error: {e}");
                             return;
                         }
                     };
@@ -330,22 +332,22 @@ async fn listen_ws(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     match stream.mqtt().await {
                         Ok(MqttStream::V3(s)) => {
                             if let Err(e) = v3::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv3/WS processing error: {e:?}");
+                                log::info!("MQTTv3/WS processing error: {e}");
                             }
                         }
                         Ok(MqttStream::V5(s)) => {
                             if let Err(e) = v5::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv5/WS processing error: {e:?}");
+                                log::info!("MQTTv5/WS processing error: {e}");
                             }
                         }
                         Err(e) => {
-                            log::info!("MQTT/WS version detection failed: {e:?}");
+                            log::info!("MQTT/WS version detection failed: {e}");
                         }
                     }
                 });
             }
             Err(e) => {
-                log::info!("WebSocket listener error: {e:?}");
+                log::info!("WebSocket listener error: {e}");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
@@ -368,7 +370,7 @@ async fn listen_wss(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     let stream = match accept.wss().await {
                         Ok(s) => s,
                         Err(e) => {
-                            log::warn!("WSS accept error: {e:?}");
+                            log::warn!("WSS accept error: {e}");
                             return;
                         }
                     };
@@ -376,22 +378,68 @@ async fn listen_wss(scx: ServerContext, l: &Listener, lid: ListenerId) {
                     match stream.mqtt().await {
                         Ok(MqttStream::V3(s)) => {
                             if let Err(e) = v3::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv3/WSS processing error: {e:?}");
+                                log::info!("MQTTv3/WSS processing error: {e}");
                             }
                         }
                         Ok(MqttStream::V5(s)) => {
                             if let Err(e) = v5::process(scx.clone(), s, lid).await {
-                                log::info!("MQTTv5/WSS processing error: {e:?}");
+                                log::info!("MQTTv5/WSS processing error: {e}");
                             }
                         }
                         Err(e) => {
-                            log::info!("MQTT/WSS version detection failed: {e:?}");
+                            log::info!("MQTT/WSS version detection failed: {e}");
                         }
                     }
                 });
             }
             Err(e) => {
-                log::info!("WSS listener error: {e:?}");
+                log::info!("WSS listener error: {e}");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "quic")]
+/// Handles QUIC connections (requires "quic" feature)
+/// # Arguments
+/// * `scx` - Server context
+/// * `l` - QUIC listener configuration
+async fn listen_quic(scx: ServerContext, l: &Listener, lid: ListenerId) {
+    loop {
+        match l.accept_quic().await {
+            Ok(accept) => {
+                let scx = scx.clone();
+                tokio::spawn(async move {
+                    log::debug!("QUIC connection from {}", accept.remote_addr);
+
+                    let stream = match accept.quic().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("QUIC accept error: {e}");
+                            return;
+                        }
+                    };
+
+                    match stream.mqtt().await {
+                        Ok(MqttStream::V3(s)) => {
+                            if let Err(e) = v3::process(scx.clone(), s, lid).await {
+                                log::info!("MQTTv3/QUIC processing error: {e}");
+                            }
+                        }
+                        Ok(MqttStream::V5(s)) => {
+                            if let Err(e) = v5::process(scx.clone(), s, lid).await {
+                                log::info!("MQTTv5/QUIC processing error: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            log::info!("MQTT/QUIC version detection failed: {e}");
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                log::info!("QUIC listener error: {e}");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }

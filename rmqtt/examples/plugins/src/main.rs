@@ -1,3 +1,7 @@
+//! Example: MQTT server with plugin support using the `rmqtt_plugins` meta-crate.
+//! Demonstrates how to register plugins (ACL, HTTP API, Retainer, P2P Messaging)
+//! via the unified `rmqtt_plugins` module path.
+
 use rmqtt::{context::ServerContext, net::Builder, server::MqttServer, Result};
 use simple_logger::SimpleLogger;
 
@@ -10,6 +14,7 @@ async fn main() -> Result<()> {
     rmqtt_plugins::acl::register(&scx, true, false).await?;
     rmqtt_plugins::http_api::register(&scx, true, false).await?;
     rmqtt_plugins::retainer::register(&scx, true, false).await?;
+    rmqtt_plugins::p2p_messaging::register(&scx, true, false).await?;
     // rmqtt_plugins::sys_topic::register(&scx, true, false).await?;
     // rmqtt_plugins::message_storage::register(&scx, true, false).await?;
 

@@ -1,3 +1,9 @@
+//! Network listener configuration for TCP, TLS, WebSocket, WSS, and QUIC protocols.
+//!
+//! Defines the configuration structures for each listener type, including
+//! connection limits, keepalive settings, QoS restrictions, TLS certificate
+//! paths, and proxy protocol support.
+
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::Deref;
@@ -16,6 +22,11 @@ type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 type Port = u16;
 
+/// Collection of all configured network listeners, organized by protocol.
+///
+/// Contains separate maps for TCP, TLS (TCP+SSL), WebSocket, WebSocket Secure,
+/// and QUIC listeners, each keyed by port number. Parsed from raw TOML config
+/// during the server initialization phase.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Listeners {
     #[serde(rename = "tcp")]
@@ -34,6 +45,10 @@ pub struct Listeners {
     #[serde(default)]
     _wsss: HashMap<String, ListenerInner>,
 
+    #[serde(rename = "quic")]
+    #[serde(default)]
+    _quics: HashMap<String, ListenerInner>,
+
     #[serde(default, skip)]
     pub tcps: HashMap<Port, Listener>,
     #[serde(default, skip)]
@@ -42,6 +57,8 @@ pub struct Listeners {
     pub wss: HashMap<Port, Listener>,
     #[serde(default, skip)]
     pub wsss: HashMap<Port, Listener>,
+    #[serde(default, skip)]
+    pub quics: HashMap<Port, Listener>,
 }
 
 impl Listeners {
@@ -74,28 +91,49 @@ impl Listeners {
                 self.wsss.insert(inner.addr.port(), Listener::new(inner));
             }
         }
+
+        for (name, mut inner) in self._quics.drain() {
+            if inner.enable {
+                inner.name = format!("{name}/quic");
+                self.quics.insert(inner.addr.port(), Listener::new(inner));
+            }
+        }
     }
 
+    /// Returns a reference to the TCP listener for the given port, if configured.
     #[inline]
     pub fn tcp(&self, port: u16) -> Option<Listener> {
         self.tcps.get(&port).cloned()
     }
 
+    /// Returns the TLS (TCP+SSL) listener for the given port, if configured.
     #[inline]
     pub fn tls(&self, port: u16) -> Option<Listener> {
         self.tlss.get(&port).cloned()
     }
 
+    /// Returns the WebSocket listener for the given port, if configured.
     #[inline]
     pub fn ws(&self, port: u16) -> Option<Listener> {
         self.wss.get(&port).cloned()
     }
 
+    /// Returns the secure WebSocket (WSS) listener for the given port, if configured.
     #[inline]
     pub fn wss(&self, port: u16) -> Option<Listener> {
         self.wsss.get(&port).cloned()
     }
 
+    /// Returns the QUIC listener for the given port, if configured.
+    #[inline]
+    pub fn quic(&self, port: u16) -> Option<Listener> {
+        self.quics.get(&port).cloned()
+    }
+
+    /// Looks up a listener by port across all protocol types.
+    ///
+    /// Searches TCP, TLS, WebSocket, WSS, and QUIC in order and returns the
+    /// first match found.
     #[inline]
     pub fn get(&self, port: u16) -> Option<Listener> {
         if let Some(l) = self.tcp(port) {
@@ -110,6 +148,9 @@ impl Listeners {
         if let Some(l) = self.wss(port) {
             return Some(l);
         }
+        if let Some(l) = self.quic(port) {
+            return Some(l);
+        }
         None
     }
 
@@ -120,6 +161,10 @@ impl Listeners {
     }
 }
 
+/// A single listener configuration, wrapping an `Arc<ListenerInner>`.
+///
+/// Provides thread-safe shared access to the underlying listener settings
+/// via dereferencing. Created during the initialization phase.
 #[derive(Debug, Clone, Default)]
 pub struct Listener {
     inner: Arc<ListenerInner>,
@@ -139,6 +184,11 @@ impl Deref for Listener {
     }
 }
 
+/// Detailed configuration for a single network listener.
+///
+/// Contains all tunable parameters including connection limits, keepalive
+/// intervals, QoS levels, TLS certificate paths, rate limiting, and
+/// MQTT session expiry settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListenerInner {
     #[serde(default)]
@@ -221,9 +271,6 @@ pub struct ListenerInner {
     #[serde(default = "ListenerInner::max_subscriptions_default")]
     pub max_subscriptions: usize,
 
-    #[serde(default = "ListenerInner::shared_subscription_default")]
-    pub shared_subscription: bool,
-
     #[serde(default)]
     pub max_topic_aliases: u16,
 
@@ -231,6 +278,7 @@ pub struct ListenerInner {
     pub cross_certificate: bool,
     pub cert: Option<String>,
     pub key: Option<String>,
+    pub client_ca_certs: Option<String>,
 
     #[serde(default)]
     pub limit_subscription: bool,
@@ -243,6 +291,17 @@ pub struct ListenerInner {
         deserialize_with = "deserialize_duration"
     )]
     pub proxy_protocol_timeout: Duration,
+
+    #[serde(default)]
+    pub cert_cn_as_username: bool,
+    #[serde(default)]
+    pub cert_subject_dn_as_username: bool,
+    #[serde(default)]
+    pub collect_cert_info: bool,
+
+    //QUIC max_idle_timeout
+    #[serde(default = "ListenerInner::idle_timeout_default", deserialize_with = "deserialize_duration")]
+    pub idle_timeout: Duration,
 }
 
 impl Default for ListenerInner {
@@ -277,15 +336,20 @@ impl Default for ListenerInner {
             message_retry_interval: ListenerInner::message_retry_interval_default(),
             message_expiry_interval: ListenerInner::message_expiry_interval_default(),
             max_subscriptions: ListenerInner::max_subscriptions_default(),
-            shared_subscription: ListenerInner::shared_subscription_default(),
             max_topic_aliases: 0,
             cross_certificate: ListenerInner::cross_certificate_default(),
             cert: None,
             key: None,
+            client_ca_certs: None,
             limit_subscription: false,
             delayed_publish: false,
             proxy_protocol: false,
             proxy_protocol_timeout: ListenerInner::proxy_protocol_timeout_default(),
+
+            cert_cn_as_username: false,
+            cert_subject_dn_as_username: false,
+            collect_cert_info: false,
+            idle_timeout: ListenerInner::idle_timeout_default(),
         }
     }
 }
@@ -399,11 +463,8 @@ impl ListenerInner {
     fn max_subscriptions_default() -> usize {
         0
     }
-    #[inline]
-    fn shared_subscription_default() -> bool {
-        true
-    }
 
+    /// Returns the handshake timeout in milliseconds as a `u16`, capped at `u16::MAX`.
     #[inline]
     pub fn handshake_timeout(&self) -> u16 {
         let millis = self.handshake_timeout.as_millis();
@@ -423,7 +484,7 @@ impl ListenerInner {
         let pair: Vec<&str> = v.split(',').collect();
         if pair.len() == 2 {
             let burst = NonZeroU32::from_str(pair[0])
-                .map_err(|e| de::Error::custom(format!("mqueue_rate_limit, burst format error, {e:?}")))?;
+                .map_err(|e| de::Error::custom(format!("mqueue_rate_limit, burst format error, {e}")))?;
             let replenish_n_per = to_duration(pair[1]);
             if replenish_n_per.as_millis() == 0 {
                 return Err(de::Error::custom(format!(
@@ -470,5 +531,10 @@ impl ListenerInner {
     #[inline]
     fn proxy_protocol_timeout_default() -> Duration {
         Duration::from_secs(5)
+    }
+
+    #[inline]
+    fn idle_timeout_default() -> Duration {
+        Duration::from_secs(90)
     }
 }

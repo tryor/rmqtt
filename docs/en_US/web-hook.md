@@ -103,6 +103,7 @@ rule.message_publish = [{action = "message_publish" }]
 rule.message_delivered = [{action = "message_delivered", topics=["x/y/z", "foo/#"] } ]
 rule.message_acked = [{action = "message_acked", topics=["x/y/z", "foo/#"] } ]
 rule.message_dropped = [{action = "message_dropped" } ]
+rule.offline_message = [{action = "offline_message", topics=["#", "$SYS/#"] }]
 
 ```
 ### Trigger Event
@@ -125,6 +126,7 @@ Currently, the following events are supported:
 | message_delivered   | Message delivered  | Before delivering the message to the client               |
 | message_acked       | Message acknowledged | After the server receives an ACK for the message from the client |
 | message_dropped     | Message dropped    | When the message fails to be successfully forwarded       |
+| offline_message     | Message queued offline | When a message is pushed to an offline session's message queue |
 
 ### [Rule]
 
@@ -246,20 +248,32 @@ opts include
 
 **client_connected**
 
-| Key             | Type    | Description                                        |
-|-----------------|---------|--------------------------------------------------- |
-| action          | string  | Event name<br>Default: "client_connected"           |
-| node            | integer | Node ID                                            |
-| ipaddress       | string  | Source IP address and port of the client               |
-| clientid        | string  | Client ID                                          |
-| username        | string  | Client Username; "undefined" if it doesn't exist     |
-| keepalive       | integer | Requested keep-alive time by the client               |
-| proto_ver       | integer | Protocol version number                             |
-| clean_session   | bool    | Session persistence flag (MQTT 3.1, 3.1.1)          |
-| clean_start     | bool    | Session clean start flag (MQTT 5.0)                 |
+| Key             | Type    | Description                                                   |
+|-----------------|---------|---------------------------------------------------------------|
+| action          | string  | Event name<br>Default: "client_connected"                     |
+| node            | integer | Node ID                                                       |
+| ipaddress       | string  | Source IP address and port of the client                      |
+| clientid        | string  | Client ID                                                     |
+| username        | string  | Client Username; "undefined" if it doesn't exist              |
+| keepalive       | integer | Requested keep-alive time by the client                       |
+| proto_ver       | integer | Protocol version number                                       |
+| clean_session   | bool    | Session persistence flag (MQTT 3.1, 3.1.1)                    |
+| clean_start     | bool    | Session clean start flag (MQTT 5.0)                           |
 | connected_at    | integer | Timestamp in milliseconds when the connection was established |
-| session_present | bool    | Indicates whether a persistent session is present     |
-| time            | string  | Hook Information Creation Time, Format: %Y-%m-%d %H:%M:%S%.3f  |
+| session_present | bool    | Indicates whether a persistent session is present             |
+| user_properties | json    | Attach additional contextual information                      |
+| time            | string  | Hook Information Creation Time, Format: %Y-%m-%d %H:%M:%S%.3f |
+
+user_properties contains
+
+| Key  | Type | Description                          |
+|------|--------------------|------------------------|
+| name | string or [string] | The property name serves as the key, and its value may be a single string or a string array |
+
+Such as:
+```
+{"age": "23", "interests": ["reading", "gaming", "running"], "name": "Alice"}
+```
 
 **client_disconnected**
 
@@ -390,6 +404,29 @@ opts contains
 | packet_id      | string  | Message ID                                       |
 | payload        | string  | Message payload                                  |
 | reason         | string  | Reason for dropping the message                   |
+| pts            | integer | Timestamp in milliseconds when the Publish message was received |
+| ts             | integer | Timestamp in milliseconds when this hook message was generated |
+| time           | string  | Hook Information Creation Time, Format: %Y-%m-%d %H:%M:%S%.3f  |
+
+**offline_message**
+
+| Key            | Type    | Description                                      |
+|----------------| ------- | -------------------------------------------------|
+| action         | string  | Event name<br>Default: "offline_message"          |
+| from_node      | integer | Node ID of the publishing client                   |
+| from_ipaddress | string  | Source IP address and port of the publishing client|
+| from_clientid  | string  | Client ID of the publishing client                |
+| from_username  | string  | Username of the publishing client; "undefined" if it doesn't exist |
+| node           | integer | Node ID                                          |
+| ipaddress      | string  | Source IP address and port of the client           |
+| clientid       | string  | Client ID                                        |
+| username       | string  | Client Username; "undefined" if it doesn't exist   |
+| dup            | bool    | Indicates if the message is a duplicate           |
+| retain         | bool    | Indicates if the message should be retained       |
+| qos            | enum    | QoS level; can be `0`, `1`, or `2`                |
+| topic          | string  | Topic of the message                             |
+| packet_id      | string  | Message ID                                       |
+| payload        | string  | Message payload                                  |
 | pts            | integer | Timestamp in milliseconds when the Publish message was received |
 | ts             | integer | Timestamp in milliseconds when this hook message was generated |
 | time           | string  | Hook Information Creation Time, Format: %Y-%m-%d %H:%M:%S%.3f  |

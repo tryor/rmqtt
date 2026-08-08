@@ -70,18 +70,36 @@ use crate::Result;
 
 type OutQueues = DequeMap<PacketId, OutInflightMessage>;
 
+/// Tracks the acknowledgment status of an inflight message.
+///
+/// Represents the current state in the QoS flow:
+/// - `UnAck`: Published but not yet acknowledged by the subscriber.
+/// - `UnReceived`: PUBREL sent but PUBREC not yet received (QoS 2 only).
+/// - `UnComplete`: QoS 2 handshake initiated but not completed.
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum MomentStatus {
+    /// Published to subscriber, awaiting acknowledgment.
     UnAck,
+    /// PUBREL sent, awaiting PUBREC (QoS 2 only).
     UnReceived,
+    /// QoS 2 handshake in progress, awaiting completion.
     UnComplete,
 }
 
+/// An outbound inflight message with delivery tracking metadata.
+///
+/// Tracks a publish message that has been sent but not yet
+/// acknowledged by the receiver. Used for QoS 1 and QoS 2
+/// retransmission and deduplication logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutInflightMessage {
+    /// The publish message content.
     pub publish: Publish,
+    /// The source of the message (client, broker, or bridge).
     pub from: From,
+    /// Current delivery acknowledgment status.
     pub status: MomentStatus,
+    /// Last status update timestamp (milliseconds since epoch).
     pub update_time: TimestampMillis,
 }
 
@@ -104,6 +122,22 @@ impl OutInflightMessage {
     }
 }
 
+/// Manages outbound inflight messages for QoS 1 and QoS 2 delivery.
+///
+/// Provides packet ID generation, retransmission tracking via
+/// dual-interval timing (retry/expiry), and capacity-based flow control.
+///
+/// # Packet ID Management
+///
+/// Packet IDs are generated atomically via `AtomicU16` starting from 1,
+/// wrapping around when necessary. The system probes up to `u16::MAX`
+/// attempts before reporting exhaustion.
+///
+/// # Timeout Behavior
+///
+/// The effective check interval is `min(retry_interval, expiry_interval)`.
+/// When a timeout fires, [`pop_front_timeout`](OutInflight::pop_front_timeout)
+/// returns the expired message for retransmission or cleanup.
 #[derive(Clone)]
 pub struct OutInflight {
     cap: usize,
@@ -115,6 +149,13 @@ pub struct OutInflight {
 }
 
 impl OutInflight {
+    /// Create a new outbound inflight tracker.
+    ///
+    /// # Arguments
+    ///
+    /// * `cap` — Maximum concurrent outbound messages.
+    /// * `retry_interval` — Delay before retransmitting unacknowledged messages (ms).
+    /// * `expiry_interval` — Time after which messages expire (ms).
     #[inline]
     pub fn new(cap: usize, retry_interval: TimestampMillis, expiry_interval: TimestampMillis) -> Self {
         let interval = Self::interval(retry_interval, expiry_interval);
@@ -128,6 +169,7 @@ impl OutInflight {
         }
     }
 
+    /// Register a callback invoked when a message is pushed to the inflight queue.
     #[inline]
     pub fn on_push<F>(mut self, f: F) -> Self
     where
@@ -137,6 +179,7 @@ impl OutInflight {
         self
     }
 
+    /// Register a callback invoked when a message is popped from the inflight queue.
     #[inline]
     pub fn on_pop<F>(mut self, f: F) -> Self
     where
@@ -156,6 +199,9 @@ impl OutInflight {
         }
     }
 
+    /// Compute the timeout duration until the next inflight message expires.
+    ///
+    /// Returns `None` if no messages are queued or if intervals are zero.
     #[inline]
     pub fn get_timeout(&self) -> Option<Duration> {
         if self.interval == 0 {
@@ -288,6 +334,17 @@ impl OutInflight {
         Err(anyhow!("no packet_id available, should unreachable!()"))
     }
 
+    /// Advance the packet-id allocator so that ids already reserved by
+    /// transferred inflight messages (kept under their old ids) are never
+    /// re-issued to concurrently delivered messages. `next_id` only checks
+    /// the current queue, so without this isolation a stored message
+    /// delivered during session resume can be assigned the same id as a
+    /// transferred message and `push_back` would silently overwrite it.
+    #[inline]
+    pub fn advance_next_id(&self, max_reserved: u16) {
+        self.next.fetch_max(max_reserved.saturating_add(1), Ordering::SeqCst);
+    }
+
     #[inline]
     pub fn to_inflight_messages(&mut self) -> Vec<OutInflightMessage> {
         let mut inflight_messages = Vec::new();
@@ -304,7 +361,19 @@ impl OutInflight {
     }
 }
 
-//@TODO 大小限制，即同一个连接上接收消息的并发限制
+/// Tracks inbound inflight messages for QoS 2 deduplication.
+///
+///
+/// Maintains a set of packet IDs received from the client to detect
+/// duplicate PUBLISH packets (a requirement of the MQTT QoS 2 protocol).
+///
+/// # Flow Control
+///
+/// Enforces a `max_inflight` window to prevent the client from
+/// overwhelming the broker with concurrent QoS 2 publishes.
+///
+/// Size limit for concurrent inbound messages on a single connection.
+/// TODO: Make this configurable per listener/client.
 pub struct InInflight {
     cached: BTreeSet<NonZeroU16>,
     #[allow(dead_code)]
@@ -340,6 +409,16 @@ impl InInflight {
         }
     }
 
+    /// Check whether a packet id is already tracked in the inbound inflight set.
+    ///
+    /// Used by the QoS 2 duplicate detection path ([MQTT-4.3.3-10]): when a
+    /// PUBLISH with the same Packet Identifier arrives before the exchange is
+    /// complete, the broker must answer PUBREC without delivering again.
+    #[inline]
+    pub(crate) fn exist(&self, pid: &NonZeroU16) -> bool {
+        self.cached.contains(pid)
+    }
+
     #[inline]
     pub(crate) fn remove(&mut self, pid: &NonZeroU16) -> bool {
         #[allow(clippy::needless_bool)]
@@ -350,5 +429,112 @@ impl InInflight {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use bytestring::ByteString;
+
+    use crate::types::{CodecPublish, Id};
+
+    fn make_publish(topic: &str, packet_id: u16) -> Publish {
+        Publish {
+            inner: Box::new(CodecPublish {
+                dup: false,
+                retain: false,
+                qos: QoS::ExactlyOnce,
+                topic: ByteString::from(topic),
+                packet_id: NonZeroU16::new(packet_id),
+                properties: None,
+                payload: Bytes::from_static(b"payload"),
+            }),
+            target_clientid: None,
+            delay_interval: None,
+            create_time: None,
+        }
+    }
+
+    fn make_from(client: &str) -> From {
+        From::from_custom(Id::new(1, 1, None, None, ByteString::from(client), None))
+    }
+
+    fn make_msg(topic: &str, pid: u16, status: MomentStatus) -> OutInflightMessage {
+        OutInflightMessage::new(status, make_from(topic), make_publish(topic, pid))
+    }
+
+    /// Root cause 1: the packet-id allocator restarts at 1 and is not
+    /// isolated from the id space of transferred inflight messages
+    /// (which keep their old ids 1..N and are registered later by
+    /// `send_rerelease`). `next_id` only checks the current queue, so a
+    /// concurrently delivered stored message can be assigned the same id.
+    #[test]
+    fn next_id_restarts_at_one_and_collides_with_transfer_ids() {
+        let inflight = OutInflight::new(100, 0, 0);
+        // The transferred messages (old ids 1..=3) are still queued behind
+        // `SendRerelease`; the new session's queue is empty, so the allocator
+        // hands out id 1 again — the exact overlap that causes the collision.
+        assert_eq!(inflight.next_id().unwrap(), 1, "allocator is not isolated from the transferred id space");
+    }
+
+    /// Root cause 2: `push_back` silently overwrites an existing entry with
+    /// the same packet-id (`HashMap::insert`), returning the overwritten id.
+    /// A second registration therefore destroys the first message's QoS 2 state.
+    #[test]
+    fn push_back_same_packet_id_silently_overwrites() {
+        let mut inflight = OutInflight::new(100, 0, 0);
+        inflight.push_back(make_msg("stored/a", 1, MomentStatus::UnReceived));
+
+        // Second registration with the same id (send_rerelease path).
+        let old = inflight.push_back(make_msg("inflight/b", 1, MomentStatus::UnComplete));
+        assert_eq!(old.map(|id| id.get()), Some(1), "push_back reported the overwrite");
+
+        let cur = inflight.get(1).expect("packet 1 is still tracked");
+        assert_eq!(cur.publish.inner.topic, ByteString::from_static("inflight/b"));
+        assert_eq!(cur.status, MomentStatus::UnComplete);
+    }
+
+    /// Fix verification: after `advance_next_id`, new allocations skip the
+    /// transferred id range (1..=N), so a concurrently delivered stored
+    /// message can never collide with a transferred message's old id.
+    #[test]
+    fn advance_next_id_isolates_transfer_id_space() {
+        let inflight = OutInflight::new(100, 0, 0);
+        inflight.advance_next_id(5); // transferred messages keep ids 1..=5
+        assert_eq!(inflight.next_id().unwrap(), 6, "allocator must skip the transferred id range");
+    }
+
+    /// End-to-end mechanism reproduction: during session resume, a stored
+    /// message is first delivered (id 1), then `send_rerelease` registers a
+    /// transferred message under the same old id 1 and overwrites it. The
+    /// stored message's QoS 2 state is permanently lost — the PUBCOMP that
+    /// arrives later completes the *other* message and the stored one has no
+    /// record at all (no resend, no ack hook).
+    #[test]
+    fn resume_collision_loses_stored_message() {
+        let mut inflight = OutInflight::new(100, 0, 0);
+
+        // (1) stored message M1 delivered by send_storaged_messages: next_id=1
+        let pid = NonZeroU16::new(inflight.next_id().unwrap()).unwrap();
+        assert_eq!(pid.get(), 1);
+        inflight.push_back(make_msg("stored/M1", pid.get(), MomentStatus::UnReceived));
+
+        // (2) transferred message M2 (old id 1) registered by send_rerelease → overwrites M1
+        let old = inflight.push_back(make_msg("inflight/M2", pid.get(), MomentStatus::UnComplete));
+        assert_eq!(
+            old.map(|id| id.get()),
+            Some(1),
+            "send_rerelease overwrote the stored message (bug reproduced)"
+        );
+
+        // (3) M1's PUBREC/PUBCOMP removes M2 — M1 is left with no tracking at all
+        let removed = inflight.remove(&pid.get()).expect("something is tracked under id 1");
+        assert_eq!(removed.publish.inner.topic, ByteString::from_static("inflight/M2"));
+        assert!(
+            inflight.get(pid.get()).is_none(),
+            "M1's QoS 2 state is gone: no resend, no ack hook, message effectively lost"
+        );
     }
 }

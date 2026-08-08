@@ -1,3 +1,10 @@
+//! Egress bridge to Kafka.
+//!
+//! Routes MQTT publish messages to Kafka topics. Manages Kafka producers,
+//! topic matching via a trie, and translates MQTT publish metadata into
+//! Kafka message headers (from, client ID, QoS, timestamps, etc.).
+
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,12 +26,14 @@ use rmqtt::{
 
 use crate::config::{Bridge, Entry, PluginConfig};
 
+/// Commands for controlling the bridge lifecycle.
 #[derive(Debug)]
 pub enum Command {
     Start,
     Close,
 }
 
+/// A Kafka producer instance for a single bridge entry.
 #[derive(Clone)]
 pub struct Producer {
     pub(crate) client_id: Option<ByteString>,
@@ -34,6 +43,7 @@ pub struct Producer {
 }
 
 impl Producer {
+    /// Creates a new Kafka producer from bridge configuration.
     pub(crate) fn from(
         cfg: Arc<Bridge>,
         cfg_entry: Entry,
@@ -69,7 +79,13 @@ impl Producer {
     }
 
     #[inline]
-    pub(crate) async fn send(&self, exec: &TaskExecQueue, f: &From, p: &Publish) -> Result<()> {
+    pub(crate) async fn send(
+        &self,
+        exec: &TaskExecQueue,
+        f: &From,
+        p: &Publish,
+        new_local_topic: &str,
+    ) -> Result<()> {
         let mut headers = OwnedHeaders::new();
         headers = headers.insert(Header { key: "from_type", value: Some(f.typ().as_str()) });
         headers =
@@ -95,9 +111,9 @@ impl Producer {
         }
         headers = headers
             .insert(Header { key: "time", value: Some(itoa::Buffer::new().format(timestamp_millis())) });
-        headers = headers.insert(Header { key: "topic", value: Some(p.topic.as_str()) });
+        headers = headers.insert(Header { key: "topic", value: Some(new_local_topic) });
 
-        let topic = self.cfg_entry.remote.make_topic(&p.topic);
+        let topic = self.cfg_entry.remote.make_topic(new_local_topic);
         let payload = p.payload.clone();
         let queue_timeout = self.cfg_entry.remote.queue_timeout;
         let partition = self.cfg_entry.remote.partition;
@@ -114,11 +130,11 @@ impl Producer {
 
             let delivery_status = producer.send(frecord, queue_timeout).await;
             match delivery_status {
-                Ok((partition, offset)) => {
-                    log::debug!("{name} delivery ok, partition: {partition}, offset: {offset}");
+                Ok(delivery) => {
+                    log::debug!("{name} delivery ok, delivery: {delivery:?}");
                 }
                 Err((e, msg)) => {
-                    log::error!("{name} delivery error: {e:?}, message: {msg:?}");
+                    log::error!("{name} delivery error: {e}, message: {msg:?}");
                 }
             };
         }
@@ -131,11 +147,16 @@ impl Producer {
     }
 }
 
+/// A named bridge instance identifier (alias for the bridge name).
 pub(crate) type BridgeName = ByteString;
 type SourceKey = (BridgeName, EntryIndex);
 
 type EntryIndex = usize;
 
+/// Manages the lifecycle and routing of Kafka producers for bridge entries.
+///
+/// Maintains a topic trie for matching inbound MQTT topics to Kafka sinks,
+/// and a task execution queue for asynchronous message delivery.
 #[derive(Clone)]
 pub(crate) struct BridgeManager {
     node_id: NodeId,
@@ -146,6 +167,7 @@ pub(crate) struct BridgeManager {
 }
 
 impl BridgeManager {
+    /// Creates a new `BridgeManager` with the given node ID and plugin configuration.
     pub async fn new(node_id: NodeId, cfg: Arc<RwLock<PluginConfig>>) -> Self {
         Self {
             node_id,
@@ -170,6 +192,8 @@ impl BridgeManager {
         exec
     }
 
+    /// Starts all configured bridge entries by creating Kafka producers
+    /// and populating the topic routing trie.
     pub async fn start(&mut self) -> Result<()> {
         let mut topics = self.topics.write().await;
         let bridges = self.cfg.read().await.bridges.clone();
@@ -205,6 +229,7 @@ impl BridgeManager {
         Ok(())
     }
 
+    /// Stops all bridge entries by clearing the producer map.
     pub async fn stop(&mut self) {
         for mut entry in &mut self.sinks.iter_mut() {
             let ((bridge_name, entry_idx), producers) = entry.pair_mut();
@@ -217,11 +242,16 @@ impl BridgeManager {
         self.sinks.clear();
     }
 
+    /// Returns a reference to the internal sink (producer) map.
     #[allow(unused)]
     pub(crate) fn sinks(&self) -> &DashMap<SourceKey, Vec<Producer>> {
         &self.sinks
     }
 
+    /// Routes an MQTT publish message to matching Kafka producers.
+    ///
+    /// Matches the publish topic against the topic trie, selects a producer
+    /// via random distribution, applies topic skip-levels, and forwards.
     #[inline]
     pub(crate) async fn send(&self, f: &From, p: &Publish) -> Result<()> {
         let topic = Topic::from_str(&p.topic)?;
@@ -234,7 +264,17 @@ impl BridgeManager {
                 if let Some(producers) = self.sinks.get(&(name.clone(), *entry_idx)) {
                     let client_no = rnd % producers.len();
                     if let Some(producer) = producers.get(client_no) {
-                        if let Err(e) = producer.send(&self.exec, f, p).await {
+                        let producer: &Producer = producer;
+                        let new_local_topic: Cow<str> = if producer.cfg_entry.remote.skip_levels > 0 {
+                            Cow::Owned(topic.to_string_skip(producer.cfg_entry.remote.skip_levels))
+                        } else {
+                            Cow::Borrowed(p.topic.as_ref())
+                        };
+                        log::debug!(
+                            "new_local_topic: {new_local_topic}, skip_levels: {}",
+                            producer.cfg_entry.remote.skip_levels
+                        );
+                        if let Err(e) = producer.send(&self.exec, f, p, new_local_topic.as_ref()).await {
                             log::warn!("{e}");
                         }
                     }
@@ -245,6 +285,10 @@ impl BridgeManager {
     }
 }
 
+/// Converts values to their string representation.
+///
+/// Used internally to serialize boolean and ByteString values
+/// for inclusion in Kafka message headers.
 pub trait AsStr {
     fn as_str(&self) -> &str;
 }

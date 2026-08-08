@@ -1,3 +1,16 @@
+//! Kafka egress bridge plugin for RMQTT.
+//!
+//! Forwards MQTT publish messages to Apache Kafka topics.
+//! Supports configurable topic mapping, message transformation,
+//! and delivery guarantees.
+//!
+//! # Features
+//!
+//! - Topic-to-topic mapping between MQTT and Kafka.
+//! - Configurable Kafka producer settings (acks, batch size, etc.).
+//! - Message key extraction from MQTT payload or properties.
+//! - Delivery confirmation with retry on failure.
+//!
 #![deny(unsafe_code)]
 
 use std::ops::Deref;
@@ -51,7 +64,7 @@ impl BridgeKafkaEgressPlugin {
                     match cmd {
                         Command::Start => {
                             if let Err(e) = bridge_mgr.start().await {
-                                log::error!("start bridge error, {e:?}");
+                                log::error!("start bridge error, {e}");
                             }
                         }
                         Command::Close => {
@@ -149,9 +162,10 @@ impl HookHandler {
 impl Handler for HookHandler {
     async fn hook(&self, param: &Parameter, acc: Option<HookResult>) -> ReturnType {
         match param {
-            Parameter::MessagePublish(s, f, publish) => {
-                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), publish);
-                if let Err(e) = self.bridge_mgr.send(f, publish).await {
+            Parameter::MessagePublish(s, f, p) => {
+                let p = if let Some(HookResult::Publish(publish)) = &acc { publish } else { p };
+                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), p);
+                if let Err(e) = self.bridge_mgr.send(f, p).await {
                     log::error!("{e}");
                 }
             }

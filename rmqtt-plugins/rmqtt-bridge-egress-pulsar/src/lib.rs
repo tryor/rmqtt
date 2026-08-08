@@ -1,3 +1,15 @@
+//! Pulsar egress bridge plugin for RMQTT.
+//!
+//! Forwards MQTT publish messages to Apache Pulsar topics.
+//! Supports configurable topic mapping, message key extraction,
+//! and Pulsar producer settings.
+//!
+//! # Features
+//!
+//! - MQTT topic to Pulsar topic mapping.
+//! - Configurable Pulsar producer settings (batching, compression).
+//! - Message ordering and deduplication support.
+//!
 #![deny(unsafe_code)]
 
 use std::ops::Deref;
@@ -139,10 +151,11 @@ impl HookHandler {
 impl Handler for HookHandler {
     async fn hook(&self, param: &Parameter, acc: Option<HookResult>) -> ReturnType {
         match param {
-            Parameter::MessagePublish(s, f, publish) => {
-                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), publish);
-                if let Err(e) = self.bridge_mgr.send(f, publish).await {
-                    log::error!("{e:?}");
+            Parameter::MessagePublish(s, f, p) => {
+                let p = if let Some(HookResult::Publish(publish)) = &acc { publish } else { p };
+                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), p);
+                if let Err(e) = self.bridge_mgr.send(f, p).await {
+                    log::error!("{e}");
                 }
             }
             _ => {

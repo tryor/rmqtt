@@ -7,9 +7,15 @@ use crate::error::EncodeError;
 use crate::types::packet_type;
 use crate::utils::{write_variable_length, Encode};
 
+/// Trait for encoding MQTT v5 packets with packet size limit enforcement
+///
+/// Unlike the base `Encode` trait, this allows encoding to be constrained
+/// by a maximum packet size, truncating or omitting properties as needed.
 pub(crate) trait EncodeLtd {
+    /// Returns the encoded size within the given size limit
     fn encoded_size(&self, limit: u32) -> usize;
 
+    /// Encodes the data into the buffer, respecting the size limit
     fn encode(&self, buf: &mut BytesMut, size: u32) -> Result<(), EncodeError>;
 }
 
@@ -116,6 +122,7 @@ impl EncodeLtd for Packet {
     }
 }
 
+/// Calculates encoded size of optional user properties and reason string, respecting size limit
 pub(crate) fn encoded_size_opt_props(
     user_props: &[UserProperty],
     reason_str: &Option<ByteString>,
@@ -141,6 +148,7 @@ pub(crate) fn encoded_size_opt_props(
     len
 }
 
+/// Encodes optional user properties and reason string, respecting size limit
 pub(crate) fn encode_opt_props(
     user_props: &[UserProperty],
     reason_str: &Option<ByteString>,
@@ -339,6 +347,7 @@ mod tests {
                 topic_alias_max: 0,
                 user_properties: vec![],
                 max_packet_size: None,
+                cert: None,
             })),
             &b"\x10\x1E\x00\x04MQTT\x05\xC0\x00\x3C\x00\x00\
 \x0512345\x00\x04user\x00\x04pass"[..],
@@ -373,6 +382,7 @@ mod tests {
                 topic_alias_max: 0,
                 user_properties: vec![],
                 max_packet_size: None,
+                cert: None,
             })),
             &b"\x10\x23\x00\x04MQTT\x05\x14\x00\x3C\x00\x00\
 \x0512345\x00\x00\x05topic\x00\x07message"[..],
@@ -409,6 +419,7 @@ mod tests {
                 topic_alias_max: 0,
                 user_properties: vec![],
                 max_packet_size: None,
+                cert: None,
             })),
             &b"\x10\x6D\x00\x04MQTT\x05\x34\x00\x3C\x00\x00\
 \x0512345\x4A\x18\0\0\0\x05\x01\x01\x02\0\0\0\x07\x03\0\x0bcontentType\x08\x00\x0dresponseTopic\x09\0\x0fcorrelationData\x26\0\x04name\0\x05value\x00\x05topic\x00\x07message"[..],

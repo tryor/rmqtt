@@ -1,3 +1,22 @@
+//! WebHook plugin for RMQTT.
+//!
+//! Forwards MQTT events (connect, publish, subscribe, disconnect)
+//! to external HTTP endpoints in real time. Supports configurable
+//! event filtering, retry with exponential backoff, batching, and
+//! payload transformation.
+//!
+//! # Architecture
+//!
+//! - Registers hook handlers for client lifecycle and message events.
+//! - Events are serialized to JSON and sent via HTTP POST.
+//! - Failed deliveries are retried using exponential backoff.
+//! - Optional file-based logging of all hooked events for auditing.
+//!
+//! # Configuration
+//!
+//! See [`config::PluginConfig`] for available options including
+//! URL templates, event filters, retry policies, and concurrency.
+//!
 #![deny(unsafe_code)]
 
 use std::path::Path;
@@ -158,7 +177,7 @@ impl WebHookPlugin {
             )
             .await
             {
-                log::warn!("Failed to build the web-hook message, {e:?}");
+                log::warn!("Failed to build the web-hook message, {e}");
             }
         }
         .spawn(exec)
@@ -266,6 +285,12 @@ impl Plugin for WebHookPlugin {
         self.register
             .add(
                 Type::MessageDropped,
+                Box::new(WebHookHandler { tx: tx.clone(), chan_queue_count: chan_queue_count.clone() }),
+            )
+            .await;
+        self.register
+            .add(
+                Type::OfflineMessage,
                 Box::new(WebHookHandler { tx: tx.clone(), chan_queue_count: chan_queue_count.clone() }),
             )
             .await;
@@ -442,7 +467,7 @@ impl WebHookHandler {
             let data = match serde_json::to_vec(body.as_ref()) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("write hook message failure, {e:?}");
+                    log::warn!("write hook message failure, {e}");
                     return;
                 }
             };
@@ -479,7 +504,7 @@ impl WebHookHandler {
         .await
         {
             fails.current_inc();
-            log::warn!("send web hook message failure, {e:?}");
+            log::warn!("send web hook message failure, {e}");
         }
     }
 
@@ -515,14 +540,14 @@ impl Handler for WebHookHandler {
         let now_time = format_timestamp_millis(now);
         let bodys = match param {
             Parameter::ClientConnect(conn_info) => {
-                let mut body = conn_info.to_hook_body();
+                let mut body = conn_info.to_hook_body(false);
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert("time".into(), serde_json::Value::String(now_time));
                 }
                 Some((None, body))
             }
             Parameter::ClientConnack(conn_info, conn_ack) => {
-                let mut body = conn_info.to_hook_body();
+                let mut body = conn_info.to_hook_body(false);
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert("conn_ack".into(), serde_json::Value::String(conn_ack.reason().to_string()));
                     obj.insert("time".into(), serde_json::Value::String(now_time));
@@ -531,7 +556,7 @@ impl Handler for WebHookHandler {
             }
 
             Parameter::ClientConnected(session) => {
-                let mut body = session.connect_info().await.map(|c| c.to_hook_body()).unwrap_or_default();
+                let mut body = session.connect_info().await.map(|c| c.to_hook_body(true)).unwrap_or_default();
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert(
                         "connected_at".into(),
@@ -719,18 +744,39 @@ impl Handler for WebHookHandler {
                     Some((None, body))
                 }
             }
+            Parameter::OfflineMessage(session, from, publish) => {
+                if from.is_system() {
+                    None
+                } else {
+                    let topic = &publish.topic;
+                    let body = json!({
+                        "dup": publish.dup,
+                        "retain": publish.retain,
+                        "qos": publish.qos.value(),
+                        "topic": topic,
+                        "packet_id": publish.packet_id,
+                        "payload": BASE64_STANDARD.encode(publish.payload.as_ref()),
+                        "pts": publish.create_time,
+                        "ts": now,
+                        "time": now_time
+                    });
+                    let body = session.id.to_to_json(body);
+                    let body = from.to_from_json(body);
+                    Some((Some(topic.clone()), body))
+                }
+            }
             _ => {
                 log::error!("parameter is: {param:?}");
                 None
             }
         };
 
-        log::debug!("bodys: {:?}", bodys);
+        log::debug!("bodys: {bodys:?}");
 
         if let Some((topic, body)) = bodys {
             let tx = self.tx.read().await.clone();
             if let Err(e) = tx.send((typ, topic, body)).await {
-                log::warn!("web-hook send error, typ: {typ:?}, {e:?}");
+                log::warn!("web-hook send error, typ: {typ:?}, {e}");
             } else {
                 self.chan_queue_count.fetch_add(1, Ordering::SeqCst);
             }

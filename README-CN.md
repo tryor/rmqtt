@@ -1,12 +1,12 @@
 # RMQTT Broker
 
 [![GitHub Release](https://img.shields.io/github/release/rmqtt/rmqtt?color=brightgreen)](https://github.com/rmqtt/rmqtt/releases)
-<a href="https://blog.rust-lang.org/2025/03/18/Rust-1.85.1/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.85.0%2B-blue" /></a>
+[![Rust Version](https://img.shields.io/badge/rust-1.89.0%2B-blue)](https://blog.rust-lang.org/2025/08/07/Rust-1.89.0/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rmqtt/rmqtt)
-[![crates.io page](https://img.shields.io/crates/v/rmqtt.svg)](https://crates.io/crates/rmqtt)
-[![docs.rs page](https://docs.rs/rmqtt/badge.svg)](https://docs.rs/rmqtt/latest/rmqtt/)
+[![crates.io](https://img.shields.io/crates/v/rmqtt.svg)](https://crates.io/crates/rmqtt)
+[![docs.rs](https://docs.rs/rmqtt/badge.svg)](https://docs.rs/rmqtt/latest/rmqtt/)
 
-[English](./README.md)  | 简体中文
+[English](README.md) | [**简体中文**](README-CN.md)
 
 *RMQTT* 是一款完全开源，高度可伸缩，高可用的分布式 MQTT 消息服务器，适用于 IoT、M2M 和移动应用程序，可以在单个服务节点上处理百万级别的并发客户端。
 
@@ -14,11 +14,11 @@
 
 - 100% Rust安全编码;
 - 基于 [tokio](https://crates.io/crates/tokio) 开发;
-- 支持MQTT v3.1,v3.1.1 及 v5.0协议;
-    - QoS0, QoS1, QoS2 消息支持;
-    - 离线消息支持;
+- [支持MQTT v3.1,v3.1.1 及 v5.0协议](./docs/zh_CN/mqtt-protocol.md);
+    - [QoS0, QoS1, QoS2 消息支持](./docs/zh_CN/mqtt-protocol.md#41-qos-说明);
+    - [离线消息支持](./docs/zh_CN/offline-message.md);
     - [Retained 消息支持](./docs/zh_CN/retainer.md);
-    - Last Will 消息支持;
+    - [Last Will 消息支持](./docs/zh_CN/mqtt-protocol.md#6-保留消息与遗嘱消息);
 - [分布式集群](./docs/zh_CN/cluster-raft.md);
 - [内置 AUTH/ACL](./docs/zh_CN/acl.md);
 - [HTTP AUTH/ACL](./docs/zh_CN/auth-http.md);
@@ -28,17 +28,19 @@
 - [$SYS 系统主题](./docs/zh_CN/sys-topic.md);
 - [存储会话信息](./docs/zh_CN/store-session.md);
 - [存储未过期消息](./docs/zh_CN/store-message.md);
-- [MQTT桥接-入口模式](./docs/zh_CN/bridge-ingress-mqtt.md)
-- [MQTT桥接-出口模式](./docs/zh_CN/bridge-egress-mqtt.md)
-- [Apache Kafka桥接-入口模式](./docs/zh_CN/bridge-ingress-kafka.md)
-- [Apache kafka桥接-出口模式](./docs/zh_CN/bridge-egress-kafka.md)
-- [Apache Pulsar桥接-入口模式](./docs/zh_CN/bridge-ingress-pulsar.md)
-- [Apache Pulsar桥接-出口模式](./docs/zh_CN/bridge-egress-pulsar.md)
-- [NATS桥接-出口模式](./docs/zh_CN/bridge-egress-nats.md)
-- [Reductstore桥接-出口模式](./docs/zh_CN/bridge-egress-reductstore.md)
-- [主题重写](./docs/zh_CN/topic-rewrite.md)
-- [自动订阅](./docs/zh_CN/auto-subscription.md)
-- 共享订阅($share/{Group}/{TopicFilter});
+- [MQTT桥接-入口模式](./docs/zh_CN/bridge-ingress-mqtt.md);
+- [MQTT桥接-出口模式](./docs/zh_CN/bridge-egress-mqtt.md);
+- [Apache Kafka桥接-入口模式](./docs/zh_CN/bridge-ingress-kafka.md);
+- [Apache kafka桥接-出口模式](./docs/zh_CN/bridge-egress-kafka.md);
+- [Apache Pulsar桥接-入口模式](./docs/zh_CN/bridge-ingress-pulsar.md);
+- [Apache Pulsar桥接-出口模式](./docs/zh_CN/bridge-egress-pulsar.md);
+- [NATS桥接-入口模式](./docs/zh_CN/bridge-ingress-nats.md);
+- [NATS桥接-出口模式](./docs/zh_CN/bridge-egress-nats.md);
+- [Reductstore桥接-出口模式](./docs/zh_CN/bridge-egress-reductstore.md);
+- [主题重写](./docs/zh_CN/topic-rewrite.md);
+- [自动订阅](./docs/zh_CN/auto-subscription.md);
+- [P2P 消息传递](./docs/zh_CN/p2p-messaging.md);
+- [共享订阅($share/{Group}/{TopicFilter})](./docs/zh_CN/shared-subscription.md);
 - 排它订阅($exclusive/{TopicFilter});
 - 限制订阅($limit/{LimitQuantity}/{TopicFilter});
 - 延迟发布($delayed/{DelayInterval}/{TopicName});
@@ -46,6 +48,7 @@
 - TLS支持;
 - WebSocket支持;
 - WebSocket-TLS支持;
+- MQTT over QUIC支持;
 - 内置可扩展功能;
 - 支持扩展插件;
 - 指标监控;
@@ -80,6 +83,31 @@ docker run -d --name rmqtt -p 1883:1883 -p 8883:8883 -p 11883:11883 -p 6060:6060
 
 节点IDs: 1, 2, 3; 节点IP Addrs: 172.17.0.3, 172.17.0.4, 172.17.0.5
 
+#### 通过 docker-compose 创建单节点
+
+```yaml
+# docker-compose.yaml
+version: '3'
+
+services:
+  rmqtt:
+    container_name: rmqtt
+    image: rmqtt/rmqtt:latest
+    volumes:
+      - /etc/localtime:/etc/localtime
+      - /app/rmqtt-single/etc/:/app/rmqtt/etc
+      - /app/rmqtt-single/log:/var/log/rmqtt
+    ports:
+      - "1883:1883"
+      - "8080:8080"
+      - "8883:8883"
+      - "11883:11883"
+      - "6060:6060"
+    restart: always
+    command: -f ./etc/rmqtt.toml --id 1
+    privileged: true
+```
+
 #### 通过 docker-compose 创建静态集群
 
 1. [下载配置模板](https://github.com/rmqtt/templates/blob/main/docker-compose-template/docker-compose-template-v0.7.zip)
@@ -111,29 +139,48 @@ curl "http://127.0.0.1:6066/api/v1/health/check"
 
 ```toml
 [dependencies]
-rmqtt = "0.15"
+rmqtt = "0.21"
 ```
 
-更多关于库模式的使用说明，请参考 [RMQTT 库使用文档](./rmqtt/README.md) 。
+更多关于库模式的使用说明，请参考 [RMQTT 库使用文档](./rmqtt/README-CN.md) 。
 
-## 体验
+## 插件系统
 
-[//]: # (- MQTT Broker：47.103.110.134:1883)
+RMQTT 内置 26 个插件，分为 6 大类：
 
-[//]: # (- Account: 无)
+| 分类 | 插件 |
+|------|------|
+| **认证** | ACL、HTTP 认证、JWT 认证 |
+| **存储** | Retainer、消息存储、会话存储 |
+| **集群** | Raft、广播 |
+| **桥接** | MQTT（入/出）、Kafka（入/出）、Pulsar（入/出）、NATS（入/出）、ReductStore（出）、桥接来源 |
+| **API** | HTTP API、WebHook、系统主题 |
+| **功能** | Counter、自动订阅、主题重写、P2P 消息、共享订阅 |
 
-[//]: # (- HTTP APIs: http://47.103.110.134:6080/api/v1/)
+[插件开发指南 →](docs/zh_CN/development/plugin-development.md)
+
+## 文档资源
+
+| 资源 | 说明 |
+|------|------|
+| [架构概览](docs/zh_CN/architecture/overview.md) | 系统架构、模块设计、数据流 |
+| [配置指南](./rmqtt-conf/README-CN.md) | 所有配置项及默认值 |
+| [HTTP API 参考](docs/zh_CN/reference/http-api.md) | 36 个 REST API 端点 |
+| [贡献指南](CONTRIBUTING-CN.md) | 如何贡献代码 |
+| [更新日志](CHANGELOG.md) | 版本历史 |
+| [开发入门](docs/zh_CN/development/getting-started.md) | 构建、测试、开发工作流 |
+| [测试指南](docs/zh_CN/development/testing.md) | 单元测试、集成测试、互操作性 |
+| 子项目文档 | [rmqtt](./rmqtt/README-CN.md)、[rmqtt-bin](./rmqtt-bin/README-CN.md)、[rmqtt-codec](./rmqtt-codec/README-CN.md)、[rmqtt-net](./rmqtt-net/README-CN.md)、[rmqtt-conf](./rmqtt-conf/README-CN.md)、[rmqtt-utils](./rmqtt-utils/README-CN.md)、[rmqtt-macros](./rmqtt-macros/README-CN.md)、[rmqtt-test](./rmqtt-test/README-CN.md) |
 
 ## 测试
 
-### 功能测试
+### 互操作性测试
 
 #### paho.mqtt.testing(MQTT V3.1.1) [client_test.py](https://github.com/eclipse/paho.mqtt.testing/blob/master/interoperability/client_test.py)
 
 * client_test.py Test.test_retained_messages          [OK]
 * client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.will_message_test               [OK]
-* client_test.py Test.test_zero_length_clientid       [OK]
 * client_test.py Test.test_offline_message_queueing   [OK]
 * client_test.py Test.test_overlapping_subscriptions  [OK]
 * client_test.py Test.test_keepalive                  [OK]
@@ -176,6 +223,10 @@ rmqtt = "0.15"
   * 需要修改rmqtt-acl.toml配置，在第一行添加：["deny", "all", "subscribe", ["test/nosubscribe"]]
 
 
+### 集成测试框架
+
+`rmqtt-test` crate 提供了自定义测试框架，包含功能测试、压力测试和混沌测试套件。详见[测试报告](docs/zh_CN/testing-report.md)。
+
 ### 基准测试
 
 #### 环境
@@ -205,7 +256,14 @@ rmqtt = "0.15"
 
 [基准测试详细内容，请参阅](./docs/zh_CN/benchmark-testing.md)
 
+---
 
+## Credits
 
+- 从 0.15 版本开始，本项目的 MQTT 编解码实现部分参考并借鉴了 ntex-mqtt 的实现。
 
+- 在 0.13 及之前的版本，本项目依赖了维护的 ntex 和 ntex-mqtt fork 版本作为依赖库。
 
+## 许可证
+
+基于 [MIT](LICENSE-MIT) 或 [Apache 2.0](LICENSE-APACHE) 许可证。

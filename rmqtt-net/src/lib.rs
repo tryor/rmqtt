@@ -27,13 +27,23 @@
 //! ```
 
 mod builder;
+mod cert_extractor;
 mod error;
+#[cfg(feature = "quic")]
+mod quic;
 mod stream;
 #[cfg(feature = "ws")]
 mod ws;
 
+/// QUIC bidirectional stream type for MQTT over QUIC transport
+#[cfg(feature = "quic")]
+pub use quic::QuinnBiStream;
+
 /// Server configuration and listener management
 pub use builder::{Builder, Listener, ListenerType};
+
+/// Trait for extracting TLS certificate information from client connections
+pub use cert_extractor::TlsCertExtractor;
 
 /// Error types for MQTT operations
 pub use error::MqttError;

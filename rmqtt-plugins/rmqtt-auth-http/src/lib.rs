@@ -1,3 +1,20 @@
+//! HTTP-based authentication and ACL plugin for RMQTT.
+//!
+//! Delegates client authentication and publish/subscribe ACL checks
+//! to an external HTTP API. Supports flexible auth logic based on
+//! custom HTTP endpoint responses.
+//!
+//! # Architecture
+//!
+//! - Hooks into `ClientAuthenticate`, `ClientSubscribeCheckAcl`,
+//!   and `MessagePublishCheckAcl` events.
+//! - Sends HTTP POST requests to configurable URLs with client
+//!   credentials and connection metadata as JSON payload.
+//! - Caches authentication results with configurable TTL to reduce
+//!   HTTP call overhead.
+//! - Supports username/password, client ID, and certificate-based
+//!   authentication flows.
+//!
 #![deny(unsafe_code)]
 
 use std::sync::Arc;
@@ -252,7 +269,7 @@ impl AuthHandler {
                 match tm.parse::<i64>() {
                     Ok(tm) => Some(tm),
                     Err(e) => {
-                        log::warn!("Parse X-Cache error, {e:?}");
+                        log::warn!("Parse X-Cache error, {e}");
                         None
                     }
                 }
@@ -302,7 +319,7 @@ impl AuthHandler {
         log::debug!("http_get_request, timeout: {timeout:?}, url: {url}");
         match httpc.get(url).headers(headers).timeout(timeout).query(body).send().await {
             Err(e) => {
-                log::warn!("{e:?}");
+                log::warn!("{e}");
                 Err(anyhow!(e))
             }
             Ok(resp) => Self::response_result(resp).await,
@@ -320,7 +337,7 @@ impl AuthHandler {
         log::debug!("http_form_request, method: {method:?}, timeout: {timeout:?}, url: {url}");
         match httpc.request(method, url).headers(headers).timeout(timeout).form(body).send().await {
             Err(e) => {
-                log::warn!("{e:?}");
+                log::warn!("{e}");
                 Err(anyhow!(e))
             }
             Ok(resp) => Self::response_result(resp).await,
@@ -338,7 +355,7 @@ impl AuthHandler {
         log::debug!("http_json_request, method: {method:?}, timeout: {timeout:?}, url: {url}");
         match httpc.request(method, url).headers(headers).timeout(timeout).json(body).send().await {
             Err(e) => {
-                log::warn!("{e:?}");
+                log::warn!("{e}");
                 Err(anyhow!(e))
             }
             Ok(resp) => Self::response_result(resp).await,
@@ -493,7 +510,7 @@ impl AuthHandler {
                     (acl_res.permission, acl_res.cacheable)
                 }
                 Err(e) => {
-                    log::warn!("{id:?} acl error, {e:?}");
+                    log::warn!("{id:?} acl error, {e}");
                     if self.cfg.read().await.deny_if_error {
                         (Permission::Deny, None)
                     } else {
@@ -593,8 +610,10 @@ impl Handler for AuthHandler {
 
             Parameter::MessagePublishCheckAcl(session, publish) => {
                 log::debug!("MessagePublishCheckAcl");
-                if let Some(HookResult::PublishAclResult(PublishAclResult::Rejected(_))) = &acc {
-                    return (false, acc);
+                if let Some(HookResult::PublishAclResult(acl_res)) = &acc {
+                    if acl_res.is_rejected() {
+                        return (false, acc);
+                    }
                 }
 
                 if let Some(auth_info) = &session.auth_info {
@@ -632,12 +651,13 @@ impl Handler for AuthHandler {
 
                 return match acl_res {
                     Permission::Allow(_) => {
-                        (false, Some(HookResult::PublishAclResult(PublishAclResult::Allow)))
+                        (false, Some(HookResult::PublishAclResult(PublishAclResult::allow())))
                     }
                     Permission::Deny => (
                         false,
-                        Some(HookResult::PublishAclResult(PublishAclResult::Rejected(
+                        Some(HookResult::PublishAclResult(PublishAclResult::rejected(
                             self.cfg.read().await.disconnect_if_pub_rejected,
+                            None,
                         ))),
                     ),
                     Permission::Ignore => (true, None),

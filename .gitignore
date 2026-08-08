@@ -9,8 +9,18 @@ target/
 */*/target/
 */*/Cargo.lock
 */*/*.iml
-/Cargo.lock
 /readme.txt
-!.github
 /publishs-dry-run.bat
-/publishs.bat
+/publishs-login.bat
+
+# Exclusions:
+!.dockerignore
+!.github
+/CODEBUDDY.md
+/code-review-report
+/docs/architecture
+/overview.md
+/DMyWorkspaceMyProjectsrustworkspacermqtt-rsrmqtt.workbuddymemory2026-06-22.md
+/designs
+/git-commit-message.md
+/*.log

@@ -29,16 +29,29 @@
 //! }
 //! ```
 
-use proxy_protocol::parse;
-use proxy_protocol::ProxyHeader;
-use proxy_protocol::{version1 as v1, version2 as v2};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
+#[cfg(feature = "quic")]
+use crate::quic::QuinnBiStream;
+use crate::stream::Dispatcher;
+#[cfg(feature = "ws")]
+use crate::ws::WsStream;
+#[cfg(feature = "tls")]
+use crate::TlsCertExtractor;
+use crate::{Error, Result};
+#[allow(unused_imports)]
+use anyhow::{anyhow, Context};
 use nonzero_ext::nonzero;
+use proxy_protocol::parse;
+use proxy_protocol::ProxyHeader;
+use proxy_protocol::{version1 as v1, version2 as v2};
+#[cfg(feature = "quic")]
+use quinn::{crypto::rustls::QuicServerConfig, IdleTimeout};
+#[cfg(feature = "tls")]
+use rmqtt_codec::cert::CertInfo;
 use rmqtt_codec::types::QoS;
 #[cfg(not(target_os = "windows"))]
 #[cfg(feature = "tls")]
@@ -46,6 +59,8 @@ use rustls::crypto::aws_lc_rs as provider;
 #[cfg(feature = "tls")]
 #[cfg(target_os = "windows")]
 use rustls::crypto::ring as provider;
+#[cfg(feature = "tls")]
+use rustls::pki_types::CertificateDer;
 #[cfg(feature = "tls")]
 use rustls::{pki_types::pem::PemObject, server::WebPkiClientVerifier, RootCertStore, ServerConfig};
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -58,11 +73,6 @@ use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{ErrorResponse, Request, Response},
 };
-
-use crate::stream::Dispatcher;
-#[cfg(feature = "ws")]
-use crate::ws::WsStream;
-use crate::{Error, Result};
 
 /// Configuration builder for MQTT server instances
 #[derive(Clone, Debug)]
@@ -123,8 +133,6 @@ pub struct Builder {
     pub message_expiry_interval: Duration,
     /// Maximum subscriptions per client (0 = unlimited)
     pub max_subscriptions: usize,
-    /// Enable shared subscription support
-    pub shared_subscription: bool,
     /// Maximum topic aliases (MQTTv5 feature)
     pub max_topic_aliases: u16,
     /// Enable subscription count limiting
@@ -138,10 +146,29 @@ pub struct Builder {
     pub tls_cert: Option<String>,
     /// Path to TLS private key
     pub tls_key: Option<String>,
+    /// Path to TLS client ca certs
+    pub tls_client_ca_certs: Option<String>,
     /// Enable Proxy Protocol
     pub proxy_protocol: bool,
     /// Proxy Protocol timeout
     pub proxy_protocol_timeout: Duration,
+
+    /// Use TLS Certificate CN as Username
+    pub cert_cn_as_username: bool,
+
+    /// Use the full Subject DN of the TLS Certificate as Username.
+    /// Overrides `cert_cn_as_username` when both are set. Useful when
+    /// multiple CAs are trusted on the same listener and CNs may
+    /// collide — the full DN includes O / OU / CN and naturally
+    /// namespaces identities (e.g. `OU=ANS,CN=alice` vs
+    /// `OU=EnduranceUser,CN=alice`).
+    pub cert_subject_dn_as_username: bool,
+
+    /// Collect TLS Certificate information
+    pub collect_cert_info: bool,
+
+    /// QUIC(max_idle_timeout)
+    pub idle_timeout: Duration,
 }
 
 impl Default for Builder {
@@ -193,7 +220,6 @@ impl Builder {
             message_retry_interval: Duration::from_secs(20),
             message_expiry_interval: Duration::from_secs(5 * 60),
             max_subscriptions: 0,
-            shared_subscription: true,
             max_topic_aliases: 0,
 
             limit_subscription: false,
@@ -202,8 +228,15 @@ impl Builder {
             tls_cross_certificate: false,
             tls_cert: None,
             tls_key: None,
+            tls_client_ca_certs: None,
             proxy_protocol: false,
             proxy_protocol_timeout: Duration::from_secs(5),
+
+            cert_cn_as_username: false,
+            cert_subject_dn_as_username: false,
+            collect_cert_info: false,
+
+            idle_timeout: Duration::from_secs(90),
         }
     }
 
@@ -369,12 +402,6 @@ impl Builder {
         self
     }
 
-    /// Enables shared subscription support
-    pub fn shared_subscription(mut self, shared_subscription: bool) -> Self {
-        self.shared_subscription = shared_subscription;
-        self
-    }
-
     /// Configures maximum topic aliases (MQTTv5)
     pub fn max_topic_aliases(mut self, max_topic_aliases: u16) -> Self {
         self.max_topic_aliases = max_topic_aliases;
@@ -411,6 +438,31 @@ impl Builder {
         self
     }
 
+    /// Sets path to TLS private key
+    pub fn tls_client_ca_certs<N: Into<String>>(mut self, tls_key: Option<N>) -> Self {
+        self.tls_client_ca_certs = tls_key.map(|c| c.into());
+        self
+    }
+
+    /// Configures using the TLS certificate CN field as the MQTT username
+    pub fn cert_cn_as_username(mut self, cert_cn_as_username: bool) -> Self {
+        self.cert_cn_as_username = cert_cn_as_username;
+        self
+    }
+
+    /// Configures using the full TLS certificate Subject DN as the MQTT username.
+    /// Takes precedence over `cert_cn_as_username` when both are enabled.
+    pub fn cert_subject_dn_as_username(mut self, v: bool) -> Self {
+        self.cert_subject_dn_as_username = v;
+        self
+    }
+
+    /// Enables collection of TLS certificate metadata for connected clients
+    pub fn collect_cert_info(mut self, collect_cert_info: bool) -> Self {
+        self.collect_cert_info = collect_cert_info;
+        self
+    }
+
     /// Enable proxy protocol parse
     pub fn proxy_protocol(mut self, enable_protocol_proxy: bool) -> Self {
         self.proxy_protocol = enable_protocol_proxy;
@@ -423,6 +475,12 @@ impl Builder {
         self
     }
 
+    /// Sets idle timeout (QUIC)
+    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
     /// Binds the server to the configured address
     #[allow(unused_variables)]
     pub fn bind(self) -> Result<Listener> {
@@ -430,8 +488,6 @@ impl Builder {
             SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, None)?,
             SocketAddr::V6(_) => Socket::new(Domain::IPV6, Type::STREAM, None)?,
         };
-
-        builder.set_linger(Some(Duration::from_secs(10)))?;
 
         builder.set_nonblocking(true)?;
 
@@ -456,10 +512,71 @@ impl Builder {
         Ok(Listener {
             typ: ListenerType::TCP,
             cfg: Arc::new(self),
-            tcp_listener,
+            tcp_listener: Some(tcp_listener),
             #[cfg(feature = "tls")]
             tls_acceptor: None,
+            #[cfg(feature = "quic")]
+            quinn_endpoint: None,
         })
+    }
+
+    #[allow(unused_variables)]
+    #[cfg(feature = "quic")]
+    pub fn bind_quic(self) -> Result<Listener> {
+        let mut tls_config = self.build_tls_config()?;
+        tls_config.alpn_protocols = vec![b"mqtt".to_vec(), b"mqttv5".to_vec()];
+        let server_crypto = QuicServerConfig::try_from(tls_config)?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+
+        let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+        transport_config.max_concurrent_uni_streams(0_u8.into());
+        transport_config.max_idle_timeout(Some(IdleTimeout::try_from(self.idle_timeout)?));
+
+        let endpoint = quinn::Endpoint::server(server_config, self.laddr)?;
+
+        log::info!("MQTT Broker Listening on {} {}", self.name, endpoint.local_addr().unwrap_or(self.laddr));
+        Ok(Listener {
+            typ: ListenerType::QUIC,
+            cfg: Arc::new(self),
+            tcp_listener: None,
+            #[cfg(feature = "tls")]
+            tls_acceptor: None,
+            quinn_endpoint: Some(endpoint),
+        })
+    }
+
+    #[cfg(feature = "tls")]
+    fn build_tls_config(&self) -> Result<ServerConfig> {
+        let cert_file = self.tls_cert.as_ref().ok_or(anyhow!("TLS certificate path not set"))?;
+        let key_file = self.tls_key.as_ref().ok_or(anyhow!("TLS key path not set"))?;
+
+        let cert_chain = read_ca_certs(cert_file).context("Failed to read TLS certificate chain")?;
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_file).map_err(|e| anyhow!(e))?;
+        let client_ca_certs = if let Some(ca_certs_file) = self.tls_client_ca_certs.as_ref() {
+            read_ca_certs(ca_certs_file).context("Failed to read TLS Client CA certificates")?
+        } else {
+            cert_chain.clone()
+        };
+
+        let provider = Arc::new(provider::default_provider());
+        let client_auth = if self.tls_cross_certificate {
+            let mut client_auth_roots = RootCertStore::empty();
+            for root in client_ca_certs {
+                client_auth_roots.add(root).map_err(|e| anyhow!(e))?;
+            }
+            WebPkiClientVerifier::builder_with_provider(client_auth_roots.into(), provider.clone())
+                .build()
+                .map_err(|e| anyhow!(e))?
+        } else {
+            WebPkiClientVerifier::no_client_auth()
+        };
+
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow!(e))?
+            .with_client_cert_verifier(client_auth)
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| anyhow!(format!("Certificate error: {e}")))
     }
 }
 
@@ -478,6 +595,9 @@ pub enum ListenerType {
     #[cfg(feature = "ws")]
     /// TLS-secured WebSocket listener
     WSS,
+    #[cfg(feature = "quic")]
+    ///QUIC listener (UDP-based, multiplexed and secured by default)
+    QUIC,
 }
 
 /// Network listener for accepting client connections
@@ -486,9 +606,11 @@ pub struct Listener {
     pub typ: ListenerType,
     /// Shared server configuration
     pub cfg: Arc<Builder>,
-    tcp_listener: TcpListener,
+    tcp_listener: Option<TcpListener>,
     #[cfg(feature = "tls")]
     tls_acceptor: Option<TlsAcceptor>,
+    #[cfg(feature = "quic")]
+    quinn_endpoint: Option<quinn::Endpoint>,
 }
 
 /// # Examples
@@ -503,7 +625,7 @@ pub struct Listener {
 impl Listener {
     /// Converts listener to plain TCP mode
     pub fn tcp(mut self) -> Result<Self> {
-        let _err = anyhow!("Protocol downgrade from TLS/WS/WSS to TCP is not permitted");
+        let _err = anyhow!("Protocol downgrade from TLS/WS/WSS/QUIC to TCP is not permitted");
         #[cfg(feature = "tls")]
         if matches!(self.typ, ListenerType::TLS) {
             return Err(_err);
@@ -517,6 +639,11 @@ impl Listener {
         if matches!(self.typ, ListenerType::WS) {
             return Err(_err);
         }
+        #[cfg(feature = "quic")]
+        if matches!(self.typ, ListenerType::QUIC) {
+            return Err(_err);
+        }
+
         self.typ = ListenerType::TCP;
         Ok(self)
     }
@@ -527,7 +654,7 @@ impl Listener {
         if matches!(self.typ, ListenerType::TCP | ListenerType::WS) {
             self.typ = ListenerType::WS;
         } else {
-            return Err(anyhow!("Protocol upgrade from TLS/WSS to WS is not permitted"));
+            return Err(anyhow!("Protocol upgrade from TLS/WSS/QUIC to WS is not permitted"));
         }
         Ok(self)
     }
@@ -536,6 +663,11 @@ impl Listener {
     #[cfg(feature = "ws")]
     /// Upgrades listener to secure WebSocket (WSS)
     pub fn wss(mut self) -> Result<Self> {
+        #[cfg(feature = "quic")]
+        if matches!(self.typ, ListenerType::QUIC) {
+            return Err(anyhow!("Protocol upgrade from QUIC to WS is not permitted"));
+        }
+
         if matches!(self.typ, ListenerType::TCP | ListenerType::WS) {
             self = self.tls()?;
         }
@@ -549,42 +681,17 @@ impl Listener {
         match self.typ {
             #[cfg(feature = "ws")]
             ListenerType::WS | ListenerType::WSS => {
-                return Err(anyhow!("Protocol downgrade from WS/WSS to TLS is not permitted"));
+                return Err(anyhow!("Protocol downgrade from WS/WSS/QUIC to TLS is not permitted"));
+            }
+            #[cfg(feature = "quic")]
+            ListenerType::QUIC => {
+                return Err(anyhow!("Protocol downgrade from QUIC to TLS is not permitted"));
             }
             ListenerType::TLS => return Ok(self),
             ListenerType::TCP => {}
         }
 
-        let cert_file = self.cfg.tls_cert.as_ref().ok_or(anyhow!("TLS certificate path not set"))?;
-        let key_file = self.cfg.tls_key.as_ref().ok_or(anyhow!("TLS key path not set"))?;
-
-        let cert_chain = rustls::pki_types::CertificateDer::pem_file_iter(cert_file)
-            .map_err(|e| anyhow!(e))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!(e))?;
-        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_file).map_err(|e| anyhow!(e))?;
-
-        let provider = Arc::new(provider::default_provider());
-        let client_auth = if self.cfg.tls_cross_certificate {
-            let root_chain = cert_chain.clone();
-            let mut client_auth_roots = RootCertStore::empty();
-            for root in root_chain {
-                client_auth_roots.add(root).map_err(|e| anyhow!(e))?;
-            }
-            WebPkiClientVerifier::builder_with_provider(client_auth_roots.into(), provider.clone())
-                .build()
-                .map_err(|e| anyhow!(e))?
-        } else {
-            WebPkiClientVerifier::no_client_auth()
-        };
-
-        let tls_config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| anyhow!(e))?
-            .with_client_cert_verifier(client_auth)
-            .with_single_cert(cert_chain, key)
-            .map_err(|e| anyhow!(format!("Certificate error: {}", e)))?;
-
+        let tls_config = self.cfg.build_tls_config()?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
         self.tls_acceptor = Some(acceptor);
         self.typ = ListenerType::TLS;
@@ -593,10 +700,19 @@ impl Listener {
 
     /// Accepts incoming client connections
     pub async fn accept(&self) -> Result<Acceptor<TcpStream>> {
-        let (mut socket, mut remote_addr) = self.tcp_listener.accept().await?;
+        if let Some(tcp_listener) = &self.tcp_listener {
+            self.accept_tcp(tcp_listener).await
+        } else {
+            Err(anyhow!(""))
+        }
+    }
+
+    async fn accept_tcp(&self, tcp_listener: &TcpListener) -> Result<Acceptor<TcpStream>> {
+        let (mut socket, mut remote_addr) = tcp_listener.accept().await?;
         if let Err(e) = socket.set_nodelay(self.cfg.nodelay) {
             return Err(Error::from(e));
         }
+        log::debug!("remote_addr: {remote_addr}, proxy_protocol: {}", self.cfg.proxy_protocol);
         if self.cfg.proxy_protocol {
             let mut buffer = [0u8; u16::MAX as usize];
             let read_bytes =
@@ -622,8 +738,43 @@ impl Listener {
         })
     }
 
+    #[cfg(feature = "quic")]
+    pub async fn accept_quic(&self) -> Result<Acceptor<QuinnBiStream>> {
+        if let Some(endpoint) = &self.quinn_endpoint {
+            let incoming =
+                endpoint.accept().await.ok_or_else(|| anyhow!("No incoming QUIC connection available"))?;
+            let conn = incoming.await?;
+            let remote_addr = conn.remote_address();
+
+            let (send, recv) = conn.accept_bi().await?;
+            let socket = QuinnBiStream::new(send, recv);
+
+            Ok(Acceptor {
+                socket,
+                remote_addr,
+                #[cfg(feature = "tls")]
+                acceptor: self.tls_acceptor.clone(),
+                cfg: self.cfg.clone(),
+                typ: self.typ,
+            })
+        } else {
+            Err(anyhow!(""))
+        }
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.tcp_listener.local_addr()?)
+        if let Some(tcp_listener) = &self.tcp_listener {
+            Ok(tcp_listener.local_addr()?)
+        } else {
+            #[cfg(feature = "quic")]
+            if let Some(endpoint) = &self.quinn_endpoint {
+                Ok(endpoint.local_addr()?)
+            } else {
+                Err(anyhow!("No active listener (neither TCP nor QUIC endpoint is available)"))
+            }
+            #[cfg(not(feature = "quic"))]
+            Err(anyhow!("No active listener"))
+        }
     }
 }
 
@@ -649,7 +800,7 @@ where
     #[inline]
     pub fn tcp(self) -> Result<Dispatcher<S>> {
         if matches!(self.typ, ListenerType::TCP) {
-            Ok(Dispatcher::new(self.socket, self.remote_addr, self.cfg))
+            Ok(Dispatcher::new(self.socket, self.remote_addr, None, self.cfg))
         } else {
             Err(anyhow!("Protocol mismatch: Expected TCP listener"))
         }
@@ -670,7 +821,15 @@ where
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(crate::MqttError::ReadTimeout.into()),
         };
-        Ok(Dispatcher::new(tls_s, self.remote_addr, self.cfg))
+
+        let cert_info = Self::get_extract_cert_info(
+            &tls_s,
+            self.cfg.cert_cn_as_username,
+            self.cfg.cert_subject_dn_as_username,
+            self.cfg.collect_cert_info,
+        );
+
+        Ok(Dispatcher::new(tls_s, self.remote_addr, cert_info, self.cfg))
     }
 
     #[cfg(feature = "ws")]
@@ -685,7 +844,7 @@ where
             .await
         {
             Ok(Ok(ws_stream)) => {
-                Ok(Dispatcher::new(WsStream::new(ws_stream), self.remote_addr, self.cfg.clone()))
+                Ok(Dispatcher::new(WsStream::new(ws_stream), self.remote_addr, None, self.cfg.clone()))
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Err(crate::MqttError::ReadTimeout.into()),
@@ -708,12 +867,51 @@ where
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err(crate::MqttError::ReadTimeout.into()),
         };
+
+        let cert_info = Self::get_extract_cert_info(
+            &tls_s,
+            self.cfg.cert_cn_as_username,
+            self.cfg.cert_subject_dn_as_username,
+            self.cfg.collect_cert_info,
+        );
+
         match tokio::time::timeout(self.cfg.handshake_timeout, accept_hdr_async(tls_s, on_handshake)).await {
             Ok(Ok(ws_stream)) => {
-                Ok(Dispatcher::new(WsStream::new(ws_stream), self.remote_addr, self.cfg.clone()))
+                Ok(Dispatcher::new(WsStream::new(ws_stream), self.remote_addr, cert_info, self.cfg.clone()))
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Err(crate::MqttError::ReadTimeout.into()),
+        }
+    }
+
+    #[cfg(feature = "quic")]
+    #[inline]
+    pub async fn quic(self) -> Result<Dispatcher<S>> {
+        if !matches!(self.typ, ListenerType::QUIC) {
+            return Err(anyhow!("Protocol mismatch: Expected QUIC listener"));
+        }
+        Ok(Dispatcher::new(self.socket, self.remote_addr, None, self.cfg))
+    }
+
+    #[inline]
+    #[cfg(feature = "tls")]
+    fn get_extract_cert_info<C: TlsCertExtractor>(
+        io: &C,
+        cert_cn_as_username: bool,
+        cert_subject_dn_as_username: bool,
+        collect_cert_info: bool,
+    ) -> Option<CertInfo> {
+        if cert_cn_as_username || cert_subject_dn_as_username || collect_cert_info {
+            // Extract cert info BEFORE consuming self
+            let cert_info: Option<CertInfo> = io.extract_cert_info();
+            // Certificate info is now available in s.cert_info
+            if let Some(ref cert) = cert_info {
+                log::debug!("Client certificate: {cert}");
+                log::debug!("CN: {:?}, Org: {:?}", cert.common_name, cert.organization);
+            }
+            cert_info
+        } else {
+            None
         }
     }
 }
@@ -726,14 +924,26 @@ fn on_handshake(req: &Request, mut response: Response) -> std::result::Result<Re
     let mqtt_protocol = req
         .headers()
         .get("Sec-WebSocket-Protocol")
-        .ok_or_else(|| ErrorResponse::new(Some(PROTOCOL_ERROR.into())))?;
-    if mqtt_protocol != "mqtt" {
-        return Err(ErrorResponse::new(Some(PROTOCOL_ERROR.into())));
+        .ok_or_else(|| ErrorResponse::new(Some(PROTOCOL_ERROR.into())))?
+        .to_str()
+        .map_err(|_| ErrorResponse::new(Some(PROTOCOL_ERROR.into())))?;
+    match mqtt_protocol {
+        "mqtt" => {
+            response.headers_mut().append(
+                "Sec-WebSocket-Protocol",
+                "mqtt".parse().map_err(|_| ErrorResponse::new(Some("InvalidHeaderValue".into())))?,
+            );
+        }
+        "mqttv3.1" => {
+            response.headers_mut().append(
+                "Sec-WebSocket-Protocol",
+                "mqttv3.1".parse().map_err(|_| ErrorResponse::new(Some("InvalidHeaderValue".into())))?,
+            );
+        }
+        _ => {
+            return Err(ErrorResponse::new(Some(PROTOCOL_ERROR.into())));
+        }
     }
-    response.headers_mut().append(
-        "Sec-WebSocket-Protocol",
-        "mqtt".parse().map_err(|_| ErrorResponse::new(Some("InvalidHeaderValue".into())))?,
-    );
     Ok(response)
 }
 
@@ -760,11 +970,11 @@ fn handle_header_v1(addr: v1::ProxyAddresses) -> Option<(SocketAddr, SocketAddr)
             None
         }
         Ipv4 { source, destination } => {
-            log::debug!("[tcp]accept proxy-protocol-v1: {} => {}", &source, &destination);
+            log::debug!("[tcp]accept proxy-protocol-v1: {} => {}", source, destination);
             Some((SocketAddr::V4(source), SocketAddr::V4(destination)))
         }
         Ipv6 { source, destination } => {
-            log::debug!("[tcp]accept proxy-protocol-v1: {} => {}", &source, &destination);
+            log::debug!("[tcp]accept proxy-protocol-v1: {} => {}", source, destination);
             Some((SocketAddr::V6(source), SocketAddr::V6(destination)))
         }
     }
@@ -804,11 +1014,11 @@ fn handle_header_v2(
 
     match addr {
         Address::Ipv4 { source, destination } => {
-            log::debug!("[tcp]accept proxy-protocol-v2: {} => {}", &source, &destination);
+            log::debug!("[tcp]accept proxy-protocol-v2: {} => {}", source, destination);
             Some((SocketAddr::V4(source), SocketAddr::V4(destination)))
         }
         Address::Ipv6 { source, destination } => {
-            log::debug!("[tcp]accept proxy-protocol-v2: {} => {}", &source, &destination);
+            log::debug!("[tcp]accept proxy-protocol-v2: {} => {}", source, destination);
             Some((SocketAddr::V6(source), SocketAddr::V6(destination)))
         }
         Address::Unspec => {
@@ -820,4 +1030,12 @@ fn handle_header_v2(
             None
         }
     }
+}
+
+#[cfg(feature = "tls")]
+fn read_ca_certs(cert_file: &str) -> Result<Vec<CertificateDer<'static>>> {
+    CertificateDer::pem_file_iter(cert_file)
+        .map_err(|e| anyhow!(e))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!(e))
 }

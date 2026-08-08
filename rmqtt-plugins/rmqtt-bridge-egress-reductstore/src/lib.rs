@@ -1,3 +1,15 @@
+//! ReductStore egress bridge plugin for RMQTT.
+//!
+//! Forwards MQTT publish messages to ReductStore for time-series
+//! data storage and retrieval. Stores messages as blobs with
+//! timestamp-based indexing.
+//!
+//! # Features
+//!
+//! - Time-series storage of MQTT messages.
+//! - Configurable bucket and entry mapping.
+//! - Automatic timestamp extraction from message metadata.
+//!
 #![deny(unsafe_code)]
 
 use std::ops::Deref;
@@ -53,7 +65,7 @@ impl BridgeReductstoreEgressPlugin {
                     match cmd {
                         Command::Start => loop {
                             if let Err(e) = bridge_mgr.start().await {
-                                log::error!("start bridge-egress-reductstore error, {e:?}");
+                                log::error!("start bridge-egress-reductstore error, {e}");
                                 tokio::time::sleep(Duration::from_secs(3)).await;
                             } else {
                                 log::info!("start bridge-egress-reductstore ok.");
@@ -145,10 +157,11 @@ impl HookHandler {
 impl Handler for HookHandler {
     async fn hook(&self, param: &Parameter, acc: Option<HookResult>) -> ReturnType {
         match param {
-            Parameter::MessagePublish(s, f, publish) => {
-                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), publish);
-                if let Err(e) = self.bridge_mgr.send(f, publish).await {
-                    log::error!("{e:?}");
+            Parameter::MessagePublish(s, f, p) => {
+                let p = if let Some(HookResult::Publish(publish)) = &acc { publish } else { p };
+                log::debug!("{:?} message publish, {:?}", s.map(|s| &s.id), p);
+                if let Err(e) = self.bridge_mgr.send(f, p).await {
+                    log::error!("{e}");
                 }
             }
             _ => {

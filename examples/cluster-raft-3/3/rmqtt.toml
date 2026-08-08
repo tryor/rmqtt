@@ -11,7 +11,7 @@ node.id = 3
 ##--------------------------------------------------------------------
 ## RPC
 ##--------------------------------------------------------------------
-rpc.server_addr = "0.0.0.0:5365"
+rpc.server_addr = "0.0.0.0:5366"
 rpc.server_workers = 4
 
 
@@ -33,14 +33,17 @@ log.file = "rmqtt_3.log"
 plugins.dir = "./plugins/"
 #Plug in started by default, when the mqtt server is started
 plugins.default_startups = [
-    #"rmqtt-retainer",
+    "rmqtt-retainer",
     "rmqtt-cluster-raft",
+    "rmqtt-http-api",
     #"rmqtt-auth-http",
     #"rmqtt-sys-topic",
-    #"rmqtt-message-storage",
+    "rmqtt-message-storage",
     #"rmqtt-session-storage",
     #"rmqtt-bridge-ingress-kafka",
     #"rmqtt-bridge-egress-kafka",
+    "rmqtt-shared-subscription",
+    "rmqtt-p2p-messaging",
     "rmqtt-web-hook"
 ]
 
@@ -65,7 +68,7 @@ mqtt.max_sessions = 0
 
 ##--------------------------------------------------------------------
 ## MQTT/TCP - External TCP Listener for MQTT Protocol
-listener.tcp.external.addr = "0.0.0.0:1885"
+listener.tcp.external.addr = "0.0.0.0:1886"
 #Number of worker threads
 listener.tcp.external.workers = 8
 #The maximum number of concurrent connections allowed by the listener.
@@ -111,5 +114,3 @@ listener.tcp.external.message_expiry_interval = "5m"
 #The maximum number of topics that a single client is allowed to subscribe to
 #0 means unlimited, default value: 0
 listener.tcp.external.max_subscriptions = 0
-#Shared subscription switch, default value: true
-listener.tcp.external.shared_subscription = true

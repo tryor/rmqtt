@@ -6,6 +6,7 @@
 //! - **Timestamp Utilities**: Precise timestamp handling with millisecond resolution
 //! - **Network Addressing**: Cluster node address parsing ([`NodeAddr`]) and socket address handling
 //! - **Counter Implementation**: Thread-safe counter with merge modes ([`Counter`])
+//! - **Rate Counter**: Lock-free per-second rate tracking ([`RateCounter`])
 //!
 //! ## Key Components:
 //! - `Bytesize`: Handles 2G512M-style conversions with serialization support
@@ -32,7 +33,7 @@
 //!
 //! // Timestamp formatting
 //! let now = format_timestamp_now();
-//! assert!(now.contains("2025")); // Current year
+//! assert!(now.contains("2026")); // Current year
 //! ```
 //!
 //! ## Safety Guarantees:
@@ -81,8 +82,10 @@ use serde::{
 };
 
 mod counter;
+mod rate_counter;
 
 pub use counter::{Counter, StatsMergeMode};
+pub use rate_counter::RateCounter;
 
 /// Cluster node identifier type (64-bit unsigned integer)
 pub type NodeId = u64;
@@ -294,6 +297,7 @@ pub fn to_bytesize(text: &str) -> Result<usize, ParseSizeError> {
         .sum()
 }
 
+/// Errors that can occur when parsing a byte size string.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ParseSizeError {
     InvalidFormat,
@@ -615,4 +619,72 @@ impl<'de> de::Deserialize<'de> for NodeAddr {
     {
         NodeAddr::from_str(&String::deserialize(deserializer)?).map_err(de::Error::custom)
     }
+}
+
+/// Expand all environment variable placeholders in the form `${ENV:VAR_NAME}`
+/// within a string.
+///
+/// Each occurrence of `${ENV:VAR_NAME}` will be replaced with the value of the
+/// corresponding environment variable `VAR_NAME`.  
+/// If an environment variable is not set, it will be replaced with an empty string
+/// and a warning will be logged.
+///
+/// # Example
+///
+/// ```
+/// use std::env;
+/// env::set_var("MQTT_USER", "user");
+/// env::set_var("MQTT_PASS", "pass");
+///
+/// let p = rmqtt_utils::expand_env_vars("${env:MQTT_PASS}");
+/// assert_eq!(p, "pass");
+///
+/// let s = rmqtt_utils::expand_env_vars("mqtt://${ENV:MQTT_USER}:${ENV:MQTT_PASS}@localhost");
+/// assert_eq!(s, "mqtt://user:pass@localhost");
+/// ```
+#[inline]
+pub fn expand_env_vars(value: &str) -> String {
+    static ENV_PATTERN: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?i)\$\{ENV:([A-Z0-9_]+)\}").expect("Invalid regex pattern")
+    });
+
+    ENV_PATTERN
+        .replace_all(value, |caps: &regex::Captures| {
+            let env_name = &caps[1];
+            std::env::var(env_name).unwrap_or_else(|_| {
+                log::warn!("environment variable `{env_name}` not set");
+                String::new()
+            })
+        })
+        .into_owned()
+}
+
+/// Deserializes a string with `${ENV:VAR}` placeholders expanded from environment variables.
+///
+/// Returns the expanded string. Unset environment variables log a warning
+/// and are replaced with an empty string.
+#[inline]
+pub fn deserialize_expand_env_vars<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = String::deserialize(deserializer)?;
+    Ok(expand_env_vars(&v))
+}
+
+/// Deserializes an optional string with `${ENV:VAR}` placeholders expanded.
+///
+/// Returns `None` if the resulting expanded string is empty.
+#[inline]
+pub fn deserialize_expand_env_vars_option<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|s| expand_env_vars(&s)).map(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    })
 }

@@ -1,3 +1,9 @@
+//! Egress bridge to NATS.
+//!
+//! Routes MQTT publish messages to NATS subjects via JetStream.
+//! Manages NATS client connections, topic matching via a trie, and
+//! forwards MQTT metadata as NATS message headers.
+
 use std::collections::HashSet;
 use std::convert::From as _;
 use std::str::FromStr;
@@ -19,6 +25,7 @@ use rmqtt::{
 
 use crate::config::{Bridge, Entry, PluginConfig};
 
+/// Commands for controlling a NATS producer.
 #[derive(Debug)]
 pub enum Command {
     Start,
@@ -26,14 +33,16 @@ pub enum Command {
     Message(From, Publish),
 }
 
+/// A NATS producer that forwards MQTT messages to a NATS subject.
 pub struct Producer {
     pub(crate) name: String,
+    cfg_entry: Entry,
     tx: mpsc::Sender<Command>,
 }
 
 impl Producer {
+    /// Creates a new NATS producer and spawns its message processing loop.
     pub(crate) async fn from(
-        // producer: Client,
         cfg: Arc<Bridge>,
         cfg_entry: Entry,
         entry_idx: usize,
@@ -53,11 +62,12 @@ impl Producer {
 
         let producer = Self::build_nats(&cfg, &producer_name).await?;
 
+        let cfg_entry1 = cfg_entry.clone();
         let (tx, rx) = mpsc::channel(100_000);
         tokio::spawn(async move {
-            Self::start(cfg_entry, producer, rx).await;
+            Self::start(cfg_entry1, producer, rx).await;
         });
-        Ok(Producer { name: producer_name, tx })
+        Ok(Producer { name: producer_name, cfg_entry, tx })
     }
 
     #[inline]
@@ -193,18 +203,30 @@ impl Producer {
         log::info!("exit nats producer.")
     }
 
+    /// Sends an MQTT publish to the NATS producer, applying topic skip-levels.
     #[inline]
-    pub(crate) async fn send(&self, f: &From, p: &Publish) -> Result<()> {
-        self.tx.send(Command::Message(f.clone(), p.clone())).await?;
+    pub(crate) async fn send(&self, f: &From, p: &Publish, topic: &Topic) -> Result<()> {
+        let p = if self.cfg_entry.remote.skip_levels > 0 {
+            let mut p = p.clone();
+            p.topic = ByteString::from(topic.to_string_skip(self.cfg_entry.remote.skip_levels));
+            p
+        } else {
+            p.clone()
+        };
+        log::debug!("new_local_topic: {}, skip_levels: {}", p.topic, self.cfg_entry.remote.skip_levels);
+
+        self.tx.send(Command::Message(f.clone(), p)).await?;
         Ok(())
     }
 }
 
+/// A named bridge instance identifier.
 pub(crate) type BridgeName = ByteString;
 type SourceKey = (BridgeName, EntryIndex);
 
 type EntryIndex = usize;
 
+/// Manages NATS producers and topic routing for bridge entries.
 #[derive(Clone)]
 pub(crate) struct BridgeManager {
     node_id: NodeId,
@@ -214,6 +236,7 @@ pub(crate) struct BridgeManager {
 }
 
 impl BridgeManager {
+    /// Creates a new `BridgeManager` with the given node ID and configuration.
     pub async fn new(node_id: NodeId, cfg: Arc<RwLock<PluginConfig>>) -> Self {
         Self {
             node_id,
@@ -223,6 +246,7 @@ impl BridgeManager {
         }
     }
 
+    /// Starts all configured bridge entries by creating NATS producers.
     pub async fn start(&mut self) -> Result<()> {
         let mut topics = self.topics.write().await;
         let bridges = self.cfg.read().await.bridges.clone();
@@ -251,22 +275,28 @@ impl BridgeManager {
         Ok(())
     }
 
+    /// Stops all bridge entries by sending close commands to producers.
     pub async fn stop(&mut self) {
         for mut entry in &mut self.sinks.iter_mut() {
             let ((bridge_name, entry_idx), producer) = entry.pair_mut();
             log::debug!("stop bridge_name: {bridge_name:?}, entry_idx: {entry_idx:?}",);
             if let Err(e) = producer.tx.send(Command::Close).await {
-                log::error!("{e:?}");
+                log::error!("{e}");
             }
         }
         self.sinks.clear();
     }
 
+    /// Returns a reference to the internal producer map.
     #[allow(unused)]
     pub(crate) fn sinks(&self) -> &DashMap<SourceKey, Producer> {
         &self.sinks
     }
 
+    /// Routes an MQTT publish to matching NATS producers.
+    ///
+    /// Matches the publish topic against the topic trie and forwards to
+    /// each matching producer, applying topic skip-levels.
     #[inline]
     pub(crate) async fn send(&self, f: &From, p: &Publish) -> Result<()> {
         let topic = Topic::from_str(&p.topic)?;
@@ -276,7 +306,7 @@ impl BridgeManager {
             log::debug!("bridge_infos: {bridge_infos:?}");
             for (name, entry_idx) in bridge_infos {
                 if let Some(producer) = self.sinks.get(&(name.clone(), *entry_idx)) {
-                    if let Err(e) = producer.send(f, p).await {
+                    if let Err(e) = producer.send(f, p, &topic).await {
                         log::warn!("{e}");
                     }
                 }

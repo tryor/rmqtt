@@ -1,3 +1,9 @@
+//! Example MQTT broker server demonstrating TCP, TLS, WebSocket, and QUIC listeners.
+//!
+//! This example creates listeners on multiple ports and protocols, accepts connections,
+//! determines the MQTT protocol version (v3.1.1 or v5.0), and processes packets with
+//! basic message routing logic.
+
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -42,7 +48,14 @@ async fn main() -> Result<()> {
         .bind()?
         .wss()?;
 
-    let tcp = async {
+    let quic_listener = Builder::new()
+        .name("external/quic")
+        .laddr(([0, 0, 0, 0], 9443).into())
+        .tls_key(Some("./rmqtt-bin/rmqtt.key"))
+        .tls_cert(Some("./rmqtt-bin/rmqtt.pem"))
+        .bind_quic()?;
+
+    let tcp = async move {
         loop {
             match tcp_listener.accept().await {
                 Ok(a) => {
@@ -51,36 +64,36 @@ async fn main() -> Result<()> {
                         let d = match a.tcp() {
                             Ok(d) => d,
                             Err(e) => {
-                                log::warn!("Failed to mqtt(tcp) accept, {e:?}");
+                                log::warn!("Failed to mqtt(tcp) accept, {e}");
                                 return;
                             }
                         };
                         match d.mqtt().await {
                             Ok(MqttStream::V3(s)) => {
                                 if let Err(e) = process_v3(s).await {
-                                    log::warn!("Failed to process mqtt v3, {e:?}");
+                                    log::warn!("Failed to process mqtt v3, {e}");
                                 }
                             }
                             Ok(MqttStream::V5(s)) => {
                                 if let Err(e) = process_v5(s).await {
-                                    log::warn!("Failed to process mqtt v5, {e:?}");
+                                    log::warn!("Failed to process mqtt v5, {e}");
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to probe MQTT version, {e:?}");
+                                log::warn!("Failed to probe MQTT version, {e}");
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    log::warn!("Failed to accept TCP socket connection, {e:?}");
+                    log::warn!("Failed to accept TCP socket connection, {e}");
                     sleep(Duration::from_millis(300)).await;
                 }
             }
         }
     };
 
-    let tls = async {
+    let tls = async move {
         loop {
             match tls_listener.accept().await {
                 Ok(acceptor) => {
@@ -89,36 +102,36 @@ async fn main() -> Result<()> {
                         let d = match acceptor.tls().await {
                             Ok(d) => d,
                             Err(e) => {
-                                log::warn!("Failed to mqtt(tls) accept, {e:?}");
+                                log::warn!("Failed to mqtt(tls) accept, {e}");
                                 return;
                             }
                         };
                         match d.mqtt().await {
                             Ok(MqttStream::V3(s)) => {
                                 if let Err(e) = process_v3(s).await {
-                                    log::warn!("Failed to process mqtt(tls) v3, {e:?}");
+                                    log::warn!("Failed to process mqtt(tls) v3, {e}");
                                 }
                             }
                             Ok(MqttStream::V5(s)) => {
                                 if let Err(e) = process_v5(s).await {
-                                    log::warn!("Failed to process mqtt(tls) v5, {e:?}");
+                                    log::warn!("Failed to process mqtt(tls) v5, {e}");
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to probe MQTT(TLS) version, {e:?}");
+                                log::warn!("Failed to probe MQTT(TLS) version, {e}");
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    log::warn!("Failed to accept TLS socket connection, {e:?}");
+                    log::warn!("Failed to accept TLS socket connection, {e}");
                     sleep(Duration::from_millis(300)).await;
                 }
             }
         }
     };
 
-    let ws = async {
+    let ws = async move {
         loop {
             match ws_listener.accept().await {
                 Ok(acceptor) => {
@@ -127,36 +140,36 @@ async fn main() -> Result<()> {
                         let d = match acceptor.ws().await {
                             Ok(d) => d,
                             Err(e) => {
-                                log::warn!("Failed to websocket accept, {e:?}");
+                                log::warn!("Failed to websocket accept, {e}");
                                 return;
                             }
                         };
                         match d.mqtt().await {
                             Ok(MqttStream::V3(s)) => {
                                 if let Err(e) = process_v3(s).await {
-                                    log::warn!("Failed to process websocket mqtt v3, {e:?}");
+                                    log::warn!("Failed to process websocket mqtt v3, {e}");
                                 }
                             }
                             Ok(MqttStream::V5(s)) => {
                                 if let Err(e) = process_v5(s).await {
-                                    log::warn!("Failed to process websocket mqtt v5, {e:?}");
+                                    log::warn!("Failed to process websocket mqtt v5, {e}");
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to websocket probe MQTT version, {e:?}");
+                                log::warn!("Failed to websocket probe MQTT version, {e}");
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    log::warn!("Failed to websocket accept TCP socket connection, {e:?}");
+                    log::warn!("Failed to websocket accept TCP socket connection, {e}");
                     sleep(Duration::from_millis(300)).await;
                 }
             }
         }
     };
 
-    let wss = async {
+    let wss = async move {
         loop {
             match wss_listener.accept().await {
                 Ok(acceptor) => {
@@ -165,36 +178,79 @@ async fn main() -> Result<()> {
                         let d = match acceptor.wss().await {
                             Ok(d) => d,
                             Err(e) => {
-                                log::warn!("Failed to websocket mqtt(tls) accept, {e:?}");
+                                log::warn!("Failed to websocket mqtt(tls) accept, {e}");
                                 return;
                             }
                         };
                         match d.mqtt().await {
                             Ok(MqttStream::V3(s)) => {
                                 if let Err(e) = process_v3(s).await {
-                                    log::warn!("Failed to process websocket mqtt(tls) v3, {e:?}");
+                                    log::warn!("Failed to process websocket mqtt(tls) v3, {e}");
                                 }
                             }
                             Ok(MqttStream::V5(s)) => {
                                 if let Err(e) = process_v5(s).await {
-                                    log::warn!("Failed to process websocket mqtt(tls) v5, {e:?}");
+                                    log::warn!("Failed to process websocket mqtt(tls) v5, {e}");
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to websocket probe MQTT(TLS) version, {e:?}");
+                                log::warn!("Failed to websocket probe MQTT(TLS) version, {e}");
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    log::warn!("Failed to websocket accept TLS socket connection, {e:?}");
+                    log::warn!("Failed to websocket accept TLS socket connection, {e}");
                     sleep(Duration::from_millis(300)).await;
                 }
             }
         }
     };
 
-    futures::future::join4(tcp, tls, ws, wss).await;
+    let quic = async move {
+        loop {
+            match quic_listener.accept_quic().await {
+                Ok(acceptor) => {
+                    tokio::spawn(async move {
+                        log::info!("quic {:?}", acceptor.remote_addr);
+                        let d = match acceptor.quic().await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log::warn!("Failed to quic mqtt(tls) accept, {e}");
+                                return;
+                            }
+                        };
+                        match d.mqtt().await {
+                            Ok(MqttStream::V3(s)) => {
+                                if let Err(e) = process_v3(s).await {
+                                    log::warn!("Failed to process quic mqtt(tls) v3, {e}");
+                                }
+                            }
+                            Ok(MqttStream::V5(s)) => {
+                                if let Err(e) = process_v5(s).await {
+                                    log::warn!("Failed to process quic mqtt(tls) v5, {e}");
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to quic probe MQTT(TLS) version, {e}");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Failed to quic accept TLS socket connection, {e}");
+                    sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+    };
+
+    // futures::future::join4(tcp, tls, ws, wss).await;
+    tokio::spawn(tcp);
+    tokio::spawn(tls);
+    tokio::spawn(ws);
+    tokio::spawn(quic);
+    wss.await;
 
     Ok(())
 }

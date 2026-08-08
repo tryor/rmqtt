@@ -1,3 +1,8 @@
+//! Raft-consensus cluster router.
+//!
+//! Maintains client state (connection status, handshake locks) and topic
+//! subscription routes via the Raft log, providing cluster-wide consistency
+//! for session ownership and routing data.
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::str::FromStr;
@@ -128,13 +133,18 @@ impl ClusterRouter {
     pub(crate) fn _handshakings(&self) -> usize {
         self.client_states.iter().filter_map(|entry| if entry.handshaking { Some(()) } else { None }).count()
     }
+
+    #[inline]
+    pub(crate) fn get_target_node_id(&self, target_clientid: &str) -> Option<NodeId> {
+        self.client_states.get(target_clientid).map(|entry| entry.id.node_id)
+    }
 }
 
 #[async_trait]
 impl Router for ClusterRouter {
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
-        log::debug!("[Router.add] topic_filter: {:?}, id: {:?}, opts: {:?}", topic_filter, id, opts);
+        log::debug!("[Router.add] topic_filter: {topic_filter:?}, id: {id:?}, opts: {opts:?}");
 
         let mut add_res = None;
         for _ in 0..3 {
@@ -160,7 +170,7 @@ impl Router for ClusterRouter {
 
     #[inline]
     async fn remove(&self, topic_filter: &str, id: Id) -> Result<bool> {
-        log::debug!("[Router.remove] topic_filter: {:?}, id: {:?}", topic_filter, id);
+        log::debug!("[Router.remove] topic_filter: {topic_filter:?}, id: {id:?}");
         let msg = Message::Remove { topic_filter, id: id.clone() }.encode()?;
         let raft_mailbox = self.raft_mailbox().await;
         let exec = self.remove_exec.clone();
@@ -179,7 +189,7 @@ impl Router for ClusterRouter {
             })
             .await
             {
-                log::warn!("[Router.remove] Failed to send Message::Remove, id: {id:?}, {e:?}");
+                log::warn!("[Router.remove] Failed to send Message::Remove, id: {id:?}, {e}");
             }
         });
         Ok(true)
@@ -191,8 +201,9 @@ impl Router for ClusterRouter {
     }
 
     ///Check online or offline
+    #[inline]
     async fn is_online(&self, node_id: NodeId, client_id: &str) -> bool {
-        log::debug!("[Router.is_online] node_id: {:?}, client_id: {:?}", node_id, client_id);
+        log::debug!("[Router.is_online] node_id: {node_id:?}, client_id: {client_id:?}");
         self.client_states.get(client_id).map(|entry| entry.online).unwrap_or(false)
     }
 
@@ -254,9 +265,10 @@ impl Router for ClusterRouter {
 
 #[async_trait]
 impl Store for ClusterRouter {
+    #[allow(clippy::result_large_err)]
     async fn apply(&mut self, message: &[u8]) -> RaftResult<Vec<u8>> {
         log::debug!("apply, message.len: {:?}", message.len());
-        let message: Message = bincode::deserialize(message).map_err(|e| Error::Other(e))?;
+        let message: Message = postcard::from_bytes(message).map_err(|e| Error::Other(Box::new(e)))?;
         match message {
             Message::HandshakeTryLock { id } => {
                 log::debug!("[Router.HandshakeTryLock] id: {id:?}");
@@ -345,7 +357,7 @@ impl Store for ClusterRouter {
             }
             Message::GetClientNodeId { client_id } => {
                 let node_id = self._client_node_id(client_id);
-                let data = bincode::serialize(&node_id).map_err(|e| Error::Other(e))?;
+                let data = postcard::to_stdvec(&node_id).map_err(|e| Error::Other(Box::new(e)))?;
                 return Ok(data);
             }
             Message::Ping => return MessageReply::Ping.encode().map_err(|_e| Error::Unknown),
@@ -354,13 +366,14 @@ impl Store for ClusterRouter {
         Ok(Vec::new())
     }
 
+    #[allow(clippy::result_large_err)]
     async fn query(&self, query: &[u8]) -> RaftResult<Vec<u8>> {
         log::debug!("query, message.len: {:?}", query.len());
-        let query: Message = bincode::deserialize(query).map_err(|e| Error::Other(e))?;
+        let query: Message = postcard::from_bytes(query).map_err(|e| Error::Other(Box::new(e)))?;
         match query {
             Message::GetClientNodeId { client_id } => {
                 let node_id = self._client_node_id(client_id);
-                let data = bincode::serialize(&node_id).map_err(|e| Error::Other(e))?;
+                let data = postcard::to_stdvec(&node_id).map_err(|e| Error::Other(Box::new(e)))?;
                 return Ok(data);
             }
             _ => {
@@ -370,6 +383,7 @@ impl Store for ClusterRouter {
         Ok(Vec::new())
     }
 
+    #[allow(clippy::result_large_err)]
     async fn snapshot(&self) -> RaftResult<Vec<u8>> {
         log::debug!("create snapshot ...");
         let now = std::time::Instant::now();
@@ -423,13 +437,13 @@ impl Store for ClusterRouter {
                 .collect::<Vec<_>>();
 
             let (relations_bin, client_states_bin) = rayon::join(
-                || bincode::serialize(&relations).map(|data| compress(compression, data)),
-                || bincode::serialize(&client_states).map(|data| compress(compression, data)),
+                || postcard::to_stdvec(&relations).map(|data| compress(compression, data)),
+                || postcard::to_stdvec(&client_states).map(|data| compress(compression, data)),
             );
             let relations_bin = relations_bin??;
             let client_states_bin = client_states_bin??;
-            let topics_count_bin = bincode::serialize(&topics_count.as_ref())?;
-            let relations_count_bin = bincode::serialize(&relations_count.as_ref())?;
+            let topics_count_bin = postcard::to_stdvec(&topics_count.as_ref())?;
+            let relations_count_bin = postcard::to_stdvec(&relations_count.as_ref())?;
 
             let mut snapshot = Vec::new();
             encode_with_length_prefix(&relations_bin, &mut snapshot);
@@ -448,6 +462,7 @@ impl Store for ClusterRouter {
         Ok(snapshot)
     }
 
+    #[allow(clippy::result_large_err)]
     async fn restore(&mut self, snapshot: &[u8]) -> RaftResult<()> {
         log::info!("restore, snapshot.len: {}", snapshot.len());
         let now = std::time::Instant::now();
@@ -487,9 +502,9 @@ impl Store for ClusterRouter {
             let slice = &snapshot[start..start + len];
             if uncompress_enable {
                 let slice = uncompress(compression, slice)?;
-                Ok(bincode::deserialize(slice.as_ref())?)
+                Ok(postcard::from_bytes(slice.as_ref())?)
             } else {
-                Ok(bincode::deserialize(slice)?)
+                Ok(postcard::from_bytes(slice)?)
             }
         }
 
@@ -545,7 +560,7 @@ impl Store for ClusterRouter {
         let mut topics = self.inner.topics.write().await;
         self.inner.relations.clear();
         for (topic_filter, relation) in relations {
-            let topic = Topic::from_str(&topic_filter).map_err(|e| Error::Msg(format!("{e:?}")))?;
+            let topic = Topic::from_str(&topic_filter).map_err(|e| Error::Msg(format!("{e}")))?;
             self.inner.relations.insert(topic_filter, relation);
             topics.insert(&topic, ());
         }
